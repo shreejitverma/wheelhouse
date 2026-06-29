@@ -1,13 +1,16 @@
 name: decision-handler
 
-# The heart: the maintainer drives a decision card and we execute it on the
-# TARGET repo, then consume the card. Three ways to drive a card:
+# The heart: the maintainer drives a decision card. Consuming decisions execute
+# on the TARGET repo, then consume the card. Three ways to drive a card:
 #   * tick a checkbox            (issues.edited  - read via issue-ops/parser)
 #   * reply with a slash-command (issue_comment.created)
 #   * reply in plain English     (issue_comment.created - mapped by Claude, opt-in)
-# Owner-gated, serialized per issue. Whatever the entry point, any action on the
-# target runs through the one deterministic `execute` step (FLEET_TOKEN) so every
-# guard - per-kind allowlist, head-SHA re-check, fork-CI HOLD - always applies.
+# The `Investigate` checkbox is the deliberate exception: it dispatches
+# deep-review.yml, clears the box, and leaves the card open.
+# Owner-gated, serialized per issue. Whatever the entry point, any consuming
+# action on the target runs through the one deterministic `execute` step
+# (FLEET_TOKEN) so every guard - per-kind allowlist, head-SHA re-check,
+# fork-CI HOLD - always applies.
 
 on:
   issues:
@@ -27,6 +30,13 @@ concurrency:
 jobs:
   handle:
     runs-on: ubuntu-latest
+    outputs:
+      authorized: ${{ steps.gate.outputs.authorized }}
+      investigate: ${{ steps.decide.outputs.investigate }}
+      target_repo: ${{ steps.decide.outputs.target_repo }}
+      target_number: ${{ steps.decide.outputs.target_number }}
+      kind: ${{ steps.decide.outputs.kind }}
+      head_sha: ${{ steps.decide.outputs.head_sha }}
     steps:
       - uses: actions/checkout@v4
 
@@ -293,3 +303,62 @@ jobs:
           ISSUE: ${{ github.event.issue.number }}
           REPLY: ${{ steps.route.outputs.answer }}
         run: gh issue comment "$ISSUE" --body "$REPLY" || true
+
+  investigate-dispatch:
+    needs: handle
+    if: ${{ needs.handle.outputs.authorized == 'true' && needs.handle.outputs.investigate != '' }}
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install --quiet pyyaml
+
+      - id: triggering-actor-gate
+        env:
+          SENDER: ${{ github.triggering_actor }}
+          OWNER: ${{ github.repository_owner }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: echo "authorized=$(python scripts/wheelhouse_core.py authorized)" >> "$GITHUB_OUTPUT"
+
+      - name: Investigate (trigger deep review, leave card open)
+        if: ${{ needs.handle.outputs.authorized == 'true' && steps.triggering-actor-gate.outputs.authorized == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          OPT_KEY: ${{ needs.handle.outputs.investigate }}
+          TARGET_REPO: ${{ needs.handle.outputs.target_repo }}
+          TARGET_NUMBER: ${{ needs.handle.outputs.target_number }}
+          TARGET_KIND: ${{ needs.handle.outputs.kind }}
+          HEAD_SHA: ${{ needs.handle.outputs.head_sha }}
+        run: |
+          set -uo pipefail
+          if gh issue view "$ISSUE" --json body --jq .body > investigate_current_body.md; then
+            ISSUE_BODY_FILE=investigate_current_body.md \
+              python scripts/apply_decision.py clear-checkbox > investigate_body.md
+            if [ -s investigate_body.md ] && ! cmp -s investigate_current_body.md investigate_body.md; then
+              gh issue edit "$ISSUE" --body-file investigate_body.md || true
+            fi
+          fi
+          if [ -z "$TARGET_REPO" ] || [ -z "$TARGET_NUMBER" ] || [ -z "$TARGET_KIND" ]; then
+            gh issue comment "$ISSUE" --body \
+              "Couldn't start the investigation (card state is missing target coordinates)." || true
+          elif ! gh workflow run deep-review.yml \
+            -f issue="$ISSUE" \
+            -f repo="$TARGET_REPO" \
+            -f number="$TARGET_NUMBER" \
+            -f kind="$TARGET_KIND" \
+            -f head_sha="$HEAD_SHA"; then
+            gh issue comment "$ISSUE" --body \
+              "Couldn't start the investigation (workflow dispatch failed). Apply the \`needs-deep-review\` label to run it manually." || true
+          fi
