@@ -83,7 +83,9 @@ maintainer: ""
 # "needs token" note on the card instead of silently no-opping. The optional
 # READONLY_TOKEN secret enables scoped read-only search across the target repo
 # and configured fleet repos; without it deep review keeps the legacy no-shell,
-# Read/Grep/Glob-only behavior.
+# Read/Grep/Glob-only behavior. Both Claude-powered paths use the pinned
+# claude-code-action v1.0.161 commit and pass `--model sonnet` to every Claude
+# step.
 
 # Natural-language decisions. Leave false to keep the queue fully deterministic
 # (checkbox + slash-command only). Set true AND add the CLAUDE_CODE_OAUTH_TOKEN

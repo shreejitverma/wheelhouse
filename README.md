@@ -115,6 +115,9 @@ To set it up:
 
 1. Generate a **Claude subscription** token (requires a Claude Pro/Max subscription): run `claude setup-token` in the Claude Code CLI.
    This is **not** an Anthropic API key - the workflows authenticate `anthropics/claude-code-action` with your subscription only.
+   The workflows pin `anthropics/claude-code-action` to `v1.0.161` at `fad22eb3fa582b7357fc0ea48af6645851b884fd` and pass `--model sonnet` to every Claude step.
+   The pinned action resolves `@anthropic-ai/claude-agent-sdk` to `0.3.197`.
+   Claude Code documentation says that on the Anthropic API, Claude Code versions v2.1.197 and later resolve `sonnet` to Sonnet 5.
 2. Add it as an Actions secret named exactly `CLAUDE_CODE_OAUTH_TOKEN`.
 3. For the plain-English path, also set `nl_decisions: true` in `wheelhouse.config.yml`.
 4. Optional: to let deep review and plain-English answers search related PRs, issues, and code across the target repo and configured fleet repos, add an Actions secret named exactly `READONLY_TOKEN`.
