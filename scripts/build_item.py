@@ -14,7 +14,10 @@ Expected fields (all but repo/number optional):
 
 When omitted, `options` defaults by kind via render_card.CHECKBOX_OPTIONS:
 pr-review and issue-triage include the non-consuming `investigate` checkbox;
-ci-approval does not.
+ci-approval does not. Non-checkbox actions (`comment`, `decline`, and
+pr-review-only `request-changes`) are not valid `options`: `comment` and
+`request-changes` require slash-command text, while `decline` can carry a
+slash-command reason or fall back to its default label reason.
 When omitted, `auto_triage` follows the global/per-repo config; a false payload
 value can only opt this item out. `auto_triage_issues` is the INDEPENDENT
 equivalent for issue-triage items - it follows its own global/per-repo config
@@ -31,7 +34,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from render_card import CHECKBOX_OPTIONS  # noqa: E402
+from render_card import CHECKBOX_OPTIONS, checkbox_options  # noqa: E402
 from wheelhouse_core import (  # noqa: E402
     _auto_triage_enabled,
     _auto_triage_issues_enabled,
@@ -92,6 +95,8 @@ def normalize(d):
         options = [o.strip() for o in options.split(",") if o.strip()]
     if not options:
         options = CHECKBOX_OPTIONS.get(kind, ["close", "hold"])
+    else:
+        options = checkbox_options(kind, options)
 
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
     path = "pull" if kind in ("pr-review", "ci-approval") else "issues"
