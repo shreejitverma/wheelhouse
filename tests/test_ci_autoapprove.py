@@ -29,6 +29,9 @@ These tests cover:
   * run-to-PR verification: same-repo runs use GitHub's populated
     `pull_requests` association, while fork runs with an empty association are
     bound by matching `head_sha` plus `head_branch`;
+  * duplicate pending-run hygiene: verified runs sharing a stable
+    workflowDatabaseId approve only the newest run, without collapsing same-named
+    distinct workflows or runs that lack a workflow identity;
   * idempotency by construction (a PR no longer `needs-ci-approval` is never
     re-approved), default-on, explicit opt-out, and the per-repo override.
 """
@@ -973,6 +976,102 @@ def test_approve_ci_any_failed_post_returns_error():
     check("approve_ci: failed approval POST is named", "Lint:forbidden" in message)
 
 
+def test_approve_ci_dedups_duplicate_pending_runs_of_same_workflow():
+    # The card #392 incident: two action_required runs of the SAME workflow
+    # for one head_sha. Approving both is what manufactures the
+    # cancel-in-progress race; approve_ci must approve only one.
+    runs = [
+        {"databaseId": 123, "workflowDatabaseId": 7, "workflowName": "CI"},
+        {"databaseId": 200, "workflowDatabaseId": 7, "workflowName": "CI"},
+    ]
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(returncode=0, stdout=json.dumps(runs), stderr=""),
+        [SimpleNamespace(returncode=0, stdout="", stderr="")],
+    )
+    check("approve_ci: dedup still approves", status == "approved")
+    check(
+        "approve_ci: dedup approves exactly one of the duplicate runs",
+        calls["approved"] == ["200"],
+    )
+    check(
+        "approve_ci: dedup message reports a single matching run",
+        "approved 1 matching run" in message,
+    )
+    check(
+        "approve_ci: run-list asks for workflow IDs",
+        any("workflowDatabaseId" in part for part in calls["run_list"][0]),
+    )
+
+
+def test_approve_ci_does_not_dedup_same_named_distinct_workflows():
+    runs = [
+        {"databaseId": 123, "workflowDatabaseId": 7, "workflowName": "CI"},
+        {"databaseId": 200, "workflowDatabaseId": 8, "workflowName": "CI"},
+    ]
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(returncode=0, stdout=json.dumps(runs), stderr=""),
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ],
+    )
+    check(
+        "approve_ci: same-named distinct workflows still approve",
+        status == "approved",
+    )
+    check(
+        "approve_ci: same-named distinct workflows are not collapsed",
+        calls["approved"] == ["123", "200"],
+    )
+
+
+def test_approve_ci_does_not_dedup_runs_without_workflow_identity():
+    runs = [
+        {"databaseId": 123, "workflowName": None},
+        {"databaseId": 200, "workflowName": None},
+    ]
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(returncode=0, stdout=json.dumps(runs), stderr=""),
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ],
+    )
+    check(
+        "approve_ci: unknown workflow identity runs still approve",
+        status == "approved",
+    )
+    check(
+        "approve_ci: unknown workflow identity runs are not collapsed",
+        calls["approved"] == ["123", "200"],
+    )
+
+
+def test_approve_ci_dedup_does_not_bypass_risky_file_hold():
+    risky = [".github/workflows/ci.yml"]
+    verdict = {
+        "safe": False,
+        "error": False,
+        "risky_files": risky,
+        "pr_target": False,
+        "exploit": False,
+        "reason": "risky",
+    }
+    runs = [
+        {"databaseId": 123, "workflowName": "CI"},
+        {"databaseId": 200, "workflowName": "CI"},
+    ]
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(returncode=0, stdout=json.dumps(runs), stderr=""),
+        safety_verdict=verdict,
+    )
+    check("approve_ci: risky-file HOLD still wins despite duplicate runs", status == "hold")
+    check(
+        "approve_ci: HOLD short-circuits before run-list/approve calls",
+        calls["approved"] == [] and calls["run_list"] == [],
+    )
+
+
 def test_approve_ci_hold_message_caps_risky_file_list():
     risky = [".github/workflows/%02d.yml" % i for i in range(12)]
     verdict = {
@@ -1371,6 +1470,10 @@ def main():
     test_approve_ci_run_list_failure_returns_error()
     test_approve_ci_invalid_run_list_returns_error()
     test_approve_ci_any_failed_post_returns_error()
+    test_approve_ci_dedups_duplicate_pending_runs_of_same_workflow()
+    test_approve_ci_does_not_dedup_same_named_distinct_workflows()
+    test_approve_ci_does_not_dedup_runs_without_workflow_identity()
+    test_approve_ci_dedup_does_not_bypass_risky_file_hold()
     test_approve_ci_hold_message_caps_risky_file_list()
     test_approve_ci_filters_to_current_pr_head_and_number()
     test_approve_ci_fork_run_with_empty_pr_association_is_approved()
