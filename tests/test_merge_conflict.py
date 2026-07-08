@@ -17,6 +17,7 @@ import reconcile  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
 _failures = []
+UNSET = object()
 
 
 def check(name, cond):
@@ -117,10 +118,12 @@ def run_build_repo(
     *,
     card_issues=False,
     auto_approve_ci=False,
+    pending_contributor_cleanup=False,
+    pending_contributor_cleanup_targets=UNSET,
     comments_by_pr=None,
 ):
     comments_by_pr = comments_by_pr if comments_by_pr is not None else {}
-    calls = {"posts": [], "fetches": [], "safety": []}
+    calls = {"posts": [], "fetches": [], "safety": [], "patches": [], "labels": []}
     repo_cfg = {
         "name": "demo",
         "compliance_check": "Gate",
@@ -140,12 +143,31 @@ def run_build_repo(
         }
 
     def fake_rest(path, method=None, fields=None, jq=None, paginate=False, slurp=False):
+        if path.endswith("/labels"):
+            calls["labels"].append({"path": path, "fields": fields})
+            return {}
+        if "/issues/comments/" in path and method == "PATCH":
+            comment_id = int(path.rsplit("/", 1)[-1])
+            body = (fields or {}).get("body", "")
+            calls["patches"].append({"comment_id": comment_id, "body": body})
+            for comments in comments_by_pr.values():
+                for comment in comments:
+                    if comment.get("id") == comment_id:
+                        comment["body"] = body
+            return {}
         number = _issue_number_from_comments_path(path)
         if method == "POST":
             body = (fields or {}).get("body", "")
             calls["posts"].append({"number": number, "body": body})
-            comments_by_pr.setdefault(number, []).append({"body": body})
-            return {"id": len(comments_by_pr[number])}
+            comments = comments_by_pr.setdefault(number, [])
+            comment = {
+                "id": len(comments) + 1,
+                "body": body,
+                "created_at": "2026-01-01T00:00:00Z",
+                "user": {"login": "owner", "__typename": "User"},
+            }
+            comments.append(comment)
+            return dict(comment)
         calls["fetches"].append(
             {"number": number, "paginate": paginate, "slurp": slurp}
         )
@@ -186,8 +208,19 @@ def run_build_repo(
     err = io.StringIO()
     try:
         with redirect_stderr(err):
+            kwargs = {
+                "auto_approve_ci": auto_approve_ci,
+                "pending_contributor_cleanup": pending_contributor_cleanup,
+            }
+            if pending_contributor_cleanup_targets is not UNSET:
+                kwargs["pending_contributor_cleanup_targets"] = (
+                    pending_contributor_cleanup_targets
+                )
             result, items = core.build_repo(
-                "owner", repo_cfg, card_issues, auto_approve_ci=auto_approve_ci
+                "owner",
+                repo_cfg,
+                card_issues,
+                **kwargs,
             )
     finally:
         (
@@ -352,7 +385,67 @@ def test_conflicted_pr_suppresses_card_and_nudges_once_per_head():
     check("nudge: body carries a head-specific marker", core._rebase_nudge_marker("sha42") in body)
     check("nudge: comment fetch uses pagination slurp", calls1["fetches"] and calls1["fetches"][0]["slurp"] is True)
     check("nudge: marker persists in stored comments", len(comments.get(42, [])) == 1)
+    check("nudge: cleanup state is not armed while cleanup disabled",
+          calls1["patches"] == [] and calls1["labels"] == [])
     check("nudge: second scan still ok", result2["ok"] is True)
+
+    enabled_comments = {}
+    _, _, enabled_calls = run_build_repo(
+        [pr], comments_by_pr=enabled_comments, pending_contributor_cleanup=True
+    )
+    patch_bodies = [p["body"] for p in enabled_calls["patches"]]
+    check("nudge: cleanup marker is armed when cleanup enabled",
+          any(core.PENDING_CONTRIBUTOR_MARKER_PREFIX in body for body in patch_bodies))
+    check("nudge: pending contributor label is added when cleanup enabled",
+          any(
+              (item["fields"] or {}).get("labels[]") == core.PENDING_CONTRIBUTOR_LABEL
+              for item in enabled_calls["labels"]
+          ))
+
+    _, _, target_disabled_calls = run_build_repo(
+        [pr],
+        comments_by_pr={},
+        pending_contributor_cleanup=True,
+        pending_contributor_cleanup_targets=["issue"],
+    )
+    check("nudge: cleanup state is not armed when PR target disabled",
+          target_disabled_calls["patches"] == [] and target_disabled_calls["labels"] == [])
+
+    _, _, empty_target_calls = run_build_repo(
+        [pr],
+        comments_by_pr={},
+        pending_contributor_cleanup=True,
+        pending_contributor_cleanup_targets=[],
+    )
+    check("nudge: cleanup state is not armed when cleanup targets are empty",
+          empty_target_calls["patches"] == [] and empty_target_calls["labels"] == [])
+
+    _, _, null_target_calls = run_build_repo(
+        [pr],
+        comments_by_pr={},
+        pending_contributor_cleanup=True,
+        pending_contributor_cleanup_targets=None,
+    )
+    check("nudge: cleanup state is not armed when cleanup targets are null",
+          null_target_calls["patches"] == [] and null_target_calls["labels"] == [])
+
+
+def test_untrusted_rebase_marker_does_not_suppress_nudge():
+    comments = {
+        42: [
+            {
+                "id": 1,
+                "body": "forged\n\n" + core._rebase_nudge_marker("sha42"),
+                "created_at": "2026-01-01T00:00:00Z",
+                "user": HUMAN,
+            }
+        ]
+    }
+    pr = pr_node(42, status_rollup="green", mergeable="CONFLICTING")
+    result, items, calls = run_build_repo([pr], comments_by_pr=comments)
+    check("nudge: untrusted marker keeps scan ok", result["ok"] is True)
+    check("nudge: untrusted marker emits no card", items == [])
+    check("nudge: untrusted marker does not suppress real nudge", len(calls["posts"]) == 1)
 
 
 def test_nudge_skips_owner_and_bot_authors():
@@ -408,6 +501,7 @@ def main():
     test_unknown_mergeability_fails_open()
     test_ci_approval_not_rerouted_by_conflict()
     test_conflicted_pr_suppresses_card_and_nudges_once_per_head()
+    test_untrusted_rebase_marker_does_not_suppress_nudge()
     test_nudge_skips_owner_and_bot_authors()
     test_issue_triage_unaffected()
     test_reconcile_consumes_conflicted_card_that_left_worklist()

@@ -21,8 +21,10 @@ Phases, run as separate workflow steps so each uses the right token:
 
   execute      Act on the TARGET repo (merge / approve-ci / close / decline /
                comment / request-changes) using the ambient GH_TOKEN, which the
-               workflow sets to FLEET_TOKEN for this step. Writes
-               result_message/terminal_state to $GITHUB_OUTPUT.
+               workflow sets to FLEET_TOKEN for this step. A successful
+               request-changes action may also arm deterministic stale
+               pending-contributor cleanup by writing target-side state.
+               Writes result_message/terminal_state to $GITHUB_OUTPUT.
 
   clear-checkbox  Print $ISSUE_BODY_FILE (or $ISSUE_BODY) with the $OPT_KEY
                checkbox un-ticked, so the handler can rewrite a card after a
@@ -57,7 +59,10 @@ Natural-language phases (gated on nl_decisions + CLAUDE_CODE_OAUTH_TOKEN):
 Security: the caller owner/maintainer-gates the whole job; only
 owner/maintainer-authored text ever reaches this script (and the LLM). Merge and
 request-changes re-check the PR head SHA against the card's state block and
-refuse if the PR moved. approve-ci routes through the shared CI safety verdict:
+refuse if the PR moved. request-changes cleanup arming is best-effort and
+fail-open: if the review posts but the target-side marker cannot be proven or
+written, the card still stays open with a cleanup-only note. approve-ci routes
+through the shared CI safety verdict:
 CI/action-file changes hard-hold, while non-default bases and
 `pull_request_target` posture add warnings, and each awaiting workflow run is
 bound to the PR by strict pull_requests association or fork fallback head SHA
@@ -513,6 +518,32 @@ def _thank_contributor(owner, repo, number, pr):
         )
 
 
+def _pending_contributor_cleanup_active(repo):
+    try:
+        cfg = core.load_config()
+    except SystemExit as e:
+        print(
+            "::warning::wheelhouse pending-contributor cleanup config unavailable for %s: %s"
+            % (repo, str(e)[:160])
+        )
+        return False
+    except Exception as e:
+        print(
+            "::warning::wheelhouse pending-contributor cleanup config unavailable for %s: %s"
+            % (repo, str(e)[:160])
+        )
+        return False
+    repo_cfg = (cfg.get("repos") or {}).get(repo, {})
+    if not core._pending_contributor_cleanup_enabled(
+        repo_cfg, cfg.get("pending_contributor_cleanup", False)
+    ):
+        return False
+    targets = core._pending_contributor_cleanup_targets(
+        repo_cfg, cfg.get("pending_contributor_cleanup_targets", ["pr"])
+    )
+    return "pr" in targets
+
+
 def _stale_pr_head_result(repo, number, expected, current, action):
     if expected and current and current != expected:
         return (
@@ -603,7 +634,12 @@ def do_request_changes(owner, repo, number, head_sha, text):
     is a defensive check rather than an expected path. One review is
     submitted per call - repeated `/request-changes` posts another GitHub
     review each time (allowed by the API but noisy), so this is a "one review
-    per push cycle" convention, not enforced dismissal/superseding logic."""
+    per push cycle" convention, not enforced dismissal/superseding logic.
+
+    When pending-contributor cleanup is active for the repo, a successful review
+    against a non-maintainer human's PR also writes a target-side hidden marker
+    and label so the scheduled scan can remind and later close if the contributor
+    never follows up. Failure to arm that cleanup does not undo the review."""
     if not str(text or "").strip():
         return (
             "Can't request changes on %s#%s without review text." % (repo, number),
@@ -621,22 +657,67 @@ def do_request_changes(owner, repo, number, head_sha, text):
                 % (repo, number, head_sha[:8], current[:8]),
                 "none",
             )
-        author = str(((pr or {}).get("user") or {}).get("login") or "")
+        target_author = (pr or {}).get("user") or {}
+        author = str(target_author.get("login") or "")
         if author and author.casefold() == owner.casefold():
             return (
                 "Can't request changes on %s#%s: it's your own PR (GitHub "
                 "rejects self-review)." % (repo, number),
                 "error",
             )
-        core.gh_rest(
+        review = core.gh_rest(
             "/repos/%s/pulls/%s/reviews" % (slug, number),
             method="POST",
             fields={"body": text, "event": "REQUEST_CHANGES"},
+        )
+        review_id = (review or {}).get("id") if isinstance(review, dict) else None
+        submitted_at = (
+            (review or {}).get("submitted_at") if isinstance(review, dict) else None
         )
     except RuntimeError as e:
         return (
             "Requesting changes on %s#%s failed: %s" % (repo, number, str(e)[:200]),
             "error",
+        )
+    if not _pending_contributor_cleanup_active(repo):
+        return (
+            "Requested changes on %s#%s and left the card open." % (repo, number),
+            "none",
+        )
+    maintainer_logins = {str(login).casefold() for login in core.maintainers()}
+    if owner:
+        maintainer_logins.add(owner.casefold())
+    if core._is_non_maintainer_human(target_author, maintainer_logins) is not True:
+        return (
+            "Requested changes on %s#%s and left the card open." % (repo, number),
+            "none",
+        )
+    try:
+        if review_id and not submitted_at:
+            try:
+                reread = core.gh_rest(
+                    "/repos/%s/pulls/%s/reviews/%s" % (slug, number, review_id)
+                )
+            except RuntimeError as e:
+                raise RuntimeError("review timestamp lookup failed: %s" % str(e)[:160])
+            if isinstance(reread, dict):
+                submitted_at = reread.get("submitted_at")
+        core.arm_pending_contributor_action(
+            owner,
+            repo,
+            number,
+            "request-changes",
+            submitted_at,
+            current,
+            author,
+            asked_by=owner,
+            source_id=review_id,
+        )
+    except Exception as e:
+        return (
+            "Requested changes on %s#%s and left the card open. Stale cleanup was not armed: %s"
+            % (repo, number, str(e)[:160]),
+            "none",
         )
     return (
         "Requested changes on %s#%s and left the card open." % (repo, number),
