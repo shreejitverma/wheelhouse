@@ -5,9 +5,10 @@ Wheelhouse - decision-card renderer + card operations.
 `render(item)` turns one classified item into a decision card: a human-readable
 body with quick-decision checkboxes (or a held auto-triage placeholder) and a
 hidden machine-readable state block.
-`upsert_card`/`close_card` create/refresh/consume cards in THIS repo (via the
-ambient GH_TOKEN, which the workflow sets to the default GITHUB_TOKEN so that
-card-side activity never re-triggers the handler).
+`upsert_card`/`reflect_activity`/`close_card` create, refresh, activity-stamp,
+or consume cards in THIS repo (via the ambient GH_TOKEN, which the workflow
+sets to the default GITHUB_TOKEN so that card-side activity never re-triggers
+the handler).
 
 When auto triage is enabled (`should_hold`), a brand-new pr-review/issue-
 triage card is created HELD - `pending-triage` on top of `needs-decision`, a
@@ -96,7 +97,8 @@ KIND_LABEL = {
 
 
 # --------------------------------------------------------------------------- #
-# Card-refresh semantics (an open card must reflect CURRENT target state)
+# Card-refresh and activity-reflection semantics
+# (an open card must reflect CURRENT target state)
 # --------------------------------------------------------------------------- #
 # Wheelhouse-managed label namespaces. On refresh `upsert_card` REPLACES these
 # (removing ones that no longer apply); `needs-decision` and any human-added
@@ -107,8 +109,8 @@ MANAGED_LABEL_PREFIXES = ("repo:", "kind:", "priority:", "target:")
 # decision in flight (`processing`), the card is consumed (`resolved`), or the
 # owner parked it (`blocked`, via the `/hold` decision). Re-rendering the body
 # resets its checkboxes, which would clobber an in-progress decision or race
-# the decision-handler - so a refresh SKIPS a card with any of these. Only a
-# pure `needs-decision` card is refreshed.
+# the decision-handler - so full refresh and activity reflection SKIP a card
+# with any of these. Only a pure `needs-decision` card is maintained this way.
 NON_REFRESHABLE_LABELS = frozenset({"processing", "resolved", "blocked"})
 
 # A held card (see "Held cards" below) ALSO carries `needs-decision` and is
@@ -158,6 +160,10 @@ SYNCED_EXACT_LABELS = frozenset({HOLD_LABEL})
 # The fields whose change makes a card materially stale and worth re-rendering.
 # Title / summary / recommendation re-render naturally; they are NOT triggers.
 MATERIAL_FIELDS = ("head_sha", "comp", "tests", "kind", "priority", "options")
+
+# Non-material hidden timestamp used only to mirror target GitHub activity onto
+# the card issue's own updatedAt for `sort:updated-desc`.
+ACTIVITY_REFLECTED_FIELD = "activity_reflected_at"
 
 # The version of the body `render()` currently produces. A card's stored
 # `render_version` behind this value is stale and gets exactly one re-render
@@ -288,7 +294,9 @@ def normalized_options(options):
 
 
 def normalized_material_options(options):
-    return sorted(o for o in normalized_options(options) if o != ACCEPT_RECOMMENDATION_OPTION)
+    return sorted(
+        o for o in normalized_options(options) if o != ACCEPT_RECOMMENDATION_OPTION
+    )
 
 
 def material_signature(item):
@@ -388,7 +396,7 @@ def state_revision(state, kind):
     return (state or {}).get("head_sha", "") or ""
 
 
-def _parse_issue_revision(value):
+def _parse_iso_timestamp(value):
     text = (value or "").strip()
     if not text:
         return None
@@ -401,6 +409,10 @@ def _parse_issue_revision(value):
     return parsed.astimezone(timezone.utc)
 
 
+def _parse_issue_revision(value):
+    return _parse_iso_timestamp(value)
+
+
 def _issue_revision_is_older(revision, state):
     stored = state_revision(state, "issue-triage")
     if not revision or not stored:
@@ -408,6 +420,48 @@ def _issue_revision_is_older(revision, state):
     incoming = _parse_issue_revision(revision)
     current = _parse_issue_revision(stored)
     return bool(incoming and current and incoming < current)
+
+
+def target_activity_timestamp(item):
+    return item.get("updated_at", "") or ""
+
+
+def _activity_reflection_baseline(state, card_updated_at=""):
+    stored = (state or {}).get(ACTIVITY_REFLECTED_FIELD)
+    if stored:
+        parsed = _parse_iso_timestamp(stored)
+        if parsed:
+            return parsed
+    return _parse_iso_timestamp(card_updated_at)
+
+
+def activity_reflection_needed(item, state, labels, card_updated_at=""):
+    if not is_refreshable(labels):
+        return False
+    if not state:
+        return False
+    live = _parse_iso_timestamp(target_activity_timestamp(item))
+    if not live:
+        return False
+    baseline = _activity_reflection_baseline(state, card_updated_at)
+    return bool(baseline and live > baseline)
+
+
+def _state_with_activity_reflected(
+    state, item, card_updated_at="", allow_without_baseline=False
+):
+    live_text = target_activity_timestamp(item)
+    live = _parse_iso_timestamp(live_text)
+    if not live:
+        return dict(state or {})
+    baseline = _activity_reflection_baseline(state, card_updated_at)
+    if baseline and live <= baseline:
+        return dict(state or {})
+    if not baseline and not allow_without_baseline:
+        return dict(state or {})
+    new_state = dict(state or {})
+    new_state[ACTIVITY_REFLECTED_FIELD] = live_text
+    return new_state
 
 
 def triage_fresh(item, state):
@@ -488,7 +542,7 @@ def _label_names(labels):
 def is_refreshable(labels):
     """A card is refreshable only while it has `needs-decision` and no
     in-flight or terminal label. `pending-triage` is allowed because held cards
-    must still refresh, auto-triage, and self-heal."""
+    must still refresh, reflect activity, auto-triage, and self-heal."""
     names = _label_names(labels)
     return "needs-decision" in names and names.isdisjoint(NON_REFRESHABLE_LABELS)
 
@@ -655,10 +709,13 @@ def accept_recommendation_available(state):
     revision = state_revision(state, kind)
     if not revision or (state or {}).get("triaged_sha") != revision:
         return False
-    return recommendation_for_state(
-        {"triage_recommendation": (state or {}).get("triage_recommendation")},
-        kind,
-    ) is not None
+    return (
+        recommendation_for_state(
+            {"triage_recommendation": (state or {}).get("triage_recommendation")},
+            kind,
+        )
+        is not None
+    )
 
 
 def options_for_state(kind, options, state):
@@ -739,9 +796,7 @@ def _set_recommendation_section_visible(body, visible):
 def _ensure_recommendation_section(body, recommendation):
     if "### Recommended action" in (body or ""):
         return body
-    section = "### Recommended action\n%s\n" % (
-        recommendation or "Needs your call."
-    )
+    section = "### Recommended action\n%s\n" % (recommendation or "Needs your call.")
     marker = "\n%s" % DECISION_START
     idx = (body or "").find(marker)
     if idx >= 0:
@@ -757,6 +812,18 @@ def _replace_state_block(body, state):
     if _STATE_BLOCK_RE.search(body or ""):
         return _STATE_BLOCK_RE.sub(marker, body, count=1)
     return (body or "").rstrip() + "\n\n" + marker
+
+
+def body_with_activity_reflected(body, item, card_updated_at=""):
+    state = parse_state_block(body)
+    if not state:
+        return body
+    new_state = _state_with_activity_reflected(
+        state, item, card_updated_at=card_updated_at
+    )
+    if new_state == state:
+        return body
+    return _replace_state_block(body, new_state)
 
 
 def _preserve_same_revision_triage(body, existing_body, item, old_state, owner=""):
@@ -836,6 +903,9 @@ def body_with_triage_queued(body, item):
         return body
     clean = remove_triage_section(body)
     new_state = _state_with_triage(state, revision, "queued")
+    new_state = _state_with_activity_reflected(
+        new_state, item, allow_without_baseline=True
+    )
     new_state["options"] = options_for_state(kind, state.get("options"), new_state)
     if not state.get("held"):
         clean = _publish_decision_section(clean, kind, new_state["options"])
@@ -859,7 +929,9 @@ def body_with_triage_result(body, revision, triage=None, error=None, owner=""):
     )
     updated = _insert_triage_section(body, section)
     recommendation = (
-        recommendation_for_state(normalized, kind, owner=owner, repo=state.get("repo", ""))
+        recommendation_for_state(
+            normalized, kind, owner=owner, repo=state.get("repo", "")
+        )
         if normalized
         else None
     )
@@ -926,7 +998,9 @@ def _publish_decision_section(body, kind, options):
     checkboxes, in place. A no-op (returns `body` unchanged) if the markers
     are missing, e.g. a pre-feature card that was never held."""
     section = _decision_section(kind, options, held=False)
-    new_body, count = _DECISION_SECTION_RE.subn(section.replace("\\", "\\\\"), body or "", count=1)
+    new_body, count = _DECISION_SECTION_RE.subn(
+        section.replace("\\", "\\\\"), body or "", count=1
+    )
     return new_body if count else body
 
 
@@ -958,6 +1032,7 @@ def render(item, held=False):
         "kind": kind,
         "head_sha": item.get("head_sha", "") or "",
         "updated_at": item.get("updated_at", "") or "",
+        ACTIVITY_REFLECTED_FIELD: target_activity_timestamp(item),
         "options": base_options,
     }
     state.update({k: v for k, v in material_signature(item).items() if k != "options"})
@@ -1071,7 +1146,7 @@ def find_card(marker):
             "--label",
             marker,
             "--json",
-            "number,body,labels",
+            "number,body,labels,updatedAt",
             "--limit",
             "5",
         ]
@@ -1082,7 +1157,7 @@ def find_card(marker):
 
 def get_card(number):
     r = _gh(
-        ["issue", "view", str(number), "--json", "number,body,labels,state"],
+        ["issue", "view", str(number), "--json", "number,body,labels,state,updatedAt"],
         check=False,
     )
     if r.returncode != 0:
@@ -1092,6 +1167,10 @@ def get_card(number):
 
 def issue_is_open(issue):
     return str((issue or {}).get("state", "OPEN")).upper() == "OPEN"
+
+
+def card_updated_at(issue):
+    return (issue or {}).get("updated_at") or (issue or {}).get("updatedAt") or ""
 
 
 def _write_body(body):
@@ -1121,6 +1200,19 @@ def mark_triage_queued(number, item, body):
     if new_body == body:
         return False
     _edit_issue_body(number, new_body)
+    return True
+
+
+def reflect_activity(number, item, body, card_updated_at=""):
+    """Bump the card's own updated time with a hidden state-only body edit.
+
+    This never renders the full card, never changes labels, and never comments.
+    """
+    new_body = body_with_activity_reflected(body, item, card_updated_at=card_updated_at)
+    if new_body == body:
+        return False
+    _edit_issue_body(number, new_body)
+    print("reflected target activity on card #%s for %s" % (number, marker_label(item)))
     return True
 
 
@@ -1334,8 +1426,13 @@ def upsert_card(item, existing=None, has_token=False):
         terminating re-render for display-only fixes and card-body repairs like
         cached triage ref qualification or automated-status labeling), or a
         held card must be published because auto triage is no longer eligible;
-        a card with none of those triggers is a full no-op (no body edit, no
-        label churn, no comment).
+        these are full-card refreshes.
+      * If no full refresh or auto-triage queued write is needed, but the
+        target's `updated_at` is newer than the hidden `activity_reflected_at`
+        stamp, `reflect_activity` edits only the state block so GitHub's
+        recently-updated issue sort sees the target activity. If that stamp is
+        fresh too, the card is a full no-op (no body edit, no label churn, no
+        comment).
       * On refresh the wheelhouse-managed labels (`repo:`/`kind:`/`priority:`/
         `target:`) are REPLACED so stale ones are removed, and a head-SHA change
         also drops a short "target updated" comment. A held card whose refreshed
@@ -1352,9 +1449,7 @@ def upsert_card(item, existing=None, has_token=False):
     if known_number:
         existing = get_card(known_number)
         if not existing or not issue_is_open(existing):
-            print(
-                "skip card #%s for %s: card no longer open" % (known_number, marker)
-            )
+            print("skip card #%s for %s: card no longer open" % (known_number, marker))
             return known_number
     else:
         existing = find_card(marker)
@@ -1374,6 +1469,13 @@ def upsert_card(item, existing=None, has_token=False):
     old_state = parse_state_block(existing.get("body", ""))
     publish_held = held_publish_needed(item, old_state, has_token)
     if not refresh_needed(item, old_state, has_token):
+        if not should_auto_triage(item, old_state, existing.get("labels"), has_token):
+            reflect_activity(
+                number,
+                item,
+                existing.get("body", ""),
+                card_updated_at=card_updated_at(existing),
+            )
         print("skip card #%s for %s: no material change" % (number, marker))
         return number
     held = bool((old_state or {}).get("held")) and not publish_held
@@ -1660,7 +1762,12 @@ def main():
             print(
                 "::warning::failed to dispatch auto triage for card #%s (%s#%s): %s "
                 "- publishing the card so it is not left held indefinitely"
-                % (current["number"], item.get("repo"), item.get("number"), str(e)[:160])
+                % (
+                    current["number"],
+                    item.get("repo"),
+                    item.get("number"),
+                    str(e)[:160],
+                )
             )
             owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
             publish_dispatch_failure(

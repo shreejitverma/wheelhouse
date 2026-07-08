@@ -1,7 +1,8 @@
 name: ingest
 
 # Fast path: a source repo (or a manual test) hands us an item that needs the
-# maintainer's decision, and we create or refresh a decision-card issue for it.
+# maintainer's decision, and we create, refresh, or activity-reflect a
+# decision-card issue for it.
 # For eligible PR-review or issue-triage cards, this also queues the advisory
 # auto-triage workflow after writing the per-revision cache marker.
 # A brand-new eligible card is created HELD (`pending-triage`, no decision
@@ -36,7 +37,7 @@ on:
         description: "PR head SHA (recommended for pr-review/ci-approval)"
         required: false
       updated_at:
-        description: "Issue updatedAt revision (recommended for issue-triage; enables auto-triage caching)"
+        description: "Target PR/issue updatedAt (recommended; issue-triage uses it as the triage revision)"
         required: false
       title:
         description: "Short title of the target"

@@ -24,13 +24,16 @@ When omitted, `auto_triage` follows the global/per-repo config; a false payload
 value can only opt this item out. `auto_triage_issues` is the INDEPENDENT
 equivalent for issue-triage items - it follows its own global/per-repo config
 and a false payload value can only opt that item out; it never affects
-`auto_triage` or vice versa. `updated_at` is the issue-triage auto-triage cache
-key (issues have no head SHA); omit it and this item is simply never eligible
-for automatic issue triage (fail-open, mirroring a pr-review item with no
-`head_sha`). The same eligibility gates decide whether render_card.py creates a
-brand-new card as a held `pending-triage` placeholder before that first
-auto-triage attempt.
+`auto_triage` or vice versa. `updated_at` is the target's GitHub `updatedAt`.
+For issue-triage it is also the auto-triage cache key (issues have no head SHA);
+omit it and this item is simply never eligible for automatic issue triage
+(fail-open, mirroring a pr-review item with no `head_sha`). For all kinds,
+passing it lets Wheelhouse reflect target activity onto the card issue's own
+updated time for GitHub's recently-updated queue sort. The same eligibility gates
+decide whether render_card.py creates a brand-new card as a held
+`pending-triage` placeholder before that first auto-triage attempt.
 """
+
 import json
 import os
 import sys
@@ -102,8 +105,9 @@ def normalize(d):
 
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
     path = "pull" if kind in ("pr-review", "ci-approval") else "issues"
-    url = d.get("url") or ("https://github.com/%s/%s/%s/%d" % (owner, repo, path, number)
-                           if owner else "")
+    url = d.get("url") or (
+        "https://github.com/%s/%s/%s/%d" % (owner, repo, path, number) if owner else ""
+    )
     try:
         cfg = load_config()
         repo_cfg = cfg["repos"].get(repo, {})

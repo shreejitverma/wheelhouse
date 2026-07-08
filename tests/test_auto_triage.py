@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Offline checks for automatic lightweight PR-card and issue-card triage,
-including structured accept recommendations, held-card publish, and recovery
-behavior.
+including activity-stamp interaction, structured accept recommendations,
+held-card publish, and recovery behavior.
 
 Run: python tests/test_auto_triage.py
 """
@@ -157,7 +157,7 @@ def scan_payload(items, open_pr_numbers=(42,), open_issue_numbers=()):
 
 
 def run_reconcile(scan, cards, current_cards=None, token="true"):
-    calls = {"upsert": [], "close": [], "mark": [], "dispatch": []}
+    calls = {"upsert": [], "close": [], "mark": [], "dispatch": [], "reflect": []}
     current_by_number = {
         c["number"]: dict(c)
         for c in (cards if current_cards is None else current_cards)
@@ -185,13 +185,34 @@ def run_reconcile(scan, cards, current_cards=None, token="true"):
         return current_by_number.get(int(number))
 
     def fake_mark(number, it, body):
-        calls["mark"].append({"number": number, "item": it, "body": body})
         current = current_by_number[int(number)]
-        current["body"] = rc.body_with_triage_queued(body, it)
+        new_body = rc.body_with_triage_queued(body, it)
+        calls["mark"].append(
+            {"number": number, "item": it, "body": body, "body_after": new_body}
+        )
+        current["body"] = new_body
         return True
 
     def fake_dispatch(number, it):
         calls["dispatch"].append({"number": number, "item": it})
+
+    def fake_reflect(number, it, body, card_updated_at=""):
+        new_body = rc.body_with_activity_reflected(
+            body, it, card_updated_at=card_updated_at
+        )
+        calls["reflect"].append(
+            {
+                "number": number,
+                "item": it,
+                "body": body,
+                "card_updated_at": card_updated_at,
+                "body_after": new_body,
+            }
+        )
+        if new_body == body:
+            return False
+        current_by_number[int(number)]["body"] = new_body
+        return True
 
     old = (
         sys.argv[:],
@@ -200,6 +221,7 @@ def run_reconcile(scan, cards, current_cards=None, token="true"):
         reconcile.render_card.get_card,
         reconcile.render_card.mark_triage_queued,
         reconcile.render_card.dispatch_triage_workflow,
+        reconcile.render_card.reflect_activity,
         os.environ.get("WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN"),
     )
     reconcile.render_card.upsert_card = fake_upsert
@@ -207,6 +229,7 @@ def run_reconcile(scan, cards, current_cards=None, token="true"):
     reconcile.render_card.get_card = fake_get_card
     reconcile.render_card.mark_triage_queued = fake_mark
     reconcile.render_card.dispatch_triage_workflow = fake_dispatch
+    reconcile.render_card.reflect_activity = fake_reflect
     os.environ["WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN"] = token
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -227,6 +250,7 @@ def run_reconcile(scan, cards, current_cards=None, token="true"):
             reconcile.render_card.get_card,
             reconcile.render_card.mark_triage_queued,
             reconcile.render_card.dispatch_triage_workflow,
+            reconcile.render_card.reflect_activity,
             old_token,
         ) = old
         if old_token is None:
@@ -448,19 +472,37 @@ def test_structured_recommendation_persists_and_renders_accept():
         else:
             os.environ["GITHUB_REPOSITORY_OWNER"] = prior
     state = core.parse_state_block(body)
-    check("accept render: checkbox appears for valid structured rec",
-          "<!-- opt:accept-recommendation -->" in body)
-    check("accept render: deterministic recommendation is suppressed",
-          "### Recommended action" not in body)
-    check("accept state: structured recommendation persisted",
-          state.get("triage_recommendation") == {
-              "action": "decline",
-              "reason": "Duplicate of acme/wheelhouse#127; fixed on default.",
-          })
-    check("accept state: option list matches visible checkbox set",
-          state.get("options", [])[0] == "accept-recommendation")
-    check("accept render: no bare #127 survives in persisted/visible reason",
-          " #127" not in body and "acme/wheelhouse#127" in body)
+    check(
+        "accept render: checkbox appears for valid structured rec",
+        "<!-- opt:accept-recommendation -->" in body,
+    )
+    check(
+        "accept render: deterministic recommendation is suppressed",
+        "### Recommended action" not in body,
+    )
+    check(
+        "accept state: structured recommendation persisted",
+        state.get("triage_recommendation")
+        == {
+            "action": "decline",
+            "reason": "Duplicate of acme/wheelhouse#127; fixed on default.",
+        },
+    )
+    check(
+        "accept state: option list matches visible checkbox set",
+        state.get("options", [])[0] == "accept-recommendation",
+    )
+    check(
+        "accept render: no bare #127 survives in persisted/visible reason",
+        " #127" not in body and "acme/wheelhouse#127" in body,
+    )
+    activity_only = dict(state)
+    activity_only["activity_reflected_at"] = "2099-01-01T00:00:00Z"
+    check(
+        "accept availability: activity_reflected_at does not affect accept",
+        rc.accept_recommendation_available(activity_only)
+        == rc.accept_recommendation_available(state),
+    )
 
 
 def test_accept_checkbox_is_conditional_and_never_ci_approval():
@@ -473,8 +515,10 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
         }
     )
     valid_body = rc.render(valid)["body"]
-    check("accept conditional: pr merge rec renders accept",
-          "<!-- opt:accept-recommendation -->" in valid_body)
+    check(
+        "accept conditional: pr merge rec renders accept",
+        "<!-- opt:accept-recommendation -->" in valid_body,
+    )
 
     legacy = item(
         triage={
@@ -484,10 +528,14 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
         }
     )
     legacy_body = rc.render(legacy)["body"]
-    check("accept conditional: legacy markdown rec does not render accept",
-          "<!-- opt:accept-recommendation -->" not in legacy_body)
-    check("accept conditional: legacy keeps deterministic recommendation",
-          "### Recommended action" in legacy_body)
+    check(
+        "accept conditional: legacy markdown rec does not render accept",
+        "<!-- opt:accept-recommendation -->" not in legacy_body,
+    )
+    check(
+        "accept conditional: legacy keeps deterministic recommendation",
+        "### Recommended action" in legacy_body,
+    )
 
     invalid = item_issue(
         triage={
@@ -497,8 +545,10 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
             "recommended_reason": "Issues cannot merge.",
         }
     )
-    check("accept conditional: invalid per-kind action omitted",
-          "<!-- opt:accept-recommendation -->" not in rc.render(invalid)["body"])
+    check(
+        "accept conditional: invalid per-kind action omitted",
+        "<!-- opt:accept-recommendation -->" not in rc.render(invalid)["body"],
+    )
 
     missing_reason = item_issue(
         triage={
@@ -508,8 +558,10 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
             "recommended_reason": "",
         }
     )
-    check("accept conditional: missing required reason omitted",
-          "<!-- opt:accept-recommendation -->" not in rc.render(missing_reason)["body"])
+    check(
+        "accept conditional: missing required reason omitted",
+        "<!-- opt:accept-recommendation -->" not in rc.render(missing_reason)["body"],
+    )
 
     discuss = item_issue(
         triage={
@@ -521,18 +573,24 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
     )
     discuss_body = rc.render(discuss)["body"]
     discuss_state = core.parse_state_block(discuss_body)
-    check("accept conditional: discuss action stays inert",
-          "<!-- opt:accept-recommendation -->" not in discuss_body)
-    check("accept conditional: discuss action is not persisted",
-          "triage_recommendation" not in discuss_state)
+    check(
+        "accept conditional: discuss action stays inert",
+        "<!-- opt:accept-recommendation -->" not in discuss_body,
+    )
+    check(
+        "accept conditional: discuss action is not persisted",
+        "triage_recommendation" not in discuss_state,
+    )
 
     failed = rc.body_with_triage_result(
         rc.render(item_issue())["body"],
         item_issue()["updated_at"],
         error="timeout",
     )
-    check("accept conditional: failed triage omits accept",
-          "<!-- opt:accept-recommendation -->" not in failed)
+    check(
+        "accept conditional: failed triage omits accept",
+        "<!-- opt:accept-recommendation -->" not in failed,
+    )
 
     ci = item(
         kind="ci-approval",
@@ -544,8 +602,10 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
             "recommended_reason": "Checks are waiting.",
         },
     )
-    check("accept conditional: ci-approval never renders accept",
-          "<!-- opt:accept-recommendation -->" not in rc.render(ci)["body"])
+    check(
+        "accept conditional: ci-approval never renders accept",
+        "<!-- opt:accept-recommendation -->" not in rc.render(ci)["body"],
+    )
 
 
 def test_triage_section_owner_repo_drive_qualification_not_model_text():
@@ -692,22 +752,33 @@ def test_body_helpers_queue_and_apply_result():
         owner="acme",
     )
     structured_state = core.parse_state_block(structured)
-    check("result: structured recommendation persisted into state",
-          structured_state.get("triage_recommendation") == {
-              "action": "request-changes",
-              "reason": "Please add a regression test for acme/wheelhouse#7.",
-          })
-    check("result: accept checkbox appears after structured triage succeeds",
-          "<!-- opt:accept-recommendation -->" in structured)
-    check("result: deterministic recommendation suppressed after structured triage",
-          "### Recommended action" not in structured)
+    check(
+        "result: structured recommendation persisted into state",
+        structured_state.get("triage_recommendation")
+        == {
+            "action": "request-changes",
+            "reason": "Please add a regression test for acme/wheelhouse#7.",
+        },
+    )
+    check(
+        "result: accept checkbox appears after structured triage succeeds",
+        "<!-- opt:accept-recommendation -->" in structured,
+    )
+    check(
+        "result: deterministic recommendation suppressed after structured triage",
+        "### Recommended action" not in structured,
+    )
 
-    parsed_structured = rc.parse_triage_json(json.dumps({
-        "summary": "Adds lightweight context.",
-        "product_implications": "Routine internal change.",
-        "recommended_action": "request-changes",
-        "recommended_reason": "Please add a regression test for #8.",
-    }))
+    parsed_structured = rc.parse_triage_json(
+        json.dumps(
+            {
+                "summary": "Adds lightweight context.",
+                "product_implications": "Routine internal change.",
+                "recommended_action": "request-changes",
+                "recommended_reason": "Please add a regression test for #8.",
+            }
+        )
+    )
     from_parsed = rc.body_with_triage_result(
         queued,
         it["head_sha"],
@@ -715,13 +786,18 @@ def test_body_helpers_queue_and_apply_result():
         owner="acme",
     )
     from_parsed_state = core.parse_state_block(from_parsed)
-    check("result: parsed structured Claude output still renders accept",
-          "<!-- opt:accept-recommendation -->" in from_parsed)
-    check("result: parsed structured Claude output persists recommendation",
-          from_parsed_state.get("triage_recommendation") == {
-              "action": "request-changes",
-              "reason": "Please add a regression test for acme/wheelhouse#8.",
-          })
+    check(
+        "result: parsed structured Claude output still renders accept",
+        "<!-- opt:accept-recommendation -->" in from_parsed,
+    )
+    check(
+        "result: parsed structured Claude output persists recommendation",
+        from_parsed_state.get("triage_recommendation")
+        == {
+            "action": "request-changes",
+            "reason": "Please add a regression test for acme/wheelhouse#8.",
+        },
+    )
 
 
 def test_automated_status_lines_are_labeled_only_on_allowlist():
@@ -773,7 +849,8 @@ def test_automated_status_lines_are_labeled_only_on_allowlist():
     formatted_labeled = rc.label_automated_status_lines(formatted)
     check(
         "status-label: formatted triage row is marked automated",
-        formatted_labeled == (
+        formatted_labeled
+        == (
             "- **Summary:** `[automated status]` Waited for background terminal 60s.\n"
         ),
     )
@@ -1337,8 +1414,16 @@ def test_render_issue_triage_section_has_no_mentions_and_caches_revision():
         state.get("updated_at") == triaged["updated_at"],
     )
     check(
+        "state(issue): state carries activity_reflected_at",
+        state.get("activity_reflected_at") == triaged["updated_at"],
+    )
+    check(
         "state(issue): updated_at is not a material field",
         "updated_at" not in rc.MATERIAL_FIELDS,
+    )
+    check(
+        "state(issue): activity_reflected_at is not a material field",
+        "activity_reflected_at" not in rc.MATERIAL_FIELDS,
     )
 
 
@@ -1373,6 +1458,10 @@ def test_body_helpers_queue_and_apply_result_for_issue():
     check(
         "queue(issue): triaged_sha advances with updated_at",
         requeued_state.get("triaged_sha") == advanced["updated_at"],
+    )
+    check(
+        "queue(issue): activity stamp folds into queued write",
+        requeued_state.get("activity_reflected_at") == advanced["updated_at"],
     )
     stale = item_issue(updated_at="2024-02-01T00:00:00Z")
     rolled_back = rc.body_with_triage_queued(requeued, stale)
@@ -1437,6 +1526,11 @@ def test_should_auto_triage_cache_and_gates_for_issue():
     check(
         "cache(issue): matching triaged_sha (== updated_at) skips triage",
         rc.should_auto_triage(it, fresh_state, pure, has_token=True) is False,
+    )
+    activity_only = dict(fresh_state, activity_reflected_at="2099-01-01T00:00:00Z")
+    check(
+        "cache(issue): activity_reflected_at does not affect triage freshness",
+        rc.should_auto_triage(it, activity_only, pure, has_token=True) is False,
     )
     check(
         "cache(issue): advanced updated_at with old triaged_sha needs triage",
@@ -1562,9 +1656,40 @@ def test_reconcile_queues_after_issue_updated_at_advance():
         len(calls["dispatch"]) == 1,
     )
     check(
+        "reconcile(issue): updated_at advance does not do a separate activity stamp",
+        calls["reflect"] == [],
+    )
+    queued_state = core.parse_state_block(calls["mark"][0]["body_after"])
+    check(
+        "reconcile(issue): queued write folds activity_reflected_at",
+        queued_state.get("activity_reflected_at") == "2024-06-01T00:00:00Z",
+    )
+    check(
         "reconcile(issue): queued triage uses the new updated_at",
         calls["dispatch"]
         and calls["dispatch"][0]["item"]["updated_at"] == "2024-06-01T00:00:00Z",
+    )
+
+
+def test_reconcile_reflects_issue_updated_at_when_auto_triage_disabled():
+    old = item_issue(updated_at="2024-01-01T00:00:00Z", auto_triage_issues=False)
+    old_card = card_row(old)
+    new = item_issue(updated_at="2024-06-01T00:00:00Z", auto_triage_issues=False)
+    calls = run_reconcile(
+        scan_payload([new], open_pr_numbers=(), open_issue_numbers=(42,)), [old_card]
+    )
+    check(
+        "reconcile(issue): disabled triage does not queue",
+        calls["mark"] == [] and calls["dispatch"] == [],
+    )
+    check(
+        "reconcile(issue): disabled triage still reflects target activity",
+        len(calls["reflect"]) == 1,
+    )
+    reflected_state = core.parse_state_block(calls["reflect"][0]["body_after"])
+    check(
+        "reconcile(issue): reflected activity stamp uses new updated_at",
+        reflected_state.get("activity_reflected_at") == "2024-06-01T00:00:00Z",
     )
 
 
@@ -1815,7 +1940,7 @@ def test_triage_workflow_security_wiring():
         )
         check(
             "workflow: trusted source can be prepared before setup-python",
-            'command -v python3 || command -v python' in run,
+            "command -v python3 || command -v python" in run,
         )
 
     check("workflow: resolve gate exists", resolve is not None)
@@ -2002,7 +2127,9 @@ def test_triage_workflow_security_wiring():
     )
 
     trusted_i = step_index(steps, lambda s: s.get("id") == "trusted-src")
-    setup_i = step_index(steps, lambda s: "actions/setup-python" in str(s.get("uses", "")))
+    setup_i = step_index(
+        steps, lambda s: "actions/setup-python" in str(s.get("uses", ""))
+    )
     install_i = step_index(steps, lambda s: s.get("name") == "Install deps")
     preserve_i = step_index(steps, lambda s: s.get("id") == "triage-result")
     update_i = step_index(steps, lambda s: s.get("name") == "Update the decision card")
@@ -2017,8 +2144,7 @@ def test_triage_workflow_security_wiring():
     )
     check(
         "workflow: trusted source is prepared before setup and deps",
-        None not in (trusted_i, setup_i, install_i)
-        and trusted_i < setup_i < install_i,
+        None not in (trusted_i, setup_i, install_i) and trusted_i < setup_i < install_i,
     )
     check(
         "workflow: triage result handoff runs after Claude",
@@ -2031,7 +2157,9 @@ def test_triage_workflow_security_wiring():
         None not in (preserve_i, update_i) and preserve_i < update_i,
     )
 
-    recover = step_by_name(steps, "Recover a held card if this run never reached the update step")
+    recover = step_by_name(
+        steps, "Recover a held card if this run never reached the update step"
+    )
     check("workflow: held-card recovery step exists", recover is not None)
     if recover:
         check(
@@ -2050,15 +2178,18 @@ def test_triage_workflow_security_wiring():
             "workflow: recovery step can detect token-gate skips",
             env.get("TRIAGE_GATE_ENABLED") == "${{ steps.gate.outputs.enabled }}",
         )
-        check("workflow: recovery step is hardened like the update step", hardened_shell_env(recover))
+        check(
+            "workflow: recovery step is hardened like the update step",
+            hardened_shell_env(recover),
+        )
         run = str(recover.get("run", ""))
         check(
             "workflow: recovery step calls triage-recover with issue/kind/revision",
             "scripts/render_card.py triage-recover" in run
-            and "--issue \"$ISSUE\"" in run
-            and "--kind \"$KIND\"" in run
-            and "--revision \"$REVISION\"" in run
-            and "--message \"$RECOVER_MESSAGE\"" in run,
+            and '--issue "$ISSUE"' in run
+            and '--kind "$KIND"' in run
+            and '--revision "$REVISION"' in run
+            and '--message "$RECOVER_MESSAGE"' in run,
         )
         check(
             "workflow: recovery step publishes token-unavailable failures",
@@ -2108,7 +2239,7 @@ def test_triage_workflow_security_wiring():
 
 
 def test_render_card_recovery_import_does_not_require_pyyaml():
-    code = r'''
+    code = r"""
 import importlib.abc
 import os
 import sys
@@ -2123,7 +2254,7 @@ sys.meta_path.insert(0, BlockYaml())
 sys.path.insert(0, os.path.join(os.getcwd(), "scripts"))
 import render_card
 print(render_card.HOLD_LABEL)
-'''
+"""
     result = subprocess.run(
         [sys.executable, "-c", code],
         cwd=ROOT,
@@ -2243,7 +2374,7 @@ def test_triage_recover_cli_is_noop_when_not_stuck():
         "number": 7,
         "body": apply_calls["body"],
         "labels": labels(
-            *[l for l in held_card["labels"] if l != rc.HOLD_LABEL]
+            *[label for label in held_card["labels"] if label != rc.HOLD_LABEL]
         ),
         "state": "OPEN",
     }
@@ -2385,7 +2516,8 @@ def test_render_held_card_placeholder_and_labels():
             "<!-- opt:" not in held["body"],
         )
         check(
-            "held render(%s): hold label present" % kind, rc.HOLD_LABEL in held["labels"]
+            "held render(%s): hold label present" % kind,
+            rc.HOLD_LABEL in held["labels"],
         )
         check(
             "held render(%s): needs-decision retained (triage.yml requires it)" % kind,
@@ -2467,7 +2599,11 @@ def test_upsert_card_creates_held_only_when_triage_would_be_queued():
 
 def test_upsert_card_refresh_preserves_held_when_still_eligible():
     for kind, base, changed in (
-        ("pr-review", item(auto_triage=True, head_sha="oldsha"), item(auto_triage=True, head_sha="newsha999")),
+        (
+            "pr-review",
+            item(auto_triage=True, head_sha="oldsha"),
+            item(auto_triage=True, head_sha="newsha999"),
+        ),
         (
             "issue-triage",
             item_issue(auto_triage_issues=True, priority="low"),
@@ -2670,9 +2806,7 @@ def test_upsert_card_refresh_publishes_held_when_hold_gate_turns_off():
         ),
     ]
     for label, base_item, changed_item, has_token in scenarios:
-        calls = _capture_upsert_refresh(
-            base_item, changed_item, has_token, queued=True
-        )
+        calls = _capture_upsert_refresh(base_item, changed_item, has_token, queued=True)
         body = calls.get("body", "")
         state = core.parse_state_block(body)
         edit = calls["gh_calls"][0] if calls["gh_calls"] else []
@@ -2847,7 +2981,9 @@ def test_update_card_triage_publishes_held_card_on_success():
             "publish(%s): checkboxes now present" % kind,
             "<!-- opt:close -->" in calls["body"],
         )
-        check("publish(%s): triage section inserted" % kind, "### Triage" in calls["body"])
+        check(
+            "publish(%s): triage section inserted" % kind, "### Triage" in calls["body"]
+        )
         check(
             "publish(%s): triage status succeeded" % kind,
             new_state.get("triage_status") == "succeeded",
@@ -3051,6 +3187,7 @@ def main():
     test_reconcile_dispatch_failure_publish_failure_clears_cache()
     test_reconcile_queues_after_head_refresh()
     test_reconcile_queues_after_issue_updated_at_advance()
+    test_reconcile_reflects_issue_updated_at_when_auto_triage_disabled()
     test_auto_triage_toggles_are_independent_end_to_end()
     test_triage_workflow_issue_path_isolation()
     test_triage_workflow_security_wiring()

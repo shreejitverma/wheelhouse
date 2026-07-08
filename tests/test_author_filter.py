@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit-exercise scan author filtering with NO network.
+Unit-exercise scan author filtering and PR updatedAt propagation with NO network.
 
 Run: python tests/test_author_filter.py
 """
@@ -237,6 +237,17 @@ def test_pr_author_filter_skips_owner_maintainer_and_bots():
     check("author-filter: non-CI PRs do not invoke approve_ci", calls["approve"] == [])
 
 
+def test_pr_items_carry_updated_at_for_activity_sort():
+    pr = pr_node(5, author=HUMAN)
+    pr["updatedAt"] = "2026-02-03T04:05:06Z"
+    result, items, calls = run_build_repo([pr])
+    check("activity-sort: PR item is emitted", len(items) == 1)
+    check(
+        "activity-sort: PR item carries target updatedAt",
+        items and items[0].get("updated_at") == "2026-02-03T04:05:06Z",
+    )
+
+
 def test_ci_approval_author_filter_preserves_safe_auto_approve():
     prs = [
         needs_ci_pr(10, OWNER),
@@ -355,7 +366,10 @@ def test_ci_approval_author_filter_suppresses_unknown_fork_cards():
     numbers = [it["number"] for it in items]
     check("author-filter: unknown-fork owner card suppressed", 40 not in numbers)
     check("author-filter: unknown-fork human PR still carded", numbers == [41])
-    check("author-filter: unknown fork status still skips approve_ci", calls["approve"] == [])
+    check(
+        "author-filter: unknown fork status still skips approve_ci",
+        calls["approve"] == [],
+    )
     check(
         "author-filter: suppressed unknown fork still logs warning",
         "suppressed-card demo#40" in calls["stderr"],
@@ -453,9 +467,18 @@ def test_issue_scan_pages_all_open_issues():
             os.environ["GITHUB_REPOSITORY_OWNER"] = old_repo_owner
     numbers = [it["number"] for it in items if it["kind"] == "issue-triage"]
     check("issue-scan: next page requested", calls["pages"] == ["cursor-100"])
-    check("issue-scan: cards include issues beyond first page", numbers == list(range(1, 106)))
-    check("issue-scan: open issue numbers are complete", result["open_issue_numbers"] == list(range(1, 106)))
-    check("issue-scan: completed pagination is not truncated", result["truncated"] is False)
+    check(
+        "issue-scan: cards include issues beyond first page",
+        numbers == list(range(1, 106)),
+    )
+    check(
+        "issue-scan: open issue numbers are complete",
+        result["open_issue_numbers"] == list(range(1, 106)),
+    )
+    check(
+        "issue-scan: completed pagination is not truncated",
+        result["truncated"] is False,
+    )
 
 
 def test_issue_cards_skip_when_pr_scan_incomplete():
@@ -583,13 +606,19 @@ def test_issue_scan_pages_open_prs_for_addressed_filter():
         else:
             os.environ["GITHUB_REPOSITORY_OWNER"] = old_repo_owner
     issue_cards = [it for it in items if it["kind"] == "issue-triage"]
-    check("issue-scan: open PR next page requested", calls["pr_pages"] == ["pr-cursor-100"])
+    check(
+        "issue-scan: open PR next page requested",
+        calls["pr_pages"] == ["pr-cursor-100"],
+    )
     check("issue-scan: linked issue from PR page is not carded", issue_cards == [])
     check(
         "issue-scan: PR pagination completes open PR numbers",
         result["open_pr_numbers"] == list(range(1, 102)),
     )
-    check("issue-scan: completed PR pagination is not truncated", result["truncated"] is False)
+    check(
+        "issue-scan: completed PR pagination is not truncated",
+        result["truncated"] is False,
+    )
 
 
 def test_issue_scan_pages_closing_references_for_addressed_filter():
@@ -729,13 +758,18 @@ def test_cleanup_closure_recomputes_addressed_issue_map():
         else:
             os.environ["GITHUB_REPOSITORY_OWNER"] = old_repo_owner
     issue_cards = [it for it in items if it["kind"] == "issue-triage"]
-    check("cleanup: stale PR removed from open PR scan", result["open_pr_numbers"] == [])
-    check("cleanup: linked issue is carded after cleanup closes only PR",
-          [it["number"] for it in issue_cards] == [101])
+    check(
+        "cleanup: stale PR removed from open PR scan", result["open_pr_numbers"] == []
+    )
+    check(
+        "cleanup: linked issue is carded after cleanup closes only PR",
+        [it["number"] for it in issue_cards] == [101],
+    )
 
 
 def main():
     test_pr_author_filter_skips_owner_maintainer_and_bots()
+    test_pr_items_carry_updated_at_for_activity_sort()
     test_ci_approval_author_filter_preserves_safe_auto_approve()
     test_ci_approval_author_filter_suppresses_cards_after_approve_failure()
     test_ci_approval_author_filter_bypasses_global_opt_out_for_excluded_author()
