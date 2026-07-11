@@ -901,6 +901,7 @@ def patch_core(**attrs):
 def fake_gh_rest(
     pr,
     merge_error=None,
+    merge_response=None,
     comment_error=None,
     calls=None,
     review_submitted_at="2026-01-01T00:00:00Z",
@@ -921,7 +922,7 @@ def fake_gh_rest(
         if method == "PUT":
             if merge_error:
                 raise RuntimeError(merge_error)
-            return {}
+            return {} if merge_response is None else merge_response
         if method == "POST":
             if comment_error:
                 raise RuntimeError(comment_error)
@@ -972,6 +973,10 @@ def posts(calls):
     return [c for c in calls if c["method"] == "POST"]
 
 
+def merge_puts(calls):
+    return [c for c in calls if c["method"] == "PUT" and c["path"].endswith("/merge")]
+
+
 def test_thank_on_merge_posts_after_successful_merge():
     fake, calls = fake_gh_rest(open_pr())
     with patch_core(
@@ -994,6 +999,144 @@ def test_thank_on_merge_posts_after_successful_merge():
     check(
         "thank: default wording has no product name or jargon",
         p and "wheelhouse" not in (p[0]["fields"] or {}).get("body", "").lower(),
+    )
+    m = merge_puts(calls)
+    check(
+        "merge: API precondition binds the expected head SHA",
+        len(m) == 1 and m[0]["fields"].get("sha") == "abc123",
+    )
+
+
+def test_auto_merge_receives_sha_from_successful_merge_response():
+    merge_sha = "d" * 40
+    fake, _ = fake_gh_rest(open_pr(), merge_response={"sha": merge_sha})
+    with patch_core(
+        gh_rest=fake,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal, returned_sha = ad.do_merge(
+            "owner-login", "target-repo", 5, "abc123", return_merge_commit=True
+        )
+    check(
+        "merge: auto-merge receives the endpoint merge commit SHA",
+        terminal == "resolved" and "Merged" in message and returned_sha == merge_sha,
+    )
+
+
+def test_auto_merge_rejects_a_changed_expected_base():
+    pr = open_pr()
+    pr["base"] = {"sha": "new-base"}
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=fake,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge(
+            "owner-login",
+            "target-repo",
+            5,
+            "abc123",
+            expected_base_sha="reviewed-base",
+        )
+    check(
+        "merge: changed expected base is blocked",
+        terminal == "blocked" and "base moved" in message,
+    )
+    check(
+        "merge: changed expected base sends no merge request", merge_puts(calls) == []
+    )
+
+
+def test_auto_merge_rechecks_final_mergeability_without_changing_manual_merge():
+    pr = open_pr()
+    pr.update(
+        {
+            "base": {"sha": "reviewed-base"},
+            "mergeable": True,
+            "mergeable_state": "behind",
+        }
+    )
+    guarded_fake, guarded_calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=guarded_fake,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge(
+            "owner-login",
+            "target-repo",
+            5,
+            "abc123",
+            expected_base_sha="reviewed-base",
+            require_clean_merge_state=True,
+        )
+    check(
+        "merge: auto-merge final non-CLEAN state is blocked",
+        terminal == "blocked" and "no longer mergeable and CLEAN" in message,
+    )
+    check(
+        "merge: final non-CLEAN state sends no merge request",
+        merge_puts(guarded_calls) == [],
+    )
+
+    manual_fake, manual_calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=manual_fake,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        _, manual_terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
+    check(
+        "merge: manual path leaves the auto-merge CLEAN guard disabled",
+        manual_terminal == "resolved",
+    )
+    check(
+        "merge: manual path still sends its merge request",
+        len(merge_puts(manual_calls)) == 1,
+    )
+
+
+def test_auto_merge_final_guard_blocks_the_merge_put():
+    pr = open_pr()
+    pr.update(
+        {
+            "base": {"sha": "reviewed-base"},
+            "mergeable": True,
+            "mergeable_state": "clean",
+        }
+    )
+    fake, calls = fake_gh_rest(pr)
+    guarded = []
+
+    def guard(current_pr):
+        guarded.append(current_pr)
+        return (False, "owner decision arrived")
+
+    with patch_core(
+        gh_rest=fake,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge(
+            "owner-login",
+            "target-repo",
+            5,
+            "abc123",
+            expected_base_sha="reviewed-base",
+            require_clean_merge_state=True,
+            auto_merge_guard=guard,
+        )
+    check(
+        "merge: final auto-merge guard receives the final live PR",
+        guarded == [pr],
+    )
+    check(
+        "merge: final auto-merge guard blocks the merge request",
+        terminal == "blocked"
+        and "owner decision arrived" in message
+        and merge_puts(calls) == [],
     )
 
 
@@ -1806,6 +1949,10 @@ def main():
     test_request_changes_route_decision()
     test_load_llm_result_tolerant()
     test_thank_on_merge_posts_after_successful_merge()
+    test_auto_merge_receives_sha_from_successful_merge_response()
+    test_auto_merge_rejects_a_changed_expected_base()
+    test_auto_merge_rechecks_final_mergeability_without_changing_manual_merge()
+    test_auto_merge_final_guard_blocks_the_merge_put()
     test_thank_on_merge_disabled_globally()
     test_thank_on_merge_disabled_per_repo()
     test_thank_on_merge_skips_non_success_outcomes()

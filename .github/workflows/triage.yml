@@ -271,9 +271,11 @@ jobs:
           NUMBER: ${{ steps.resolve.outputs.number }}
           SLUG: ${{ steps.resolve.outputs.slug }}
           KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
           READONLY_SEARCH_ENABLED: ${{ steps.readonly.outputs.enabled }}
         run: |
           set -euo pipefail
+          BASE_SHA=""
           {
             echo "<target-content repo=\"$SLUG\" number=\"$NUMBER\" kind=\"$KIND\">"
             if [ "$KIND" = "issue-triage" ]; then
@@ -290,27 +292,79 @@ jobs:
                 --json title,body --jq '"# " + (.title // "") + "\n\n" + (.body // "")' || true
               echo
               echo "## Diff"
+              DIFF_COMPLETE=false
               diff_limit_bytes=120000
               diff_raw="diff.raw"
-              set +e
-              GH_TOKEN="$FLEET_TOKEN" gh pr diff "$NUMBER" -R "$SLUG" \
-                | head -c "$((diff_limit_bytes + 1))" > "$diff_raw"
-              pipe_status=("${PIPESTATUS[@]}")
-              diff_status=${pipe_status[0]}
-              head_status=${pipe_status[1]}
+              BASE_SHA="$(GH_TOKEN="$FLEET_TOKEN" gh api "repos/$SLUG/pulls/$NUMBER" --jq '.base.sha // empty' 2>/dev/null || true)"
+              if printf '%s' "$BASE_SHA" | grep -Eq '^[0-9A-Fa-f]{7,64}$' \
+                && printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9A-Fa-f]{7,64}$'; then
+                set +e
+                GH_TOKEN="$FLEET_TOKEN" gh api \
+                  -H 'Accept: application/vnd.github.v3.diff' \
+                  "repos/$SLUG/compare/$BASE_SHA...$HEAD_SHA" \
+                  | head -c "$((diff_limit_bytes + 1))" > "$diff_raw"
+                pipe_status=("${PIPESTATUS[@]}")
+                diff_status=${pipe_status[0]}
+                head_status=${pipe_status[1]}
+                set -e
+              else
+                printf '(could not fetch immutable diff)\n' > "$diff_raw"
+                diff_status=1
+                head_status=0
+              fi
               diff_size="$(wc -c < "$diff_raw" | tr -d '[:space:]')"
-              set -e
               if [ "$diff_size" -gt "$diff_limit_bytes" ]; then
                 head -c "$diff_limit_bytes" "$diff_raw"
                 printf '\n\n[diff truncated after %s bytes]\n' "$diff_limit_bytes"
               elif { [ "$diff_status" -ne 0 ] && [ "$diff_status" -ne 141 ]; } || [ "$head_status" -ne 0 ]; then
                 echo "(could not fetch diff)"
+              elif [ "$diff_size" -eq 0 ] || grep -Eq '^(Binary files .+ differ|GIT binary patch|Binary file .+ has changed)$|(^|[-+[:blank:]])version https://git-lfs\.github\.com/spec/v1$|(^|[+-])Subproject commit [0-9A-Fa-f]{7,64}(-dirty)?$' "$diff_raw"; then
+                cat "$diff_raw"
+                printf '\n\n[diff contains binary, LFS, or submodule data unavailable for auto-merge assessment]\n'
               else
                 cat "$diff_raw"
+                DIFF_COMPLETE=true
               fi
             fi
             echo "</target-content>"
           } > target.txt
+
+          # Auto-merge behavior verdict input (pr-review only). VISION.md is read
+          # from the target's DEFAULT branch (base), NEVER the PR head - a PR
+          # editing VISION.md must not be able to bless itself. The contents API
+          # defaults to the default branch when no ?ref is given, which is exactly
+          # the base-branch-only read we require. It is owner-authored TRUSTED
+          # policy (not contributor free-text). When absent, the auto-merge
+          # assessment is skipped entirely and the executor holds on G0.
+          VISION_PRESENT=false
+          VISION_SHA=""
+          AUTOMERGE_VERDICT_AVAILABLE=false
+          if [ "$KIND" = "pr-review" ]; then
+            vision_limit_bytes=40000
+            if GH_TOKEN="$FLEET_TOKEN" gh api "repos/$SLUG/contents/VISION.md" \
+              > vision.json 2>/dev/null; then
+              VISION_SHA="$(jq -r 'if type == "object" and .type == "file" and (.sha | type == "string") then .sha else empty end' vision.json)"
+              VISION_SIZE="$(jq -r 'if type == "object" and .type == "file" and (.size | type == "number") and .size >= 0 then .size else empty end' vision.json)"
+              if printf '%s' "$VISION_SIZE" | grep -Eq '^[0-9]+$' \
+                && [ "$VISION_SIZE" -le "$vision_limit_bytes" ]; then
+                set +e
+                jq -r '.content // empty' vision.json | base64 -d > vision.md 2>/dev/null
+                decode_status=("${PIPESTATUS[@]}")
+                set -e
+                vision_bytes="$(wc -c < vision.md | tr -d '[:space:]')"
+                if [ "${decode_status[0]}" -eq 0 ] && [ "${decode_status[1]}" -eq 0 ] \
+                  && [ "$vision_bytes" = "$VISION_SIZE" ] && [ "$vision_bytes" -gt 0 ] \
+                  && [ -n "$VISION_SHA" ]; then
+                  VISION_PRESENT=true
+                fi
+              fi
+            fi
+            if [ "$VISION_PRESENT" = "true" ] && [ "$DIFF_COMPLETE" = "true" ]; then
+              AUTOMERGE_VERDICT_AVAILABLE=true
+            else
+              VISION_SHA=""
+            fi
+          fi
 
           {
             echo "You are doing a READ-ONLY, LIGHTWEIGHT automatic triage for an"
@@ -356,6 +410,23 @@ jobs:
             echo
             cat target.txt
             echo
+            if [ "$AUTOMERGE_VERDICT_AVAILABLE" = "true" ]; then
+              echo "The target repository has opted into automatic merging and"
+              echo "committed the VISION.md below (read from its DEFAULT branch, so"
+              echo "it is TRUSTED owner-authored policy, not the PR's own content)."
+              echo "Judge whether this PR aligns with that vision and which behavior"
+              echo "class it is, so a deterministic gate can decide auto-merge:"
+              echo "  A = no product behavior change (refactor/docs/tests/chore)"
+              echo "  B = a narrow corrective bug fix that RESTORES intended behavior"
+              echo "  C = a NEW feature that is strictly opt-in and disabled by default"
+              echo "Any change that alters existing or default behavior (and is not a"
+              echo "corrective bug fix restoring intended behavior) is INELIGIBLE."
+              echo "Be conservative: when unsure, do not confirm alignment or merge."
+              echo "<vision-policy repo=\"$SLUG\">"
+              cat vision.md
+              echo "</vision-policy>"
+              echo
+            fi
             echo "Return ONLY a compact JSON object with exactly these string keys:"
             echo "{"
             if [ "$KIND" = "issue-triage" ]; then
@@ -363,6 +434,18 @@ jobs:
               echo '  "product_implications": "whether this deserves owner discussion or is routine/low-risk, with why",'
               echo '  "recommended_action": "close | decline | hold | investigate | comment",'
               echo '  "recommended_reason": "one concise reason/comment to post or show for the recommended action"'
+            elif [ "$AUTOMERGE_VERDICT_AVAILABLE" = "true" ]; then
+              echo '  "summary": "plain one-sentence summary of what the PR does",'
+              echo '  "product_implications": "whether this deserves owner discussion or is routine internal work, with why",'
+              echo '  "recommended_action": "merge | request-changes | decline | close | hold | investigate | comment",'
+              echo '  "recommended_reason": "one concise reason/comment/review body for the recommended action",'
+              echo '  "automerge": {'
+              echo '    "behavior_class": "A | B | C | ineligible",'
+              echo '    "aligns_with_vision": true or false (does this PR align with the VISION.md policy above),'
+              echo '    "changes_existing_or_default_behavior": true or false (true if it alters existing/default behavior other than a corrective bug fix),'
+              echo '    "optin_default_off": true or false (class C only: is the new feature strictly opt-in AND disabled by default),'
+              echo '    "recommend_merge": true or false (should this be merged automatically now)'
+              echo '  }'
             else
               echo '  "summary": "plain one-sentence summary of what the PR does",'
               echo '  "product_implications": "whether this deserves owner discussion or is routine internal work, with why",'
@@ -386,6 +469,8 @@ jobs:
             echo "prompt<<$delimiter"
             cat prompt.txt
             echo "$delimiter"
+            echo "vision_sha=$VISION_SHA"
+            echo "base_sha=$BASE_SHA"
           } >> "$GITHUB_OUTPUT"
 
       - id: search-tool
@@ -470,6 +555,8 @@ jobs:
           HEAD_OK: ${{ steps.verify_head.outputs.head_ok }}
           HEAD_MESSAGE: ${{ steps.verify_head.outputs.message }}
           TRIAGE_EXECUTION_FILE: ${{ steps.triage-result.outputs.path }}
+          VISION_SHA: ${{ steps.prepare.outputs.vision_sha }}
+          BASE_SHA: ${{ steps.prepare.outputs.base_sha }}
           TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
           TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
           TRUSTED_HOME: ${{ runner.temp }}/wheelhouse-gh-home
@@ -513,6 +600,8 @@ jobs:
               "$TRUSTED_PYTHON" scripts/render_card.py triage-apply \
                 --issue "$ISSUE" \
                 --revision "$REVISION" \
+                --vision-sha "$VISION_SHA" \
+                --base-sha "$BASE_SHA" \
                 --execution-file "${TRIAGE_EXECUTION_FILE:-}"
           fi
 

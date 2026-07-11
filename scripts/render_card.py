@@ -501,7 +501,24 @@ def triage_fresh(item, state):
     not get re-run every hourly scan for the same revision.
     """
     revision = triage_revision(item)
-    return bool(revision and (state or {}).get("triaged_sha") == revision)
+    state = state or {}
+    if not revision or state.get("triaged_sha") != revision:
+        return False
+    if item.get("kind") != "pr-review":
+        return True
+    verdict = state.get("automerge_verdict")
+    verdict = verdict if isinstance(verdict, dict) else {}
+    for item_field, state_field, verdict_field in (
+        ("base_sha", "triaged_base_sha", "base_sha"),
+        ("automerge_vision_sha", "triaged_vision_sha", "vision_sha"),
+    ):
+        expected = str(item.get(item_field) or "")
+        if not expected:
+            continue
+        actual = str(state.get(state_field) or verdict.get(verdict_field) or "")
+        if actual != expected:
+            return False
+    return True
 
 
 def triage_queued_for_head(state, revision):
@@ -690,7 +707,61 @@ def normalize_triage(data):
         triage["recommended_next_step"] = (
             rec if rec.lower().startswith(allowed) else "look closer - " + rec
         )
+    # Optional auto-merge behavior verdict (pr-review only; asked by triage.yml
+    # only when the target's base branch carries a VISION.md). Non-material and
+    # advisory - auto_merge.py re-validates it and holds on any doubt.
+    am = normalize_automerge_verdict(data.get("automerge"))
+    if am:
+        triage["automerge_verdict"] = am
     return triage
+
+
+def _coerce_verdict_bool(value):
+    """Strict-ish boolean coercion for the auto-merge behavior verdict: accept a
+    real JSON boolean or the strings 'true'/'false'; anything else is None so the
+    verdict fails closed."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        t = value.strip().lower()
+        if t == "true":
+            return True
+        if t == "false":
+            return False
+    return None
+
+
+def normalize_automerge_verdict(data):
+    """Parse the OPTIONAL `automerge` sub-object of the pr-review triage JSON into
+    the structured `automerge_verdict` persisted in card state and later consumed
+    by auto_merge.py (the deterministic auto-merge executor). Fail-closed: a
+    missing sub-object, a non-dict, a blank behavior class, or a required boolean
+    that is not coercible returns None, so no verdict is persisted and the
+    executor holds.
+
+    `optin_default_off` is only required for class C, so it defaults to False when
+    absent (which itself disqualifies a class-C PR at the executor). This is
+    advisory input only - the executor re-validates every field independently."""
+    if not isinstance(data, dict):
+        return None
+    cls = str(data.get("behavior_class") or "").strip().upper()
+    if not cls:
+        return None
+    verdict = {"behavior_class": cls}
+    for field in (
+        "aligns_with_vision",
+        "changes_existing_or_default_behavior",
+        "recommend_merge",
+        "optin_default_off",
+    ):
+        b = _coerce_verdict_bool(data.get(field))
+        if b is None:
+            if field == "optin_default_off":
+                b = False
+            else:
+                return None
+        verdict[field] = b
+    return verdict
 
 
 def _all_accept_actions():
@@ -885,9 +956,12 @@ def _preserve_same_revision_triage(body, existing_body, item, old_state, owner="
     changed = False
     for key in (
         "triaged_sha",
+        "triaged_base_sha",
+        "triaged_vision_sha",
         "triage_status",
         "triage_error",
         "triage_recommendation",
+        "automerge_verdict",
     ):
         if key in (old_state or {}):
             state[key] = old_state[key]
@@ -899,10 +973,27 @@ def _preserve_same_revision_triage(body, existing_body, item, old_state, owner="
     return _replace_state_block(body, state) if changed else body
 
 
-def _state_with_triage(state, revision, status, error=None, recommendation=None):
+def _state_with_triage(
+    state,
+    revision,
+    status,
+    error=None,
+    recommendation=None,
+    automerge_verdict=None,
+    base_sha="",
+    vision_sha="",
+):
     new_state = dict(state or {})
     new_state["triaged_sha"] = revision
     new_state["triage_status"] = status
+    if re.fullmatch(r"[0-9A-Fa-f]{7,64}", str(base_sha or "")):
+        new_state["triaged_base_sha"] = str(base_sha)
+    else:
+        new_state.pop("triaged_base_sha", None)
+    if str(vision_sha or ""):
+        new_state["triaged_vision_sha"] = str(vision_sha)
+    else:
+        new_state.pop("triaged_vision_sha", None)
     if error:
         new_state["triage_error"] = _clean_triage_text(error, limit=220)
     else:
@@ -911,6 +1002,13 @@ def _state_with_triage(state, revision, status, error=None, recommendation=None)
         new_state["triage_recommendation"] = recommendation
     else:
         new_state.pop("triage_recommendation", None)
+    # The auto-merge behavior verdict is a NON-MATERIAL cache field like
+    # triage_recommendation: persisted only on a fresh successful attempt, and
+    # cleared otherwise so a stale/failed verdict can never drive a merge.
+    if status == "succeeded" and automerge_verdict:
+        new_state["automerge_verdict"] = automerge_verdict
+    else:
+        new_state.pop("automerge_verdict", None)
     return new_state
 
 
@@ -930,7 +1028,13 @@ def body_with_triage_queued(body, item):
     elif state_revision(state, kind) != revision:
         return body
     clean = remove_triage_section(body)
-    new_state = _state_with_triage(state, revision, "queued")
+    new_state = _state_with_triage(
+        state,
+        revision,
+        "queued",
+        base_sha=item.get("base_sha", ""),
+        vision_sha=item.get("automerge_vision_sha", ""),
+    )
     new_state = _state_with_activity_reflected(
         new_state, item, allow_without_baseline=True
     )
@@ -941,7 +1045,9 @@ def body_with_triage_queued(body, item):
     return _replace_state_block(clean, new_state)
 
 
-def body_with_triage_result(body, revision, triage=None, error=None, owner=""):
+def body_with_triage_result(
+    body, revision, triage=None, error=None, owner="", vision_sha="", base_sha=""
+):
     state = parse_state_block(body)
     kind = (state or {}).get("kind") if state else None
     if (
@@ -963,12 +1069,32 @@ def body_with_triage_result(body, revision, triage=None, error=None, owner=""):
         if normalized
         else None
     )
+    automerge_verdict = (
+        (normalized or {}).get("automerge_verdict") if kind == "pr-review" else None
+    )
+    if (
+        automerge_verdict
+        and vision_sha
+        and re.fullmatch(r"[0-9A-Fa-f]{7,64}", str(base_sha or ""))
+    ):
+        automerge_verdict = dict(automerge_verdict)
+        automerge_verdict["vision_sha"] = vision_sha
+        automerge_verdict["base_sha"] = base_sha
+    else:
+        automerge_verdict = None
+    if not base_sha:
+        base_sha = state.get("triaged_base_sha", "")
+    if not vision_sha:
+        vision_sha = state.get("triaged_vision_sha", "")
     new_state = _state_with_triage(
         state,
         revision,
         status,
         None if normalized else error,
         recommendation=recommendation,
+        automerge_verdict=automerge_verdict,
+        base_sha=base_sha,
+        vision_sha=vision_sha,
     )
     new_state["options"] = options_for_state(kind, state.get("options"), new_state)
     updated = _publish_decision_section(updated, kind, new_state["options"])
@@ -1226,7 +1352,13 @@ def find_card(marker):
 
 def get_card(number):
     r = _gh(
-        ["issue", "view", str(number), "--json", "number,body,labels,state,updatedAt"],
+        [
+            "issue",
+            "view",
+            str(number),
+            "--json",
+            "number,body,labels,state,updatedAt,author,comments",
+        ],
         check=False,
     )
     if r.returncode != 0:
@@ -1356,7 +1488,9 @@ def publish_dispatch_failure(number, revision, message, owner=""):
     return False
 
 
-def update_card_triage(number, revision, triage=None, error=None, owner=""):
+def update_card_triage(
+    number, revision, triage=None, error=None, owner="", vision_sha="", base_sha=""
+):
     """Attach a completed auto-triage attempt's result to its card.
 
     If the card is still HELD, this ALSO publishes it in the same edit: the
@@ -1395,7 +1529,13 @@ def update_card_triage(number, revision, triage=None, error=None, owner=""):
         remove_labels.append(HOLD_LABEL)
 
     new_body = body_with_triage_result(
-        body, revision, triage=triage, error=error, owner=owner
+        body,
+        revision,
+        triage=triage,
+        error=error,
+        owner=owner,
+        vision_sha=vision_sha,
+        base_sha=base_sha,
     )
     if new_body == body and not held:
         return False
@@ -1672,6 +1812,8 @@ def main():
     ta.add_argument("--issue", required=True)
     ta.add_argument("--revision", required=True)
     ta.add_argument("--execution-file", required=True)
+    ta.add_argument("--vision-sha", default="")
+    ta.add_argument("--base-sha", default="")
 
     tf = sub.add_parser("triage-fail")
     tf.add_argument("--issue", required=True)
@@ -1726,7 +1868,12 @@ def main():
         triage = parse_triage_json(result_text)
         if triage:
             if update_card_triage(
-                args.issue, args.revision, triage=triage, owner=owner
+                args.issue,
+                args.revision,
+                triage=triage,
+                owner=owner,
+                vision_sha=args.vision_sha,
+                base_sha=args.base_sha,
             ):
                 print("updated auto triage on card #%s" % args.issue)
             else:

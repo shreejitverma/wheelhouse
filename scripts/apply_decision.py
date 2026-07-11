@@ -554,16 +554,30 @@ def _stale_pr_head_result(repo, number, expected, current, action):
     return None
 
 
-def do_merge(owner, repo, number, head_sha):
+def do_merge(
+    owner,
+    repo,
+    number,
+    head_sha,
+    return_merge_commit=False,
+    expected_base_sha=None,
+    require_clean_merge_state=False,
+    auto_merge_guard=None,
+):
+    def outcome(message, terminal, merge_commit=""):
+        if return_merge_commit:
+            return (message, terminal, merge_commit)
+        return (message, terminal)
+
     slug = "%s/%s" % (owner, repo)
     pr = core.gh_rest("/repos/%s/pulls/%s" % (slug, number))
     if pr.get("merged"):
-        return (
+        return outcome(
             "Target %s#%s is already merged - nothing to do." % (repo, number),
             "resolved",
         )
     if pr.get("state") != "open":
-        return (
+        return outcome(
             "Target %s#%s is not open (%s) - consuming card."
             % (repo, number, pr.get("state")),
             "resolved",
@@ -571,27 +585,74 @@ def do_merge(owner, repo, number, head_sha):
     current = (pr.get("head") or {}).get("sha", "")
     stale = _stale_pr_head_result(repo, number, head_sha, current, "merging")
     if stale:
-        return stale
+        return outcome(*stale)
+    expected_base_sha = str(expected_base_sha or "").strip()
+    if expected_base_sha:
+        current_base_sha = str((pr.get("base") or {}).get("sha") or "").strip()
+        if current_base_sha != expected_base_sha:
+            return outcome(
+                "HOLD: %s#%s base moved since auto-merge evaluation "
+                "(was %s, now %s). Re-scan before merging."
+                % (
+                    repo,
+                    number,
+                    expected_base_sha[:8],
+                    current_base_sha[:8] or "<none>",
+                ),
+                "blocked",
+            )
+    if require_clean_merge_state:
+        mergeable_state = str(pr.get("mergeable_state") or "").strip().lower()
+        if pr.get("mergeable") is not True or mergeable_state != "clean":
+            return outcome(
+                "HOLD: %s#%s is no longer mergeable and CLEAN "
+                "(mergeable=%r, mergeable_state=%r). Re-scan before merging."
+                % (repo, number, pr.get("mergeable"), mergeable_state or "<none>"),
+                "blocked",
+            )
+    if auto_merge_guard is not None:
+        try:
+            guard_ok, guard_reason = auto_merge_guard(pr)
+        except Exception as e:
+            return outcome(
+                "HOLD: final auto-merge guard could not be completed: %s. "
+                "Re-scan before merging." % str(e)[:160],
+                "blocked",
+            )
+        if guard_ok is not True:
+            return outcome(
+                "HOLD: final auto-merge guard: %s. Re-scan before merging."
+                % str(guard_reason or "guard did not approve the merge")[:200],
+                "blocked",
+            )
     method = _merge_method(repo)
     try:
-        core.gh_rest(
+        fields = {"merge_method": method}
+        if head_sha:
+            fields["sha"] = head_sha
+        merge_result = core.gh_rest(
             "/repos/%s/pulls/%s/merge" % (slug, number),
             method="PUT",
-            fields={"merge_method": method},
+            fields=fields,
         )
     except RuntimeError as e:
         detail = str(e)[:200]
         if "conflict" in detail.lower():
-            return (
+            return outcome(
                 "Merge of %s#%s failed because the PR has a merge conflict. "
                 "The contributor must rebase or merge the base branch, resolve "
                 "the conflict, and push before this can be merged. (%s)"
                 % (repo, number, detail),
                 "error",
             )
-        return ("Merge of %s#%s failed: %s" % (repo, number, detail), "error")
+        return outcome("Merge of %s#%s failed: %s" % (repo, number, detail), "error")
     _thank_contributor(owner, repo, number, pr)
-    return ("Merged %s#%s (%s)." % (repo, number, method), "resolved")
+    merge_commit = (
+        str(merge_result.get("sha") or "") if isinstance(merge_result, dict) else ""
+    )
+    return outcome(
+        "Merged %s#%s (%s)." % (repo, number, method), "resolved", merge_commit
+    )
 
 
 def do_approve_ci(owner, repo, number):
@@ -887,7 +948,9 @@ def build_nl_prompt(
         "  - Only use an action verb from the allowed list. If what they asked for",
         "    is not in that list, use mode=clarify.",
     ]
-    text_bearing = [v for v in ("decline", "comment", "request-changes") if v in allowed]
+    text_bearing = [
+        v for v in ("decline", "comment", "request-changes") if v in allowed
+    ]
     if text_bearing:
         parts += [
             "  - For `%s`, put the prose to post on the target in `free_text`."
@@ -896,8 +959,10 @@ def build_nl_prompt(
     if target_slug:
         parts += [
             "  - This card is posted in a DIFFERENT repository than the target",
-            "    (%s). If `answer` references any issue or PR number, write it" % target_slug,
-            "    fully qualified as %s#N (never a bare #N), or it will link to" % target_slug,
+            "    (%s). If `answer` references any issue or PR number, write it"
+            % target_slug,
+            "    fully qualified as %s#N (never a bare #N), or it will link to"
+            % target_slug,
             "    the wrong repository.",
         ]
     if search_enabled:
@@ -1069,7 +1134,9 @@ def cmd_nl_prompt():
         os.environ.get("TRIGGER_COMMENT_ID", ""),
     )
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
-    target_slug = "%s/%s" % (owner, state["repo"]) if owner and state.get("repo") else ""
+    target_slug = (
+        "%s/%s" % (owner, state["repo"]) if owner and state.get("repo") else ""
+    )
     search_enabled = os.environ.get("READONLY_SEARCH_ENABLED", "") == "true"
     search_repos = []
     if search_enabled:
