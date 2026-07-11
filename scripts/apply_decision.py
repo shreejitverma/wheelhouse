@@ -59,7 +59,11 @@ Natural-language phases (gated on nl_decisions + CLAUDE_CODE_OAUTH_TOKEN):
 Security: the caller owner/maintainer-gates the whole job; only
 owner/maintainer-authored text ever reaches this script (and the LLM). Merge and
 request-changes re-check the PR head SHA against the card's state block and
-refuse if the PR moved. request-changes cleanup arming is best-effort and
+refuse if the PR moved. Card-driven merge also pre-detects `.github/workflows/**`
+touches (net diff or PR commit history, including either side of a rename) and
+returns terminal `blocked` with
+manual UI-merge guidance instead of attempting a doomed API merge - FLEET_TOKEN
+intentionally has no Workflows write. request-changes cleanup arming is best-effort and
 fail-open: if the review posts but the target-side marker cannot be proven or
 written, the card still stays open with a cleanup-only note. approve-ci routes
 through the shared CI safety verdict:
@@ -549,8 +553,282 @@ def _stale_pr_head_result(repo, number, expected, current, action):
         return (
             "HOLD: %s#%s head moved since this card (was %s, now %s). Re-scan before %s."
             % (repo, number, expected[:8], current[:8], action),
+            "retryable",
+        )
+    return None
+
+
+def _target_pr_url(owner, repo, number, pr=None):
+    html = str((pr or {}).get("html_url") or "").strip()
+    if html:
+        return html
+    return "https://github.com/%s/%s/pull/%s" % (owner, repo, number)
+
+
+def _flatten_rest_pages(data):
+    return core._flatten_paginated_comments(data)
+
+
+_WORKFLOW_SCAN_READ_ERRORS = (RuntimeError, json.JSONDecodeError)
+
+
+def _workflow_path_sample(paths):
+    return ", ".join("`%s`" % core._safe_inline(path) for path in paths[:5])
+
+
+def _changed_file_paths(rows, source):
+    """Collect current paths plus `previous_filename` for renames.
+
+    The workflow-merge gate must treat a rename into or out of
+    `.github/workflows/` as a workflow touch, while completeness remains based
+    on file records rather than the two collected paths of a renamed file.
+    """
+    paths = []
+    for row in rows:
+        if isinstance(row, str) and row.strip():
+            paths.append(row.strip())
+            continue
+        if not isinstance(row, dict):
+            return None, "%s file entry unexpected" % source
+        filename = row.get("filename")
+        if not isinstance(filename, str) or not filename.strip():
+            return None, "%s file entry missing filename" % source
+        paths.append(filename.strip())
+        if "previous_filename" not in row:
+            continue
+        previous = row["previous_filename"]
+        if not isinstance(previous, str) or not previous.strip():
+            return None, "%s file entry has invalid previous filename" % source
+        paths.append(previous.strip())
+    return paths, None
+
+
+def _read_pr_file_paths(slug, number, expected_count=None):
+    """Return (paths, error_or_None). Fail closed when the list is incomplete."""
+    try:
+        data = core.gh_rest(
+            "/repos/%s/pulls/%s/files?per_page=100" % (slug, number),
+            paginate=True,
+            slurp=True,
+        )
+    except _WORKFLOW_SCAN_READ_ERRORS as e:
+        return None, "could not list PR files: %s" % str(e)[:120]
+    rows = _flatten_rest_pages(data)
+    if not isinstance(rows, list):
+        return None, "PR file list returned unexpected data"
+    paths, err = _changed_file_paths(rows, "PR")
+    if err:
+        return None, err
+    count = core._changed_file_count(expected_count)
+    if count is not None and len(rows) < count:
+        return None, "PR file list incomplete (%s of %s)" % (len(rows), count)
+    return paths, None
+
+
+def _read_pr_commit_shas(slug, number, expected_count=None):
+    """Return (shas, error_or_None). Fail closed on truncation or read errors."""
+    count = core._changed_file_count(expected_count)
+    if count is not None and count > core.PR_COMMITS_API_CAP:
+        return (
+            None,
+            "PR has %s commits (API lists at most %s)"
+            % (count, core.PR_COMMITS_API_CAP),
+        )
+    try:
+        data = core.gh_rest(
+            "/repos/%s/pulls/%s/commits?per_page=100" % (slug, number),
+            paginate=True,
+            slurp=True,
+        )
+    except _WORKFLOW_SCAN_READ_ERRORS as e:
+        return None, "could not list PR commits: %s" % str(e)[:120]
+    rows = _flatten_rest_pages(data)
+    if not isinstance(rows, list):
+        return None, "PR commit list returned unexpected data"
+    shas = []
+    for row in rows:
+        if isinstance(row, dict) and row.get("sha"):
+            shas.append(str(row["sha"]))
+        elif isinstance(row, str) and row.strip():
+            shas.append(row.strip())
+    if count is not None and len(shas) < count:
+        return None, "PR commit list incomplete (%s of %s)" % (len(shas), count)
+    if len(shas) >= core.PR_COMMITS_API_CAP and (count is None or count > len(shas)):
+        return (
+            None,
+            "PR commit list may be truncated at API cap (%s)" % core.PR_COMMITS_API_CAP,
+        )
+    return shas, None
+
+
+def _read_commit_file_paths(slug, sha):
+    """Return (paths, error_or_None) for one commit. Fail closed on truncation."""
+    try:
+        data = core.gh_rest(
+            "/repos/%s/commits/%s?per_page=100" % (slug, sha),
+            paginate=True,
+            slurp=True,
+        )
+    except _WORKFLOW_SCAN_READ_ERRORS as e:
+        return None, "could not list files for commit %s: %s" % (
+            sha[:8],
+            str(e)[:100],
+        )
+    pages = data if isinstance(data, list) else [data]
+    if not pages or not all(isinstance(page, dict) for page in pages):
+        return None, "commit %s returned unexpected data" % sha[:8]
+    paths = []
+    file_rows = 0
+    for page in pages:
+        if "files" not in page:
+            return None, "commit %s file list missing" % sha[:8]
+        files = page.get("files")
+        if not isinstance(files, list):
+            return None, "commit %s file list unexpected" % sha[:8]
+        file_rows += len(files)
+        page_paths, err = _changed_file_paths(files, "commit %s" % sha[:8])
+        if err:
+            return None, err
+        paths.extend(page_paths)
+    if file_rows >= core.COMMIT_FILES_API_CAP:
+        return (
+            None,
+            "commit %s file list may be truncated at API cap (%s)"
+            % (sha[:8], core.COMMIT_FILES_API_CAP),
+        )
+    return paths, None
+
+
+def _workflow_merge_block(owner, repo, number, pr):
+    """If this PR must not be API-merged, return terminal `blocked`; else None.
+
+    Detects `.github/workflows/**` in the PR's net three-dot file list OR in any
+    commit in the PR's history, including either name of a renamed file.
+    History-only touches 403 the same way as net-diff touches when the automation
+    token lacks Workflows write. Terminal `blocked`
+    applies the durable open `blocked` label (not pure needs-decision), so the
+    card is soft-heal-protected and ineligible for auto-merge claim; hard-close
+    still auto-cleans once the target is genuinely merged/closed. Detection is
+    re-run on every subsequent `/merge` once the card is actionable again, so a
+    later rebase that drops workflow touches can proceed. Fail closed when the
+    answer is unknowable (same terminal `blocked` + manual UI-merge guidance).
+    """
+    slug = "%s/%s" % (owner, repo)
+    url = _target_pr_url(owner, repo, number, pr)
+    paths, err = _read_pr_file_paths(slug, number, (pr or {}).get("changed_files"))
+    if err:
+        return (
+            "BLOCKED: could not verify whether %s#%s touches workflow files (%s). "
+            "Not merging. Review and merge by hand in the GitHub UI if "
+            "appropriate: %s" % (repo, number, err, url),
             "blocked",
         )
+    net_hits = core._workflow_merge_gated_files(paths)
+    if net_hits:
+        sample = _workflow_path_sample(net_hits)
+        more = " (+%d more)" % (len(net_hits) - 5) if len(net_hits) > 5 else ""
+        return (
+            "BLOCKED: %s#%s changes CI workflow files (%s%s). The automation "
+            "token intentionally has no Workflows write permission, so an API "
+            "merge would fail with 403. Review the workflow changes and merge "
+            "by hand in the GitHub UI: %s" % (repo, number, sample, more, url),
+            "blocked",
+        )
+    shas, err = _read_pr_commit_shas(slug, number, (pr or {}).get("commits"))
+    if err:
+        return (
+            "BLOCKED: could not verify whether %s#%s's commit history touches "
+            "workflow files (%s). Not merging. Review and merge by hand in the "
+            "GitHub UI if appropriate: %s" % (repo, number, err, url),
+            "blocked",
+        )
+    for sha in shas:
+        cpaths, err = _read_commit_file_paths(slug, sha)
+        if err:
+            return (
+                "BLOCKED: could not verify commit %s on %s#%s for workflow "
+                "touches (%s). Not merging. Review and merge by hand in the "
+                "GitHub UI if appropriate: %s" % (sha[:8], repo, number, err, url),
+                "blocked",
+            )
+        hits = core._workflow_merge_gated_files(cpaths)
+        if hits:
+            sample = _workflow_path_sample(hits)
+            more = " (+%d more)" % (len(hits) - 5) if len(hits) > 5 else ""
+            return (
+                "BLOCKED: %s#%s has a commit (%s) that changes CI workflow "
+                "files (%s%s), even if the net diff looks clean. The automation "
+                "token intentionally has no Workflows write permission, so an "
+                "API merge would fail with 403. Review and merge by hand in the "
+                "GitHub UI: %s" % (repo, number, sha[:8], sample, more, url),
+                "blocked",
+            )
+    return None
+
+
+def _merge_pr_precondition(
+    repo,
+    number,
+    head_sha,
+    pr,
+    expected_base_sha="",
+    require_clean_merge_state=False,
+    auto_merge_guard=None,
+):
+    if pr.get("merged"):
+        return (
+            "Target %s#%s is already merged - nothing to do." % (repo, number),
+            "resolved",
+        )
+    if pr.get("state") != "open":
+        return (
+            "Target %s#%s is not open (%s) - consuming card."
+            % (repo, number, pr.get("state")),
+            "resolved",
+        )
+    current = (pr.get("head") or {}).get("sha", "")
+    stale = _stale_pr_head_result(repo, number, head_sha, current, "merging")
+    if stale:
+        return stale
+    expected_base_sha = str(expected_base_sha or "").strip()
+    if expected_base_sha:
+        current_base_sha = str((pr.get("base") or {}).get("sha") or "").strip()
+        if current_base_sha != expected_base_sha:
+            return (
+                "HOLD: %s#%s base moved since auto-merge evaluation "
+                "(was %s, now %s). Re-scan before merging."
+                % (
+                    repo,
+                    number,
+                    expected_base_sha[:8],
+                    current_base_sha[:8] or "<none>",
+                ),
+                "blocked",
+            )
+    if require_clean_merge_state:
+        mergeable_state = str(pr.get("mergeable_state") or "").strip().lower()
+        if pr.get("mergeable") is not True or mergeable_state != "clean":
+            return (
+                "HOLD: %s#%s is no longer mergeable and CLEAN "
+                "(mergeable=%r, mergeable_state=%r). Re-scan before merging."
+                % (repo, number, pr.get("mergeable"), mergeable_state or "<none>"),
+                "blocked",
+            )
+    if auto_merge_guard is not None:
+        try:
+            guard_ok, guard_reason = auto_merge_guard(pr)
+        except Exception as e:
+            return (
+                "HOLD: final auto-merge guard could not be completed: %s. "
+                "Re-scan before merging." % str(e)[:160],
+                "blocked",
+            )
+        if guard_ok is not True:
+            return (
+                "HOLD: final auto-merge guard: %s. Re-scan before merging."
+                % str(guard_reason or "guard did not approve the merge")[:200],
+                "blocked",
+            )
     return None
 
 
@@ -571,61 +849,52 @@ def do_merge(
 
     slug = "%s/%s" % (owner, repo)
     pr = core.gh_rest("/repos/%s/pulls/%s" % (slug, number))
-    if pr.get("merged"):
-        return outcome(
-            "Target %s#%s is already merged - nothing to do." % (repo, number),
-            "resolved",
-        )
-    if pr.get("state") != "open":
-        return outcome(
-            "Target %s#%s is not open (%s) - consuming card."
-            % (repo, number, pr.get("state")),
-            "resolved",
-        )
-    current = (pr.get("head") or {}).get("sha", "")
-    stale = _stale_pr_head_result(repo, number, head_sha, current, "merging")
-    if stale:
-        return outcome(*stale)
-    expected_base_sha = str(expected_base_sha or "").strip()
-    if expected_base_sha:
-        current_base_sha = str((pr.get("base") or {}).get("sha") or "").strip()
-        if current_base_sha != expected_base_sha:
-            return outcome(
-                "HOLD: %s#%s base moved since auto-merge evaluation "
-                "(was %s, now %s). Re-scan before merging."
-                % (
-                    repo,
-                    number,
-                    expected_base_sha[:8],
-                    current_base_sha[:8] or "<none>",
-                ),
-                "blocked",
-            )
-    if require_clean_merge_state:
-        mergeable_state = str(pr.get("mergeable_state") or "").strip().lower()
-        if pr.get("mergeable") is not True or mergeable_state != "clean":
-            return outcome(
-                "HOLD: %s#%s is no longer mergeable and CLEAN "
-                "(mergeable=%r, mergeable_state=%r). Re-scan before merging."
-                % (repo, number, pr.get("mergeable"), mergeable_state or "<none>"),
-                "blocked",
-            )
-    if auto_merge_guard is not None:
-        try:
-            guard_ok, guard_reason = auto_merge_guard(pr)
-        except Exception as e:
-            return outcome(
-                "HOLD: final auto-merge guard could not be completed: %s. "
-                "Re-scan before merging." % str(e)[:160],
-                "blocked",
-            )
-        if guard_ok is not True:
-            return outcome(
-                "HOLD: final auto-merge guard: %s. Re-scan before merging."
-                % str(guard_reason or "guard did not approve the merge")[:200],
-                "blocked",
-            )
+    precondition = _merge_pr_precondition(
+        repo,
+        number,
+        head_sha,
+        pr,
+        expected_base_sha=expected_base_sha,
+        require_clean_merge_state=require_clean_merge_state,
+    )
+    if precondition:
+        return outcome(*precondition)
+    # Option B: never attempt API merge of a workflow-touching PR. FLEET_TOKEN
+    # intentionally has no Workflows write; pre-detect and leave the card open
+    # and clearly blocked with manual UI-merge guidance instead of a doomed 403.
+    workflow_block = _workflow_merge_block(owner, repo, number, pr)
+    if workflow_block:
+        return outcome(*workflow_block)
     method = _merge_method(repo)
+    try:
+        pr = core.gh_rest("/repos/%s/pulls/%s" % (slug, number))
+    except _WORKFLOW_SCAN_READ_ERRORS as e:
+        return outcome(
+            "BLOCKED: could not verify %s#%s after workflow inspection (%s). "
+            "Not merging. Review and merge by hand in the GitHub UI if "
+            "appropriate: %s"
+            % (repo, number, str(e)[:120], _target_pr_url(owner, repo, number)),
+            "blocked",
+        )
+    if not isinstance(pr, dict):
+        return outcome(
+            "BLOCKED: could not verify %s#%s after workflow inspection (PR "
+            "read returned unexpected data). Not merging. Review and merge by "
+            "hand in the GitHub UI if appropriate: %s"
+            % (repo, number, _target_pr_url(owner, repo, number)),
+            "blocked",
+        )
+    precondition = _merge_pr_precondition(
+        repo,
+        number,
+        head_sha,
+        pr,
+        expected_base_sha=expected_base_sha,
+        require_clean_merge_state=require_clean_merge_state,
+        auto_merge_guard=auto_merge_guard,
+    )
+    if precondition:
+        return outcome(*precondition)
     try:
         fields = {"merge_method": method}
         if head_sha:
@@ -637,6 +906,20 @@ def do_merge(
         )
     except RuntimeError as e:
         detail = str(e)[:200]
+        try:
+            latest_pr = core.gh_rest("/repos/%s/pulls/%s" % (slug, number))
+        except _WORKFLOW_SCAN_READ_ERRORS:
+            latest_pr = None
+        if isinstance(latest_pr, dict):
+            stale = _stale_pr_head_result(
+                repo,
+                number,
+                head_sha,
+                (latest_pr.get("head") or {}).get("sha", ""),
+                "merging",
+            )
+            if stale:
+                return outcome(*stale)
         if "conflict" in detail.lower():
             return outcome(
                 "Merge of %s#%s failed because the PR has a merge conflict. "
@@ -835,7 +1118,8 @@ def cmd_execute():
 
     set_output("result_message", message)
     set_output("terminal_state", terminal)
-    set_output("success", "true" if terminal not in ("error",) else "false")
+    set_output("success", "true" if terminal not in ("error", "retryable") else "false")
+    print("decision result: %s" % re.sub(r"[\r\n]+", " ", str(message)))
 
 
 # --------------------------------------------------------------------------- #
