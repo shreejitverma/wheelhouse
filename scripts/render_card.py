@@ -1852,6 +1852,31 @@ def extract_claude_result(path):
     return ""
 
 
+def extract_result_to_file(execution_file, out_file):
+    """Write the final result as a compact events file.
+
+    Result extraction stays independent of transcript-retention limits so the
+    transcript size cannot gate verdict delivery. The output remains compatible
+    with `extract_claude_result`.
+
+    Returns True when a non-empty result was extracted and written.
+    """
+    result_text = extract_claude_result(execution_file)
+    if not result_text:
+        return False
+    compact = [
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": result_text,
+        }
+    ]
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(compact, f)
+    return True
+
+
 def parse_triage_json(text):
     text = (text or "").strip()
     if text.startswith("```"):
@@ -1923,6 +1948,15 @@ def main():
         "its update step).",
     )
 
+    xr = sub.add_parser("extract-result")
+    xr.add_argument("--execution-file", required=True)
+    xr.add_argument(
+        "--out",
+        required=True,
+        help="Path to write the compact result events file that triage-apply "
+        "consumes, independent of transcript size.",
+    )
+
     qt = sub.add_parser("queue-triage")
     qt.add_argument("--item-file", required=True)
     qt.add_argument(
@@ -1982,6 +2016,13 @@ def main():
             update_card_triage(
                 args.issue, args.revision, error=TRIAGE_UNAVAILABLE, owner=owner
             )
+    elif args.cmd == "extract-result":
+        # Keep result delivery independent of transcript-retention limits.
+        if extract_result_to_file(args.execution_file, args.out):
+            print("extracted compact auto triage result to %s" % args.out)
+        else:
+            print("::warning::auto triage produced no extractable result")
+            sys.exit(1)
     elif args.cmd == "triage-fail":
         owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
         print("::warning::auto triage failed: %s" % _clean_triage_text(args.message))

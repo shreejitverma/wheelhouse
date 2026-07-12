@@ -737,7 +737,9 @@ def test_triage_requires_evidence_field():
         "recommended_next_step": "merge - safe.",
         "evidence": 'target.txt: "def grok(): ..."',
     }
-    check("evidence: complete result accepted", rc.normalize_triage(complete) is not None)
+    check(
+        "evidence: complete result accepted", rc.normalize_triage(complete) is not None
+    )
     check(
         "evidence: rendered triage does not leak the raw evidence field",
         "evidence" not in (rc.normalize_triage(complete) or {}),
@@ -772,14 +774,16 @@ def test_evidence_anchor_ok_catches_fabrication():
     (evidence_anchor_ok itself returns False on an empty haystack, and
     _triage_evidence_verified turns an unreadable target.txt into a skip)."""
     target = (
-        "<target-content repo=\"acme/widgets\" number=\"7\">\n"
+        '<target-content repo="acme/widgets" number="7">\n'
         "# Add Grok support\n\n"
         "+def grok_request(prompt):\n"
         "+    return call_model('grok', prompt)\n"
         "</target-content>\n"
     )
     good = 'target.txt: "def grok_request(prompt):" and "call_model(\'grok\', prompt)"'
-    check("anchor: a genuine on-disk quote verifies", rc.evidence_anchor_ok(good, target))
+    check(
+        "anchor: a genuine on-disk quote verifies", rc.evidence_anchor_ok(good, target)
+    )
     check(
         "anchor: whitespace/case differences still verify",
         rc.evidence_anchor_ok('target.txt: "DEF   grok_request(prompt):"', target),
@@ -2228,16 +2232,36 @@ def test_triage_workflow_security_wiring():
         )
         check(
             "workflow: triage result stores only an isolated execution file",
-            "${RUNNER_TEMP}/wheelhouse-triage" in run
-            and 'cp "$EXECUTION_FILE" "$out_file"' in run,
+            "${RUNNER_TEMP}/wheelhouse-triage" in run,
         )
         check(
             "workflow: triage result rejects symlink or non-file output",
             '[ -L "$EXECUTION_FILE" ]' in run and '[ ! -f "$EXECUTION_FILE" ]' in run,
         )
+        # Card #556 (delivered-result-drop): the compact result must be
+        # extracted INDEPENDENT of transcript size, so a bulky transcript can
+        # never discard a valid verdict. The size cap now governs only the
+        # retained debug transcript copy, never `result_path` (delivery).
+        extract_idx = run.find("extract-result")
+        size_idx = run.find("262144")
         check(
-            "workflow: triage result caps execution file size",
-            "262144" in run and 'wc -c < "$EXECUTION_FILE"' in run,
+            "workflow: triage result extracts the compact result via extract-result",
+            extract_idx != -1 and "render_card.py" in run and "TRUSTED_PYTHON" in env,
+        )
+        check(
+            "workflow: result extraction precedes any transcript-size gate",
+            extract_idx != -1 and size_idx != -1 and extract_idx < size_idx,
+        )
+        check(
+            "workflow: result_path is set from extraction, not gated by the size cap",
+            'result_path="$result_file"' in run
+            and "auto triage execution file is too large" not in run,
+        )
+        check(
+            "workflow: the transcript size cap only bounds the retained copy",
+            "262144" in run
+            and 'wc -c < "$EXECUTION_FILE"' in run
+            and 'cp "$EXECUTION_FILE" "$transcript_file"' in run,
         )
 
     check("workflow: final card update step exists", update is not None)
