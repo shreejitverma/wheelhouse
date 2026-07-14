@@ -19,9 +19,10 @@ PRs to `main` must be raised by `git push no-mistakes`, which writes the signatu
 ## How it works
 
 - **The queue is the issue list.** Each open issue is one decision that needs you. Open = pending, closed = consumed.
-- **Labels carry state:** `needs-decision` (in the queue), `pending-triage` (first auto-triage attempt is still publishing), `processing` (a handler is acting), `resolved` (a successful resolving action consumed the card), `blocked` (a manual hold or non-retryable action error needs follow-up), plus metadata labels `repo:<name>`, `kind:<pr-review|ci-approval|issue-triage>`, `priority:<high|med|low>`.
+- **Labels carry state:** `needs-decision` (in the queue), `pending-triage` (first auto-triage attempt is still publishing), `processing` (a handler is acting), `resolved` (a successful resolving action consumed the card), `blocked` (a manual hold or non-retryable action error needs follow-up), `wheelhouse:manual-merge-required` (scan-time auto-merge proved the current head needs a manual workflow-aware merge), plus metadata labels `repo:<name>`, `kind:<pr-review|ci-approval|issue-triage>`, `priority:<high|med|low>`.
 - **Each issue body is a decision card:** a link to the target, the target author shown as plain text instead of a notifying `@mention`, the situation, an overlap note, a recommended action, and quick-decision checkboxes.
   A scan-created contributor CI-approval card that holds for changed workflow/action files also includes a deterministic, read-only *Security review (advisory)* section to inform the same manual approval decision.
+  A PR-review card whose final auto-merge gate proves a history-only workflow touch includes a head-scoped *Manual merge required* section with bounded evidence.
   When successful auto triage returns a fresh structured recommendation, the card shows an *Accept recommendation* checkbox and hides the older top-level recommended-action text so there is one primary recommendation surface.
   A brand-new PR-review or issue-triage card that is waiting for its first auto-triage attempt temporarily shows a placeholder instead of those checkboxes; the normal checkboxes appear as soon as that attempt completes, even if triage fails.
   A hidden HTML comment holds the machine-readable state.
@@ -144,6 +145,8 @@ GitHub's own rollup `FAILURE` or `ERROR` also fails closed so an accidental fals
 > It re-reads the head, base, `VISION.md`, merge state, checks, escape-hatch label, and card activity immediately before the existing deterministic merge call, so any uncertainty leaves the PR for normal review.
 > Every PR-review card shows each guarded criterion as `MET`, `UNMET`, or `UNAVAILABLE` with concise evidence from the same authoritative evaluator; these rows are read-only context and never authorize a merge.
 > When current-head triage succeeds and recommends merge but produces no structured behavior verdict, the eligible behavior class is `UNMET`, while its dependent behavior checks and verdict revision bindings are `UNAVAILABLE` because they were not evaluated; authorization still requires every criterion to be `MET`.
+> If the final merge gate finds a workflow-file touch only in commit history after the complete current net diff passed the earlier exclusions, the card gains a `wheelhouse:manual-merge-required` label and a head-scoped manual-merge section with the source PR, commit, and bounded path evidence.
+> The matching head is not claimed again on later hourly runs, and its G7 criterion is `UNMET`; a new head clears the hold through normal refresh, requires fresh triage, and still passes through the same live final workflow gate before any merge.
 > Wheelhouse never auto-reverts; every automatic merge closes its decision card with an audit record and appends to a closed, durable auto-merge ledger issue in the hub.
 
 > **Heads-up - `thank_on_merge` defaults ON (no Claude token needed).**
@@ -270,6 +273,8 @@ You drive the queue three ways - whichever fits the decision:
   Auto triage itself is still advisory: it gives you context before deciding and never acts without your tick.
 - **Optional scan-time auto-merge.** When a repository has opted into `auto_merge` and committed `VISION.md`, the hourly scan may merge only a PR that clears the separate fail-closed gate described in [step 2](#2-edit-wheelhouseconfigyml).
   It first claims the pure pending decision card, then rechecks the live PR and card before merging, so an owner/maintainer action or a new decision on the card wins instead.
+  A `wheelhouse:manual-merge-required` card is a specialized, refreshable auto-merge denial for its current head: commit history touched a workflow file even though the current net diff is clean, so review and merge that PR in the GitHub UI.
+  Wheelhouse will not reclaim that same head every hour; a new head removes the hold during normal refresh and must earn a fresh current-head verdict.
   Apply `wheelhouse:no-auto-merge` to the target PR to stop one pending automatic merge; this label does not block your normal `/merge` or *Merge it* decision.
   Each automatic merge resolves the card with its qualifying evidence and adds a row to Wheelhouse's closed auto-merge ledger issue.
 - **Quick calls - tick a consuming checkbox.** Each card offers the relevant final-decision boxes (e.g. *Merge it*, *Approve the CI run*, *Close / decline*, *Hold*).
@@ -316,7 +321,7 @@ You drive the queue three ways - whichever fits the decision:
 
 An item is **consumed** when the handler closes its card after a successful resolving action; the card is labeled `resolved` for audit.
 A `/hold` or a non-retryable action error leaves the card open with the `blocked` label for manual follow-up.
-A workflow-touch or unable-to-verify workflow-history merge refusal also lands `blocked` (will not API-merge; merge by hand in the GitHub UI, or retry after a rebase drops the workflow touch).
+A workflow-touch or unable-to-verify workflow-history refusal from a direct owner merge decision also lands `blocked` (will not API-merge; merge by hand in the GitHub UI, or retry after a rebase drops the workflow touch).
 A retryable merge refusal for a stale head leaves the card as `needs-decision` so you can retry after the card is current.
 For the "what changed most recently?" view, use the Issues list sorted by Recently updated, or bookmark `https://github.com/<owner>/<wheelhouse-repo>/issues?q=is%3Aissue%20is%3Aopen%20label%3Aneeds-decision%20sort%3Aupdated-desc`.
 Wheelhouse bumps a pure pending card's own updated time when the target PR or issue's GitHub `updatedAt` advances, so recently active targets rise to the top.
@@ -419,6 +424,8 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   The gate rejects sensitive, governance, release, dependency, security/auth, billing, migration, persistence, installation, and public-default surfaces; requires a returning human contributor, clean live mergeability, configured green checks, and a 20-file/1,000-line cap; and fails closed on every missing or stale read.
   `VISION.md` is fetched only from the default branch and a PR changing it is excluded, so a contribution cannot author the policy used to approve itself.
   Immediately before the merge, Wheelhouse rechecks the head, base, vision revision, live clean state, configured checks, target escape-hatch label, card activity, and the unchanged manual workflow-touch merge gate.
+  When that final gate proves a history-only workflow touch after a clean complete net diff, Wheelhouse persists a bounded head-scoped manual-merge hold on the decision card with the default card token before releasing the claim.
+  The hold can only deny repeated claims; it never skips the final gate or authorizes a later merge, and malformed hold state fails closed until an authoritative refresh.
   PR-review cards display every guarded criterion separately as `MET`, `UNMET`, or `UNAVAILABLE`, using a head-bound result from the same evaluator that enforces G0-G6 and explicitly reserving G7 for the immediate act boundary.
   Displayed rows are non-material, read-only evidence and are never consumed as authorization.
   The cross-repo merge uses `FLEET_TOKEN`, while the claim, audit record, decision-card close, and closed hub ledger issue use the default `GITHUB_TOKEN`.
@@ -567,9 +574,9 @@ wheelhouse.config.yml          the one file you edit
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
   wheelhouse_core.py           resilient GraphQL scan/classify, mergeability settlement, scan-health ledger, author filtering, dedup/overlap, target cleanup, CI safety, auto-approval, read-only CI security summaries, ref qualification, and scan logs
-  render_card.py               build decision cards, including held pending-triage placeholders, auto-merge criteria, and advisory CI security reviews; create/reuse/refresh/activity-reflect/close cards; queue/update auto triage; label automated status lines
+  render_card.py               build decision cards, including held pending-triage placeholders, auto-merge criteria, history-only workflow holds, and advisory CI security reviews; create/reuse/refresh/activity-reflect/close cards; queue/update auto triage; label automated status lines
   apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
-  auto_merge.py                evaluate criteria, claim, validate, merge, and audit strictly eligible scan-time PR auto-merges
+  auto_merge.py                evaluate criteria, claim, validate, merge, persist final-gate manual-merge holds, and audit strictly eligible scan-time PR auto-merges
   automerge_criteria.py        stable schema for authoritative auto-merge criterion rows
   nl_readonly_search.py        optional READONLY_TOKEN search wrapper for LLM context
   build_item.py                normalize a dispatch payload into a card item
@@ -588,6 +595,7 @@ tests/test_auto_triage.py      offline unit test for automatic triage config, ca
 tests/test_triage_prompt_size.py offline regression test for bounded pass-by-reference triage and deep-review prompts
 tests/test_auto_merge_v1.py    offline unit test for scan-time auto-merge gates, claims, live rechecks, audit records, and ledger recovery
 tests/test_automerge_card_ui.py offline end-to-end test for authoritative criterion evaluation, fail-closed display states, and real card rendering
+tests/test_automerge_workflow_hold.py offline end-to-end test for durable history-only workflow holds, recovery, token isolation, and card lifecycle behavior
 tests/test_deep_review.py      offline unit test for the always-on deep-review + Investigate wiring and trusted verdict posting, including ref qualification and automated-status labeling
 tests/test_workflow_lint.py    offline regression guard for workflow `gh api --slurp` / `--jq` misuse
 tests/test_qualify_refs.py     offline unit test for shared bare `#N` -> `<owner>/<repo>#N` qualification

@@ -33,7 +33,8 @@ still appears where it's plain English, e.g. "triage the queue".)
 
 - **State lives in GitHub, not on disk.** Open issue = pending decision; closed =
   consumed. Labels are state (`needs-decision`, `pending-triage`, `processing`,
-  `resolved`, `blocked`, `repo:*`, `kind:*`, `priority:*`). A hidden
+  `resolved`, `blocked`, `wheelhouse:manual-merge-required`, `repo:*`, `kind:*`,
+  `priority:*`). A hidden
   `<!-- wheelhouse-state: {...} -->` block in each card body carries
   `{repo, number, kind, head_sha, options}` plus the material fields
   `{comp, tests, priority}` (the latter three added so a refresh can cheaply and
@@ -62,6 +63,14 @@ still appears where it's plain English, e.g. "triage the queue".)
   because it is derived from non-material triage state, not from source-provided
   checkbox options. A held card also carries non-material `held: true` until its
   first auto-triage attempt publishes the normal decision controls. The state
+  block may also carry a bounded, versioned, head-scoped NON-material
+  `automerge_workflow_hold` record after the authoritative final auto-merge gate
+  proves a history-only workflow touch against a complete clean net diff.
+  Its matching managed `wheelhouse:manual-merge-required` label and visible
+  section deny repeated claims without making the refreshable card generically
+  `blocked`; malformed same-head state fails closed, while authoritative
+  new-head or incompatible-kind rendering clears it.
+  The state
   block also carries `render_version`, another
   non-material field alongside `triaged_sha`: it is a one-time re-render
   trigger stamped by `render()` (see "Card refresh" in Sharp edges) that exists
@@ -147,7 +156,8 @@ still appears where it's plain English, e.g. "triage the queue".)
   target-activity state reflection, the advisory `### Security review` section
   on CI-approval HOLD cards (`_security_review_section`), the non-authoritative
   read-only
-  `### Auto-merge criteria` section on PR-review cards, plus trusted
+  `### Auto-merge criteria` section and trusted history-only workflow hold on
+  PR-review cards, plus trusted
   triage-result card edits that publish held cards),
   `apply_decision.py` (deterministic `parse` then
   `execute`; pre-merge workflow-touch gate in `do_merge` that blocks
@@ -163,7 +173,8 @@ still appears where it's plain English, e.g. "triage the queue".)
   context),
   `automerge_criteria.py` (stable criterion IDs/labels and fail-closed
   normalization shared by evaluator and renderer), `auto_merge.py`
-  (authoritative G0-G6 criterion evaluation plus claim/validate/G7 act/audit),
+  (authoritative G0-G6 criterion evaluation plus claim/validate/G7 act/audit and
+  default-token persistence/recovery of final-gate workflow holds),
   `build_item.py` (normalize ingest payload), `reconcile.py` (backstop
   create/**refresh**/activity-reflect/close/reuse and automatic triage dispatch). `apply_decision` imports `wheelhouse_core` and
   `nl_readonly_search`; `reconcile`/`render_card` import `wheelhouse_core` (and
@@ -990,7 +1001,12 @@ still appears where it's plain English, e.g. "triage the queue".)
   `scan-backstop` passes that head-bound result through `automerge.json` to `reconcile.py`, and `render_card.py` shows every row as `MET`, `UNMET`, or `UNAVAILABLE` with concise evidence.
   Criterion state is non-material and never read as authorization; action mode always re-evaluates fail-fast with an exclusive card claim, and G7 plus the unchanged `do_merge` workflow-touch gate still run immediately before merge.
   Missing historical criterion data renders every row explicitly unavailable, while a changed fresh result triggers only a display refresh through `automerge_criteria_stale`.
+  A final `apply_decision._workflow_merge_gate` result of exactly `history-only-workflow-touch` after G2's complete clean net diff creates the separate NON-MATERIAL `automerge_workflow_hold` record and `wheelhouse:manual-merge-required` label/section for that head.
+  The matching hold makes claim skip before any processing label, displays G7 as `UNMET`, and is preserved by same-head card maintenance and trusted soft-close reuse; a normal authoritative new-head or incompatible-kind refresh drops it with stale triage/verdict state.
+  This is denial-only and remains refreshable, never generic `blocked`: `do_merge` still performs the authoritative history read for every actual merge, while unreadable/incomplete or net-diff workflow cases retain their existing generic fail-closed paths and never establish this proven-history hold.
+  Hold body/label writes use only the default card token, are verified before audit-intent cleanup or claim release, and a failed persistence leaves the exclusive claim plus `final_gate_pending` audit intent for deterministic retry rather than a pure hourly reclaim loop.
   See `tests/test_automerge_card_ui.py` for the full positive/negative matrix, axi#96 lifecycle shape, old-card compatibility, and the guarantee that forged displayed `MET` rows cannot grant eligibility.
+  See `tests/test_automerge_workflow_hold.py` for the two-hour no-reclaim lifecycle, head changes, persistence recovery, token boundaries, and card reuse/close behavior.
   A target repository without GitHub's "require branches to be up to date" branch protection has an irreducible sub-second window between those final GETs and GitHub's merge PUT: GitHub's merge API accepts no base-SHA precondition.
   That residual risk is bounded by the final CLEAN state, green configured checks, blast-radius caps, and unconditional exclusions.
   Enabling "require branches to be up to date" branch protection, or using a merge queue, closes it server-side because GitHub's `mergeStateStatus` becomes `BEHIND` while auto-merge requires a CLEAN merge state.
@@ -1225,6 +1241,7 @@ Run the unit tests:
 - `python tests/test_config_schema.py` - structural load test that `wheelhouse_core.load_config()` accepts the checked-in `wheelhouse.config.yml`: every `repos:` entry is well-formed (name is trimmed and matches its key; `compliance_check` is null or a trimmed non-empty string; `test_check_patterns` is a list of trimmed non-empty strings; `merge_method` is unset or squash|merge|rebase) and repo names are case-insensitively unique. Deliberately pins no repo names or fleet size, so it keeps guarding the file as the fleet grows/shrinks, no network.
 - `python tests/test_auto_merge_v1.py` - scan-time auto-merge (V1), no network and no target-repo writes: the config + exclusion helpers (`_auto_merge_enabled` default-off/overrides, `_auto_merge_exclusions` covering every category incl. VISION.md self-authorization); the pure `verdict_eligible` gate (A/B/C eligibility, class-C opt-in/default-off, malformed/stale/absent verdicts, fail-closed defaults) plus `normalize_automerge_verdict` parsing/coercion; the blast-radius caps at the exact 20-file and 1000-line boundaries; every deterministic gate G0-G6 walked through PASS and HOLD via representative live-card fixtures in `act_on_scan`; the G7 live head + merge-state re-check immediately before acting (and the scan-vs-live head mismatch); the `wheelhouse:no-auto-merge` escape hatch and global/per-repo kill switches; the ok:false/truncated/indeterminate freeze; base-branch-ONLY VISION.md reads (contents API, no `?ref`); the durable ledger (parse/append/render/cap) + audit comment + `record` CLI resolving the card and appending the ledger (best-effort/no-op paths); the `do_merge` race/error outcomes; and the DELIBERATE ABSENCE of an open-PR file-overlap gate and any per-contributor/per-scan rate cap; the claim-time author-duality normalization (real `get_card`-shaped `{"login": "app/github-actions"}` fixtures normalize and are trusted, `github-actions[bot]` stays trusted, and a human login / a different `app/*` slug / bare `github-actions` / lookalikes all stay fail-closed rejected); plus offline YAML wiring checks (FLEET act step, github.token record step, act->reconcile->record order, the criteria handoff, and the triage.yml base-VISION verdict prompt).
 - `python tests/test_automerge_card_ui.py` - authoritative auto-merge criterion UI, no network: every stable row's positive and fail-closed negative state, owner/bot/history distinctions, workflow/security exclusions, dirty/unknown mergeability and checks, verdict freshness and A/B/C details, blast limits, held/claimed card state, the real axi#96 shape through evaluator and renderer, old-card fallback, criterion-only refresh, and proof that persisted display rows cannot grant eligibility.
+- `python tests/test_automerge_workflow_hold.py` - durable history-only workflow manual-merge hold, no network: the real two-hour claim/validate/act/record/reconcile lifecycle, structured final-gate evidence, same-head no-reclaim behavior, G7 `UNMET` presentation, clean and still-dirty new heads, G2 net-diff separation, unreadable/incomplete fail-closed paths, malformed/stale state, persistence recovery, same-head maintenance and trusted reuse, immediate hard close, and default-card-token isolation.
 YAML-parse `.github/workflows/*.yml` plus `wheelhouse.config.yml` plus `.github/ISSUE_TEMPLATE/*.yml`.
 Run `actionlint` if available; fetch the binary via its `download-actionlint.bash` if not.
 The live LLM paths (auto triage, deep-review, nl_decisions) can only be exercised end-to-end in CI with the token set and, for nl_decisions, the flag on.
