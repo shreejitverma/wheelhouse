@@ -12,177 +12,15 @@
 # =============================================================================
 
 # The fleet: the repositories you maintain and want triaged.
-# Replace these annotated placeholders with your own repos.
+# Shreejit's fleet (2026-07-15). Check names below were read from each repo's
+# live workflow files: The-Quant-Prep ci.yml runs `build-and-test`;
+# wc2026-quant-prediction-system ci.yml runs `test-and-verify` and `frontend`.
+# The rest have no PR CI (shreejitverma's metrics.yml is a scheduled job, not a
+# PR check), so their PRs surface for review without a tests-green signal.
+# None of these repos runs the no-mistakes contribution gate yet, so every
+# compliance_check is null.
 repos:
-  - name: lavish-axi               # repo name only (resolved under your owner)
-    # Exact name of a required status check that gates "is this PR allowed to
-    # merge". For lavish-axi this is the "raised via no-mistakes" contribution
-    # gate. Set to null if you have no such gate. When set, a PR is never shown
-    # as merge-ready until this check passes.
-    # Duplicate contexts with this exact name aggregate worst-wins. A GitHub
-    # rollup FAILURE/ERROR also fails closed rather than marking a PR merge-ready,
-    # even when this is null.
-    compliance_check: "PR must be raised via no-mistakes"
-    # Substrings that identify your *test* / CI checks. A PR is "tests green"
-    # only when every check whose name contains one of these passes. lavish-axi
-    # runs a `build-and-test (<os>)` matrix across ubuntu/macos/windows.
-    test_check_patterns: ["build-and-test"]
-    # Optional per-repo extras:
-    merge_method: squash           # squash | merge | rebase (default: squash)
-    #                              # used when you approve a "Merge it" decision
-    # auto_approve_ci: false       # optional override of the global setting
-    # auto_triage: false           # optional per-repo opt-out for Claude spend (pr-review)
-    # auto_triage_issues: false    # optional per-repo opt-out for Claude spend (issue-triage)
-    # pending_contributor_cleanup: false  # optional per-repo stale PR cleanup override
-    # pending_contributor_cleanup_days: 14
-    # pending_contributor_reminder_days: 10
-    # pending_contributor_cleanup_targets: ["pr"]
-    # thank_on_merge: false        # optional per-repo opt-out for the merge thank-you comment
-    # thank_on_merge_message: "Cheers @{author}, this just merged!"  # optional per-repo wording override
-
-  # All repos below share the same contribution gate: the `no-mistakes-required.yml`
-  # workflow runs a job named "PR must be raised via no-mistakes" on every PR to
-  # main, so that exact string is each one's compliance_check. test_check_patterns
-  # below are substrings of each repo's real CI test-job check names (verified
-  # against the live workflows and Actions run history). merge_method is omitted,
-  # so each defaults to squash.
-  - name: gnhf
-    # ci.yml runs a `build-and-test` matrix (ubuntu/macos/windows-latest).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test"]
-
-  - name: firstmate
-    # ci.yml ("CI") runs Lint shell scripts / Behavior tests / Repo invariants;
-    # "Behavior tests" is the test suite (lint/invariants excluded, mirroring how
-    # no-mistakes excludes its format/vet "check" job).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["Behavior tests"]
-
-  - name: no-mistakes
-    # ci.yml runs `test` (matrix os) + `e2e` (and a format/vet `check` job we skip).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["test (", "e2e"]
-
-  - name: axi
-    # axi-sdk-js-ci.yml runs a `build-and-test` job (path-filtered to the JS SDK);
-    # a catalog/docs PR runs `drift` (the catalog-consistency gate) instead, since
-    # `build-and-test` is path-filtered off docs. Both are accepted test signals so
-    # SDK PRs still gate on `build-and-test` and catalog PRs gate on `drift` - the
-    # two run on disjoint paths, so worst-wins over whichever is present holds.
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test", "drift"]
-
-  - name: chrome-devtools-axi
-    # ci.yml runs a single `build-and-test` job.
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test"]
-
-  - name: gh-axi
-    # ci.yml runs a single `build-and-test` job.
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test"]
-
-  # ===========================================================================
-  # Fleet expansion (2026-07-10): 15 more owned repos brought under Wheelhouse.
-  # Each entry's CI shape below was verified against that repo's LIVE workflow
-  # files and, where available, Actions run history on 2026-07-10 - the exact
-  # rendered job/check names (including matrix legs), and whether the
-  # no-mistakes contribution gate actually runs on PRs to the repo's default
-  # branch. merge_method is omitted
-  # throughout, so each defaults to squash, like the entries above.
-  # ===========================================================================
-
-  # -- These DO enforce the no-mistakes contribution gate: a
-  #    `no-mistakes-required.yml` workflow runs the job named exactly
-  #    "PR must be raised via no-mistakes" on PRs to their default branch
-  #    (confirmed live). Each also runs a `guard-generated-files.yml` check
-  #    ("Generated files must not be ...") and release-please; Wheelhouse ignores
-  #    both for classification (neither the compliance gate nor a test check).
-  - name: autopreso
-    # ci.yml ("CI") runs a single `test` job (Node typecheck/test/build).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["test"]
-
-  - name: baby-menu
-    # ci.yml ("ci") runs one job rendered as `typecheck / test / build`.
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["typecheck / test / build"]
-
-  - name: tasks-axi
-    # ci.yml runs a `build-and-test` matrix (ubuntu/macos/windows-latest).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test"]
-
-  - name: quota-axi
-    # ci.yml runs a single `build-and-test` job.
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test"]
-
-  - name: short-pipe
-    # ci.yml ("CI") runs a single job named `Validate`.
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["Validate"]
-
-  - name: trial-by-combat
-    # ci.yml ("CI") runs a single `ci` job (the only non-gate check on a PR).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["ci"]
-
-  - name: justroll
-    # ci.yml runs a `build-and-test` matrix (ubuntu/macos-latest).
-    compliance_check: "PR must be raised via no-mistakes"
-    test_check_patterns: ["build-and-test"]
-
-  # -- These have CI but NO no-mistakes contribution gate, so compliance_check is
-  #    null: a PR is never withheld waiting on a gate that does not exist (a
-  #    GitHub rollup FAILURE/ERROR still fails closed). test_check_patterns match
-  #    each repo's real CI test-job check names.
-  - name: treehouse
-    # No no-mistakes gate. ci.yml ("CI") runs a Go `test` matrix
-    # (ubuntu/macos/windows-latest); its separate `check` job is a gofmt/vet gate
-    # we skip, mirroring how no-mistakes' own format/vet `check` job is excluded.
-    compliance_check: null
-    test_check_patterns: ["test"]
-
-  - name: presize
-    # No no-mistakes gate. build.yml ("build") runs a `build` matrix rendered as
-    # `build (ubuntu, 16.x)`.
-    compliance_check: null
-    test_check_patterns: ["build"]
-
-  - name: org-bench
-    # No no-mistakes gate. ci.yml ("CI") runs a single `validate` job.
-    compliance_check: null
-    test_check_patterns: ["validate"]
-
-  - name: comment-repl.nvim
-    # No no-mistakes gate. lint_test.yml runs a `test` matrix (nvim stable/
-    # nightly) plus a `stylua` lint job (lint excluded from the test signal). No
-    # Actions run history yet; check names read from the workflow file.
-    compliance_check: null
-    test_check_patterns: ["test"]
-
-  # -- These have no CI test or gate workflows. No compliance gate and no test
-  #    checks exist, so both are left null/empty; such a repo's PRs simply
-  #    surface for review without a tests-green signal.
-  - name: dotfiles
-    # No CI. Its only workflow (close-prs.yml) auto-comments and closes non-owner
-    # PRs via pull_request_target; it is not a merge gate or a test check.
-    compliance_check: null
-    test_check_patterns: []
-
-  - name: dotfiles-mac-nix
-    # No CI workflows at all.
-    compliance_check: null
-    test_check_patterns: []
-
-  - name: superpowers-bench
-    # No CI workflows at all. Default branch is `master`.
-    compliance_check: null
-    test_check_patterns: []
-
-  - name: programbench-bench
-    # No CI workflows at all.
+  - name: shreejitverma
     compliance_check: null
     test_check_patterns: []
 
@@ -310,7 +148,7 @@ nl_decisions: true
 # deeper code-grounded read.
 card_issues: true
 
-# Stale pending-contributor cleanup. DEFAULT OFF when this key is absent; Kun's
+# Stale pending-contributor cleanup. DEFAULT OFF when this key is absent; Shreejit's
 # own Wheelhouse opts in here.
 # The PR-only MVP arms cleanup only after deterministic asks: `/request-changes`
 # reviews and merge-conflict rebase nudges.
