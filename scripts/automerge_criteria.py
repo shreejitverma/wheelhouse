@@ -54,6 +54,12 @@ CRITERIA_IDS = tuple(spec[0] for spec in CRITERIA_SPECS)
 CRITERIA_LABELS = dict(CRITERIA_SPECS)
 CRITERION_ID = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 
+# The exact G0 evidence the evaluator emits when the default branch carries no
+# readable VISION.md. The evaluator writes it and the card renderer reads it, so
+# the "needs VISION.md" hint on the vision-bound subtree is driven by the actual
+# G0 result instead of a substring heuristic over child evidence.
+G0_VISION_MISSING_EVIDENCE = "VISION.md missing or unreadable on the default branch"
+
 # These are presentation-only labels. The evaluator and persisted state keep
 # the machine value (including INELIGIBLE) unchanged.
 G6_MANUAL_REVIEW_LABEL = "MANUAL REVIEW REQUIRED"

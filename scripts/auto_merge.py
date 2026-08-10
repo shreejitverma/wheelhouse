@@ -177,12 +177,17 @@ def _scan_same_closing_issue_clear(item):
     return (True, "")
 
 
-def behavior_verdict_facts(verdict):
+def behavior_verdict_facts(verdict, triaged_vision_sha=""):
     """Return the structured facts that make up the behavior-verdict gate.
 
     `verdict_eligible` and the card UI consume these exact facts, so a displayed
     result cannot drift from enforcement. The first failing fact preserves the
     historical hold reason and ordering.
+
+    `triaged_vision_sha` is the card state's already-known triage-time VISION.md
+    revision. It only makes the vision-bound rows honest: when it is present,
+    VISION.md provably WAS read, so the rows must not claim one is required.
+    It never changes a status, an ordering, or eligibility.
     """
     facts = {}
 
@@ -294,14 +299,27 @@ def behavior_verdict_facts(verdict):
         field in verdict for field in ("aligns_with_vision", "recommend_merge")
     )
     if not vision_fields_present:
+        # Absence has two distinct causes and the card must not report the wrong
+        # one: no VISION.md was read at triage time, or one was read and the
+        # verdict simply carried no vision-bound alignment fact.
+        vision_sha = str(triaged_vision_sha or "").strip()
+        if vision_sha:
+            vision_evidence = (
+                "VISION.md %s was read, but the triage verdict carries no "
+                "vision-bound alignment fact" % vision_sha[:8]
+            )
+            vision_reason = "triage verdict carries no vision-bound alignment fact"
+        else:
+            vision_evidence = (
+                "not evaluated because a trusted default-branch VISION.md "
+                "is required"
+            )
+            vision_reason = "trusted default-branch VISION.md is required"
         for key in ("g6_vision_alignment", "g6_verdict_merge"):
             facts[key] = {
                 "status": criteria_schema.STATUS_UNAVAILABLE,
-                "evidence": (
-                    "not evaluated because a trusted default-branch VISION.md "
-                    "is required"
-                ),
-                "reason": "trusted default-branch VISION.md is required",
+                "evidence": vision_evidence,
+                "reason": vision_reason,
             }
     else:
         fact(
@@ -708,7 +726,8 @@ def fresh_verdict_facts(state, head_sha):
     state = state if isinstance(state, dict) else {}
     facts = dict(render_card.triage_admission_facts(state, head_sha))
     behavior_facts, behavior_class = behavior_verdict_facts(
-        state.get("automerge_verdict")
+        state.get("automerge_verdict"),
+        triaged_vision_sha=state.get("triaged_vision_sha", ""),
     )
     facts.update(behavior_facts)
     return facts, behavior_class
@@ -1000,7 +1019,7 @@ def evaluate_candidate(
     else:
         stopped = fail(
             "g0_vision_present",
-            "VISION.md missing or unreadable on the default branch",
+            criteria_schema.G0_VISION_MISSING_EVIDENCE,
             "G0 no committed VISION.md on %s default branch" % repo,
             unavailable=True,
         )

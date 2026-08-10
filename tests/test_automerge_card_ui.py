@@ -4,10 +4,12 @@
 Run: python tests/test_automerge_card_ui.py
 """
 
+import hashlib
 import inspect
 import json
 import os
 import sys
+import tempfile
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -28,6 +30,12 @@ _failures = []
 HEAD = "a" * 40
 BASE = "b" * 40
 VISION = "vsha"
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+# A real, committed, declaration-free prose VISION.md from the fleet. Every
+# fleet VISION.md has this shape, so it is the exact input the vision-alignment
+# gate must admit.
+PROSE_VISION_FILE = os.path.join(FIXTURES, "card-1585-vision.md")
+PROSE_TARGET_FACTS_FILE = os.path.join(FIXTURES, "card-1585-target-facts.json")
 
 
 def behavior_admission(behavior_class="A", contradiction=False):
@@ -1862,6 +1870,352 @@ def test_same_revision_preservation_recomputes_admission_rows():
     check(
         "same revision: recomputed rows do not trigger a refresh loop",
         render_card.automerge_criteria_stale(current_item, refreshed_state) is False,
+    )
+
+
+def _file_sha256(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _unique_prose_quotes(text, count):
+    """Pick `count` distinct lines that occur exactly once in the prose VISION."""
+    picked = []
+    for line in text.splitlines():
+        line = line.strip()
+        if 40 <= len(line) <= 400 and text.count(line) == 1 and line not in picked:
+            picked.append(line)
+            if len(picked) == count:
+                break
+    return picked
+
+
+def _prose_binding(vision_file):
+    facts = json.loads(open(PROSE_TARGET_FACTS_FILE, encoding="utf-8").read())
+    return facts, {
+        "action": "triage.pr.search",
+        "event_key": "e" * 64,
+        "owner": facts["owner"],
+        "repo": facts["repo"],
+        "number": facts["number"],
+        "revision": facts["head_sha"],
+        "base_sha": facts["base_sha"],
+        "vision_sha": "0" * 40,
+        "vision_content_sha256": _file_sha256(vision_file),
+        "target_facts_sha256": _file_sha256(PROSE_TARGET_FACTS_FILE),
+    }
+
+
+def _bound_candidate(binding, *, applicable_criteria=(), external=False, **automerge):
+    value = {
+        "summary": "Adds an opt-in status pane.",
+        "product_implications": "Routine, default-off.",
+        "recommended_action": "merge",
+        "recommended_reason": "Small, opt-in, tested.",
+        "evidence": "target.txt: 'adds an opt-in status pane'",
+        "vision_evidence": {
+            "target_owner": binding["owner"],
+            "target_repo": binding["repo"],
+            "target_number": binding["number"],
+            "target_facts_sha256": binding["target_facts_sha256"],
+            "vision_sha": binding["vision_sha"],
+            "vision_content_sha256": binding["vision_content_sha256"],
+            "base_sha": binding["base_sha"],
+            "target_head_sha": binding["revision"],
+            "applicable_criteria": list(applicable_criteria),
+        },
+        "automerge": {
+            "behavior_class": "C",
+            "behavior_assertions": [],
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": True,
+            "aligns_with_vision": True,
+            "recommend_merge": True,
+            "external_source_required": external,
+        },
+    }
+    value["automerge"].update(automerge)
+    return value
+
+
+def _admitted_automerge(candidate, vision_file, binding):
+    trusted = render_card.enforce_triage_source_provenance(
+        candidate,
+        "",
+        vision_file,
+        PROSE_TARGET_FACTS_FILE,
+        **{key: binding[key] for key in binding},
+    )
+    return trusted["automerge"]
+
+
+def test_prose_vision_md_admits_a_positive_alignment_verdict():
+    """A committed prose VISION.md - the documented opt-in, and the only shape
+    any fleet repository actually has - must let the model's positive alignment
+    answer survive to a MET row and an eligible verdict."""
+    facts, binding = _prose_binding(PROSE_VISION_FILE)
+    prose = open(PROSE_VISION_FILE, encoding="utf-8").read()
+    candidate = _bound_candidate(binding)
+    check(
+        "prose VISION: the real fixture declares no machine-readable criteria",
+        "wheelhouse-vision-source-dependencies" not in prose
+        and facts["paths"]
+        and render_card.triage_vision_dependency_verified(
+            candidate, PROSE_VISION_FILE, PROSE_TARGET_FACTS_FILE, **binding
+        )
+        is False,
+    )
+    admitted = _admitted_automerge(candidate, PROSE_VISION_FILE, binding)
+    persisted = render_card.normalize_triage(
+        render_card.enforce_triage_source_provenance(
+            candidate, "", PROSE_VISION_FILE, PROSE_TARGET_FACTS_FILE, **binding
+        )
+    )["automerge_verdict"]
+    facts_map, behavior_class = am.behavior_verdict_facts(persisted)
+    eligible, _, reason = am.verdict_eligible(persisted)
+    check(
+        "prose VISION: the positive alignment fields survive trusted admission",
+        admitted.get("aligns_with_vision") is True
+        and admitted.get("recommend_merge") is True
+        and persisted.get("aligns_with_vision") is True
+        and persisted.get("recommend_merge") is True,
+    )
+    check(
+        "prose VISION: vision-bound rows are MET, not UNAVAILABLE",
+        facts_map["g6_vision_alignment"]["status"] == schema.STATUS_MET
+        and facts_map["g6_vision_alignment"]["evidence"] == "alignment confirmed"
+        and facts_map["g6_verdict_merge"]["status"] == schema.STATUS_MET,
+    )
+    check(
+        "prose VISION: the verdict no longer holds on the vision reason",
+        eligible is True
+        and behavior_class == "C"
+        and "VISION.md is required" not in reason,
+    )
+    unverified = [
+        (
+            "model claims an external source without any declared criterion",
+            _bound_candidate(binding, external=True),
+        ),
+        (
+            "model cites a criterion no VISION.md declares",
+            _bound_candidate(
+                binding,
+                applicable_criteria=[
+                    {
+                        "id": "invented",
+                        "quote": _unique_prose_quotes(prose, 1)[0],
+                        "external_source_required": False,
+                    }
+                ],
+            ),
+        ),
+    ]
+    check(
+        "prose VISION: unbacked source or criterion claims still fail closed",
+        all(
+            "aligns_with_vision"
+            not in _admitted_automerge(case, PROSE_VISION_FILE, binding)
+            for _, case in unverified
+        ),
+    )
+    negative = _bound_candidate(binding, aligns_with_vision=False)
+    negative_persisted = render_card.normalize_triage(
+        render_card.enforce_triage_source_provenance(
+            negative, "", PROSE_VISION_FILE, PROSE_TARGET_FACTS_FILE, **binding
+        )
+    )["automerge_verdict"]
+    negative_facts, _ = am.behavior_verdict_facts(negative_persisted)
+    check(
+        "prose VISION: a negative alignment answer still renders UNMET",
+        negative_persisted.get("aligns_with_vision") is False
+        and negative_facts["g6_vision_alignment"]["status"] == schema.STATUS_UNMET
+        and negative_facts["g6_vision_alignment"]["evidence"]
+        == "alignment not confirmed"
+        and am.verdict_eligible(negative_persisted)[0] is False,
+    )
+
+
+def test_declared_vision_criteria_still_bind_external_source_evidence():
+    """Adopting the optional declaration block can only narrow admission: a
+    declared criterion that requires external source still needs the same #1577
+    clone provenance, while a declaration whose selectors miss the changed paths
+    falls back to the ordinary local-only rules."""
+    prose = open(PROSE_VISION_FILE, encoding="utf-8").read()
+    quote = _unique_prose_quotes(prose, 1)[0]
+    with tempfile.TemporaryDirectory() as parent:
+
+        def declaring_vision(name, selector):
+            declaration = {
+                "version": 1,
+                "complete": True,
+                "criteria": [
+                    {
+                        "id": "external-source",
+                        "quote_sha256": hashlib.sha256(
+                            quote.encode("utf-8")
+                        ).hexdigest(),
+                        "external_source_required": True,
+                        "selector": selector,
+                    }
+                ],
+            }
+            path = os.path.join(parent, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "<!-- wheelhouse-vision-source-dependencies: "
+                    + json.dumps(declaration, separators=(",", ":"))
+                    + " -->\n"
+                    + prose
+                )
+            return path
+
+        matching = declaring_vision("vision-matching.md", {"always": True})
+        _, matching_binding = _prose_binding(matching)
+        cited = _bound_candidate(
+            matching_binding,
+            external=True,
+            applicable_criteria=[
+                {
+                    "id": "external-source",
+                    "quote": quote,
+                    "external_source_required": True,
+                }
+            ],
+        )
+        check(
+            "declared VISION: an applicable external criterion still needs clone provenance",
+            render_card.triage_vision_dependency_verified(
+                cited, matching, PROSE_TARGET_FACTS_FILE, **matching_binding
+            )
+            is True
+            and "aligns_with_vision"
+            not in _admitted_automerge(cited, matching, matching_binding),
+        )
+        denied = _bound_candidate(
+            matching_binding,
+            external=False,
+            applicable_criteria=[
+                {
+                    "id": "external-source",
+                    "quote": quote,
+                    "external_source_required": False,
+                }
+            ],
+        )
+        empty = _bound_candidate(matching_binding)
+        check(
+            "declared VISION: an applicable criterion cannot be downgraded or skipped",
+            all(
+                "aligns_with_vision"
+                not in _admitted_automerge(case, matching, matching_binding)
+                for case in (denied, empty)
+            ),
+        )
+        unmatched = declaring_vision(
+            "vision-unmatched.md", {"changed_paths_any": ["docs/**"]}
+        )
+        _, unmatched_binding = _prose_binding(unmatched)
+        no_match = _bound_candidate(unmatched_binding)
+        check(
+            "declared VISION: no matching selector means an honest empty evidence list",
+            render_card.triage_vision_dependency_verified(
+                no_match, unmatched, PROSE_TARGET_FACTS_FILE, **unmatched_binding
+            )
+            is False
+            and _admitted_automerge(no_match, unmatched, unmatched_binding).get(
+                "aligns_with_vision"
+            )
+            is True,
+        )
+        forged = _bound_candidate(
+            unmatched_binding,
+            applicable_criteria=[
+                {
+                    "id": "external-source",
+                    "quote": quote,
+                    "external_source_required": False,
+                }
+            ],
+        )
+        check(
+            "declared VISION: citing an inapplicable criterion still fails closed",
+            "aligns_with_vision"
+            not in _admitted_automerge(forged, unmatched, unmatched_binding),
+        )
+
+
+def test_missing_vision_fact_copy_reflects_whether_vision_was_read():
+    """The UNAVAILABLE evidence must not claim a VISION.md is required when the
+    card's own state proves one was read at triage time."""
+    stripped = independent_verdict()
+    read_rows, _ = am.behavior_verdict_facts(stripped, triaged_vision_sha="v" * 40)
+    absent_rows, _ = am.behavior_verdict_facts(stripped)
+    check(
+        "copy: a read VISION.md is named instead of demanded",
+        all(
+            read_rows[key]["status"] == schema.STATUS_UNAVAILABLE
+            and read_rows[key]["evidence"]
+            == (
+                "VISION.md vvvvvvvv was read, but the triage verdict carries "
+                "no vision-bound alignment fact"
+            )
+            and "VISION.md is required" not in read_rows[key]["reason"]
+            for key in ("g6_vision_alignment", "g6_verdict_merge")
+        ),
+    )
+    check(
+        "copy: a genuinely missing VISION.md keeps the required wording",
+        all(
+            absent_rows[key]["evidence"]
+            == (
+                "not evaluated because a trusted default-branch VISION.md "
+                "is required"
+            )
+            for key in ("g6_vision_alignment", "g6_verdict_merge")
+        ),
+    )
+    present = evaluate(
+        card_value=card_entry(
+            automerge_verdict=independent_verdict(), triaged_vision_sha=VISION
+        ),
+        vision=(True, VISION),
+    )
+    present_rows = rows(present)
+    present_body = "\n".join(render_card._automerge_criteria_section(present["criteria"]))
+    check(
+        "copy: an evaluated card with VISION present never demands VISION.md",
+        present_rows["g0_vision_present"]["status"] == schema.STATUS_MET
+        and present_rows["g6_vision_alignment"]["status"] == schema.STATUS_UNAVAILABLE
+        and "VISION.md is required"
+        not in present_rows["g6_vision_alignment"]["evidence"]
+        and "- **VISION.md-dependent checks**" in present_body
+        and "_needs VISION.md_" not in present_body,
+    )
+    missing = evaluate(
+        card_value=card_entry(automerge_verdict=independent_verdict()),
+        vision=(False, ""),
+    )
+    missing_body = "\n".join(render_card._automerge_criteria_section(missing["criteria"]))
+    check(
+        "copy: a genuinely absent VISION.md still shows the needs-VISION hint",
+        rows(missing)["g0_vision_present"]["evidence"]
+        == schema.G0_VISION_MISSING_EVIDENCE
+        and "- **VISION.md-dependent checks** - _needs VISION.md_" in missing_body,
+    )
+    unevaluated = "\n".join(
+        render_card._automerge_criteria_section(
+            [
+                row
+                for row in missing["criteria"]
+                if row["id"] != "g0_vision_present"
+            ]
+        )
+    )
+    check(
+        "copy: an unevaluated G0 row never invents a needs-VISION instruction",
+        "- **VISION.md-dependent checks**" in unevaluated
+        and "_needs VISION.md_" not in unevaluated,
     )
 
 

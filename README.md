@@ -269,6 +269,8 @@ Auto triage and deep review keep their action prompts independent of target size
   When a repository independently opts into scan-time `auto_merge`, successful PR triage can also return a structured behavior verdict for the deterministic merge gate.
   Every complete immutable PR diff yields VISION-independent behavior facts: its A/B/C class, whether it changes existing or default behavior, and the class-C opt-in/default-off fact.
   Trusted default-branch `VISION.md` additionally enables vision alignment, revision bindings, and the final merge recommendation; only that full verdict is bound to the PR head, base, and `VISION.md` revision, and it still cannot merge anything by itself.
+  A plain prose `VISION.md` is enough: alignment is the triage model's attested semantic judgment, and trusted code validates only the exact revision/content bindings and that the verdict claims no external source.
+  A repository that wants stricter, hash-pinned criteria - including criteria whose review requires inspecting an external public source - can optionally declare them in `VISION.md`; see [the `VISION.md` contract](docs/AGENT_RUNTIME.md#the-default-branch-visionmd-contract).
 - **Deep review (always-on)** - tick a card's *Investigate* box and Claude reviews the target's checked-out code without executing it.
   The repo owner can also apply the `needs-deep-review` label or run the `deep-review` workflow with only the decision-card issue number; that manual workflow path fetches the current card body with this repo's token.
   The workflow captures Claude's final response and posts it as the code-grounded merit/triage verdict.

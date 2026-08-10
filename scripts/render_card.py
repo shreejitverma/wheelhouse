@@ -2605,6 +2605,30 @@ def _trusted_triage_target_facts(target_facts_file, **expected):
     return paths, digest
 
 
+def _vision_local_only_verified(evidence, automerge):
+    """`False` (local-only, no external source to bind) when no declared VISION
+    criterion applies to this PR and the model's own verdict agrees: it cited no
+    applicable criterion and claimed no external-source dependency. `None`
+    (fail closed) otherwise.
+
+    This is the mechanics-only half of the split AGENTS.md already draws for
+    behavior class: trusted code proves the bindings it owns, and the semantic
+    alignment judgment stays the triage model's attested responsibility. It
+    covers both a prose VISION.md that declares nothing and a declaring
+    VISION.md whose selectors match none of the changed paths - the empty
+    evidence list `docs/AGENT_RUNTIME.md` already documents. The #1577
+    external-source/`public_clone` binding is untouched wherever a declared
+    criterion actually applies."""
+    applicable = evidence.get("applicable_criteria")
+    if (
+        isinstance(applicable, list)
+        and not applicable
+        and automerge.get("external_source_required") is False
+    ):
+        return False
+    return None
+
+
 def triage_vision_dependency_verified(
     data, vision_file, target_facts_file, **expected
 ):
@@ -2660,10 +2684,14 @@ def triage_vision_dependency_verified(
         r"<!--\s*wheelhouse-vision-source-dependencies:\s*(\{[^\r\n]*\})\s*-->",
         vision_text,
     )
-    if (
-        len(declarations) != 1
-        or vision_text.count("wheelhouse-vision-source-dependencies:") != 1
-    ):
+    marker_count = vision_text.count("wheelhouse-vision-source-dependencies:")
+    if not declarations and marker_count == 0:
+        # A prose VISION.md is the documented opt-in (README, ONBOARDING,
+        # wheelhouse.config.yml): it declares no machine-readable criteria, so
+        # there is nothing to hash-pin and no external source to bind. The
+        # declaration block stays an optional stricter opt-in.
+        return _vision_local_only_verified(evidence, automerge)
+    if len(declarations) != 1 or marker_count != 1:
         return None
     try:
         declaration = json.loads(declarations[0])
@@ -2737,11 +2765,12 @@ def triage_vision_dependency_verified(
         if matches:
             applicable_trusted.append(criterion)
     applicable = evidence.get("applicable_criteria")
-    if (
-        not applicable_trusted
-        or not isinstance(applicable, list)
-        or len(applicable) != len(applicable_trusted)
-    ):
+    if not applicable_trusted:
+        # Declared criteria exist, but none of their selectors matches this PR's
+        # changed paths, so the VISION evidence list is legitimately empty and no
+        # declared criterion demands an external source.
+        return _vision_local_only_verified(evidence, automerge)
+    if not isinstance(applicable, list) or len(applicable) != len(applicable_trusted):
         return None
     quotes = []
     for criterion, trusted_criterion in zip(applicable, applicable_trusted):
@@ -5451,10 +5480,16 @@ def _automerge_criteria_section(rows):
             for row in independent_rows:
                 lines.append(_automerge_criterion_line(row, icons))
             if vision_rows:
+                # Drive the hint off the actual G0 result. A child row that
+                # merely mentions VISION.md proves nothing about whether one is
+                # committed, and telling the owner to add a file that is already
+                # there contradicts the MET G0 row three lines above.
                 needs_vision = any(
-                    row.get("status") == criteria_schema.STATUS_UNAVAILABLE
-                    and "VISION.md" in str(row.get("evidence") or "")
-                    for row in vision_rows
+                    row.get("id") == "g0_vision_present"
+                    and row.get("status") != criteria_schema.STATUS_MET
+                    and str(row.get("evidence") or "").strip()
+                    == criteria_schema.G0_VISION_MISSING_EVIDENCE
+                    for row in normalized
                 )
                 parent = "- **VISION.md-dependent checks**"
                 if needs_vision:
