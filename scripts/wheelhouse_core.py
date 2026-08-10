@@ -2518,13 +2518,27 @@ def _auto_merge_enabled(repo_cfg, global_default):
     return global_default is True if v is None else v is True
 
 
-def _default_branch_vision_sha(slug):
+def _default_branch_vision_observation(slug):
     try:
         data = gh_rest("/repos/%s/contents/VISION.md" % slug)
-    except RuntimeError:
-        return ""
+    except RuntimeError as error:
+        if re.search(r"\bHTTP\s+404\b", str(error), re.IGNORECASE):
+            return {"status": "absent", "sha": ""}
+        return {"status": "unavailable", "sha": ""}
     sha = data.get("sha") if isinstance(data, dict) else ""
-    return str(sha or "") if isinstance(sha, str) else ""
+    if (
+        isinstance(data, dict)
+        and data.get("type") == "file"
+        and isinstance(sha, str)
+        and re.fullmatch(r"[0-9A-Fa-f]{7,64}", sha)
+    ):
+        return {"status": "present", "sha": sha}
+    return {"status": "unavailable", "sha": ""}
+
+
+def _default_branch_vision_sha(slug):
+    observation = _default_branch_vision_observation(slug)
+    return observation["sha"] if observation["status"] == "present" else ""
 
 
 def _auto_triage_enabled(repo_cfg, global_default):
@@ -4531,11 +4545,15 @@ def build_repo(
     triage_context_allowance = _triage_context_allowance(
         repo_cfg, triage_context_refresh_allowance
     )
-    auto_merge_vision_sha = ""
-    if _auto_merge_enabled(repo_cfg, auto_merge) and any(
+    vision_observation = {"status": "unavailable", "sha": ""}
+    needs_triage_vision = triage_enabled and any(
+        PR_KIND.get(pr.get("bucket")) == "pr-review" for pr in enriched
+    )
+    needs_automerge_vision = _auto_merge_enabled(repo_cfg, auto_merge) and any(
         pr.get("bucket") == "merge-ready" for pr in enriched
-    ):
-        auto_merge_vision_sha = _default_branch_vision_sha(slug)
+    )
+    if needs_triage_vision or needs_automerge_vision:
+        vision_observation = _default_branch_vision_observation(slug)
     default_posture = None
 
     items = []
@@ -4600,7 +4618,12 @@ def build_repo(
             item["triage_attempt_cap_per_revision"] = triage_attempt_cap
             item["triage_context_refresh_allowance"] = triage_context_allowance
             item["base_sha"] = pr.get("base_sha") or ""
-            item["automerge_vision_sha"] = auto_merge_vision_sha
+            item["triage_vision_status"] = vision_observation["status"]
+            item["automerge_vision_sha"] = (
+                vision_observation["sha"]
+                if vision_observation["status"] == "present"
+                else ""
+            )
 
         if kind == "ci-approval":
             if pr.get("cross_repo") is not True:

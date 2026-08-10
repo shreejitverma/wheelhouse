@@ -3572,10 +3572,11 @@ def test_global_true_without_vision_holds_no_claim_merge_or_vision_verdict():
             "global true + no VISION.md: vision-bound verdict has no policy SHA",
             core._default_branch_vision_sha("owner/fmt") == "",
         )
-        core.gh_rest = lambda path: {"type": "file", "sha": "vsha"}
+        vision_sha = "a" * 40
+        core.gh_rest = lambda path: {"type": "file", "sha": vision_sha}
         check(
             "with VISION.md present: vision SHA is attached (verdict may be produced)",
-            core._default_branch_vision_sha("owner/fmt") == "vsha",
+            core._default_branch_vision_sha("owner/fmt") == vision_sha,
         )
     finally:
         core.gh_rest = saved

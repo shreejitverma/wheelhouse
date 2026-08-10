@@ -47,6 +47,8 @@ def normalized_event_identity(
     card_issue: int,
     revision: str,
     event_id: str = "",
+    review_context: str = "",
+    recovery_context: str = "",
 ) -> dict[str, Any]:
     if not ACTION.fullmatch(action):
         raise ContractError("agent event action is invalid")
@@ -63,7 +65,22 @@ def normalized_event_identity(
         raise ContractError("agent event trigger identity is invalid")
     if event_id and not EVENT_ID.fullmatch(event_id):
         raise ContractError("agent event trigger identity is invalid")
-    return {
+    # PR triage is unusual: a complete review observation, base SHA, or
+    # default-branch VISION.md revision can authorize a second review of an
+    # unchanged head. The queued-card checkpoint derives the opaque context
+    # digest, not a workflow input or a model result. Keep it optional here so
+    # historical claims can still be located and tombstoned by exact replay;
+    # `agent_claim.claim` requires it for every new PR primary/repair claim.
+    context_actions = action.startswith("triage.pr.") or action == "triage.schema-repair"
+    if review_context and not DIGEST.fullmatch(review_context):
+        raise ContractError("agent event review context is invalid")
+    if recovery_context and not DIGEST.fullmatch(recovery_context):
+        raise ContractError("agent event recovery context is invalid")
+    if (review_context or recovery_context) and not context_actions:
+        raise ContractError("agent event review context is not allowed for this action")
+    if recovery_context and not review_context:
+        raise ContractError("agent event recovery context requires review context")
+    identity = {
         "version": 1,
         "action": action,
         "target": {"owner": owner, "repo": repo, "number": number},
@@ -71,6 +88,13 @@ def normalized_event_identity(
         "revision": revision,
         "eventId": event_id or None,
     }
+    # Omit absent fields, rather than serializing null, so issue-triage and
+    # historical PR claim identities remain byte-for-byte compatible.
+    if review_context:
+        identity["reviewContext"] = review_context
+    if recovery_context:
+        identity["recoveryContext"] = recovery_context
+    return identity
 
 
 def event_key_sha256(identity: dict[str, Any]) -> str:

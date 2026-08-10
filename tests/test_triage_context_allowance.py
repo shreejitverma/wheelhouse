@@ -28,6 +28,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(ROOT, "scripts")
 sys.path.insert(0, SCRIPTS)
 
+import agent_claim  # noqa: E402
 import auto_merge  # noqa: E402
 import build_item  # noqa: E402
 import card_projection  # noqa: E402
@@ -35,14 +36,16 @@ import decision_context  # noqa: E402
 import reconcile  # noqa: E402
 import render_card as rc  # noqa: E402
 import target_observation  # noqa: E402
+import triage_admission  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
+from agent_runtime import admission as runtime_admission  # noqa: E402
 
 # Spend-guard tests isolate reservation ordering from cross-repo gate reads.
 rc._evaluate_automerge_card_projection = lambda *args, **kwargs: (
     rc.criteria_schema.unavailable_criteria("offline context-allowance fixture")
 )
 
-HEAD = "h" * 40
+HEAD = "d" * 40
 HEAD2 = "9" * 40
 B1, B2, B3, B4 = "1" * 40, "2" * 40, "3" * 40, "4" * 40
 V1, V2, V3 = "a" * 40, "b" * 40, "c" * 40
@@ -82,6 +85,7 @@ def item(base_sha=B1, vision_sha=V1, head=HEAD, allowance=2, cap=2, **overrides)
         "triage_context_refresh_allowance": allowance,
         "base_sha": base_sha,
         "automerge_vision_sha": vision_sha,
+        "triage_vision_status": "present" if vision_sha else "absent",
     }
     base.update(overrides)
     return base
@@ -530,7 +534,7 @@ def test_issue_triage_never_touches_the_allowance():
 # --------------------------------------------------------------------------- #
 # reservation, sealed permit, idempotency, G6
 # --------------------------------------------------------------------------- #
-def review_observation(base_sha=B1, head=HEAD):
+def review_observation(base_sha=B1, head=HEAD, changed_path="src/change.py"):
     """A complete native ReviewObservation v2 for the fixture target."""
     checks = [
         {
@@ -579,8 +583,21 @@ def review_observation(base_sha=B1, head=HEAD):
             "configured_checks": checks,
         },
         changed_paths=target_observation.changed_path_facts(
-            ["src/change.py"], complete=True
+            [changed_path], complete=True
         ),
+    )
+
+
+def observed_item(it, changed_path="src/change.py"):
+    """Attach the current queue-authorized v2 observation/context."""
+    obs = review_observation(
+        base_sha=it["base_sha"], head=it["head_sha"], changed_path=changed_path
+    )
+    snapshot = decision_context.repository_snapshot([], "2026-07-16T10:00:00Z")
+    return dict(
+        it,
+        target_observation=obs,
+        decision_context=decision_context.build_decision_context(obs, snapshot),
     )
 
 
@@ -591,12 +608,8 @@ def projection_card(it):
     state block is not owned by the v2 projection writer, so the spend-boundary
     tests must exercise the real projected body, not a bare render.
     """
-    obs = review_observation(base_sha=it["base_sha"], head=it["head_sha"])
-    snapshot = decision_context.repository_snapshot([], "2026-07-16T10:00:00Z")
-    context = decision_context.build_decision_context(obs, snapshot)
-    projection = card_projection.plan_card_projection(
-        dict(it, target_observation=obs, decision_context=context), prior={}
-    )
+    it = observed_item(it)
+    projection = card_projection.plan_card_projection(it, prior={})
     return {
         "number": 42,
         "title": projection["title"],
@@ -650,7 +663,7 @@ def test_context_queue_reserves_one_unit_and_returns_a_sealed_permit():
         "triage_context_refresh_allowance": 2,
         "triage_context_allowances": {"wheelhouse": 2},
     }
-    moved = item(B2, V1)
+    moved = observed_item(item(B2, V1))
     with (
         patched(
             rc,
@@ -669,6 +682,49 @@ def test_context_queue_reserves_one_unit_and_returns_a_sealed_permit():
     assert state[rc.TRIAGE_CONTEXT_FIELD]["uses"] == [
         {"base_sha": B2, "vision_sha": V1}
     ]
+    context, token = rc.triage_admission_context_for_state(state, HEAD)
+    assert context and token == permit.review_context
+    assert context["observation_id"] == moved["target_observation"]["observation_id"]
+    assert context["base_sha"] == B2 and context["vision_sha"] == V1
+    with patched(
+        triage_admission,
+        {
+            "_fleet_json": lambda endpoint: (
+                (0, {"state": "open", "head": {"sha": HEAD}, "base": {"sha": B2}}, "")
+                if "/pulls/" in endpoint
+                else (0, {"type": "file", "sha": V1}, "")
+            )
+        },
+    ):
+        assert triage_admission.verify(
+            current, "example", HEAD, permit.review_context, ""
+        ) == (permit.review_context, "")
+        review, recovery, verified = triage_admission.verify_bound_context(
+            current, "example", HEAD, permit.review_context, ""
+        )
+        assert (review, recovery) == (permit.review_context, "")
+        assert verified["base_sha"] == B2
+        assert verified["vision_sha"] == V1
+
+    for live_base, live_vision in ((B3, V1), (B2, V2)):
+        with patched(
+            triage_admission,
+            {
+                "_fleet_json": lambda endpoint, base=live_base, vision=live_vision: (
+                    (0, {"state": "open", "head": {"sha": HEAD}, "base": {"sha": base}}, "")
+                    if "/pulls/" in endpoint
+                    else (0, {"type": "file", "sha": vision}, "")
+                )
+            },
+        ):
+            try:
+                triage_admission.verify_bound_context(
+                    current, "example", HEAD, permit.review_context, ""
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("moved base/VISION context was accepted")
 
     # Dispatch accepts only the sealed permit for this exact card/item.
     calls = []
@@ -676,12 +732,363 @@ def test_context_queue_reserves_one_unit_and_returns_a_sealed_permit():
         rc.dispatch_triage_workflow(permit)
     assert calls and calls[0][:3] == ["workflow", "run", "triage.yml"]
     assert "head_sha=%s" % HEAD in calls[0]
+    assert "review_context=%s" % permit.review_context in calls[0]
     try:
         rc.dispatch_triage_workflow(object())
     except RuntimeError:
         pass
     else:
         raise AssertionError("dispatch accepted a forged permit")
+
+
+def test_vision_absence_requires_an_explicit_http_404_status():
+    failures = (
+        "transport error requesting https://api.github.com/repos/example/repo404/contents/VISION.md",
+        "repository example/repo404 was not reachable",
+        "HTTP 403: API rate limit exceeded for repo404",
+    )
+    for error in failures:
+        with patched(
+            triage_admission,
+            {"_fleet_json": lambda _endpoint, message=error: (1, None, message)},
+        ):
+            try:
+                triage_admission._vision_sha("example", "repo404")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("non-404 fleet failure proved VISION.md absence")
+
+    with patched(
+        triage_admission,
+        {"_fleet_json": lambda _endpoint: (1, None, "gh: Not Found (HTTP 404)")},
+    ):
+        assert triage_admission._vision_sha("example", "repo404") is None
+
+    for error in failures:
+        with patched(
+            core,
+            {
+                "gh_rest": lambda _path, message=error: (
+                    _ for _ in ()
+                ).throw(RuntimeError(message))
+            },
+        ):
+            assert core._default_branch_vision_observation("example/repo404") == {
+                "status": "unavailable",
+                "sha": "",
+            }
+    with patched(
+        core,
+        {
+            "gh_rest": lambda _path: (_ for _ in ()).throw(
+                RuntimeError("gh: Not Found (HTTP 404)")
+            )
+        },
+    ):
+        assert core._default_branch_vision_observation("example/repo404") == {
+            "status": "absent",
+            "sha": "",
+        }
+
+
+def queue_through_admission(card, queued_item, reservations):
+    current, order, get_card, gh = ledger_card_boundary(card)
+    config = {
+        "repos": {"wheelhouse": {"name": "wheelhouse"}},
+        "triage_attempt_cap_per_revision": 2,
+        "triage_daily_ceiling": 100,
+        "triage_context_refresh_allowance": 2,
+        "triage_context_allowances": {"wheelhouse": 2},
+    }
+
+    def reserve(number, value, ceiling):
+        reservations.append((number, value["head_sha"], ceiling))
+        order.append("reserve")
+        return True
+
+    with (
+        patched(rc, {"get_card": get_card, "reserve_triage_budget": reserve, "_gh": gh}),
+        patched(core, {"load_config": lambda: config}),
+        redirect_stdout(io.StringIO()),
+    ):
+        permit = rc.mark_triage_queued(42, queued_item, current["body"])
+    return current, permit, order
+
+
+def claim_key(review_context):
+    identity = runtime_admission.normalized_event_identity(
+        action="triage.pr.local",
+        owner="example",
+        repo="wheelhouse",
+        number=42,
+        card_issue=42,
+        revision=HEAD,
+        review_context=review_context,
+    )
+    return runtime_admission.event_key_sha256(identity)
+
+
+def admit_claim(review_context, comments):
+    outputs = {}
+
+    def gh_json(*args):
+        if "--paginate" in args:
+            return [copy.deepcopy(comments)]
+        if "--method" in args and "POST" in args:
+            body = next(value[5:] for value in args if value.startswith("body="))
+            comment = {
+                "id": len(comments) + 1,
+                "body": body,
+                "user": {"login": "github-actions[bot]"},
+                "created_at": "2026-07-16T10:00:00Z",
+                "updated_at": "2026-07-16T10:00:00Z",
+            }
+            comments.append(comment)
+            return copy.deepcopy(comment)
+        comment_id = int(args[-1].rsplit("/", 1)[-1])
+        return copy.deepcopy(next(row for row in comments if row["id"] == comment_id))
+
+    args = SimpleNamespace(
+        action="triage.pr.local",
+        owner="example",
+        repo="wheelhouse",
+        number=42,
+        issue=42,
+        revision=HEAD,
+        event_id="",
+        review_context=review_context,
+        recovery_context="",
+        repo_slug="example/wheelhouse",
+    )
+    with patched(
+        agent_claim,
+        {
+            "gh_json": gh_json,
+            "output": lambda name, value: outputs.__setitem__(name, value),
+        },
+    ):
+        assert agent_claim.claim(args) == 0
+    return outputs["admitted"] == "true", outputs["event_key"]
+
+
+def resolve_and_claim(card, permit, comments, base_sha, vision_sha):
+    def fleet(endpoint):
+        if "/pulls/" in endpoint:
+            return 0, {
+                "state": "open",
+                "head": {"sha": HEAD},
+                "base": {"sha": base_sha},
+            }, ""
+        if vision_sha is None:
+            return 1, None, "HTTP 404: Not Found"
+        return 0, {"type": "file", "sha": vision_sha}, ""
+
+    with patched(triage_admission, {"_fleet_json": fleet}):
+        review, recovery, _context = triage_admission.verify_bound_context(
+            card, "example", HEAD, permit.review_context, ""
+        )
+    assert recovery == ""
+    return admit_claim(review, comments)
+
+
+def test_queue_to_claim_admits_first_vision_and_denies_identical_context():
+    absent = observed_item(item(vision_sha=""))
+    current, first, _order = queue_through_admission(
+        projection_card(absent), absent, reservations := []
+    )
+    assert first is not None and len(reservations) == 1
+    claims = []
+    admitted, first_key = resolve_and_claim(current, first, claims, B1, None)
+    assert admitted
+    current["body"] = rc.body_with_triage_result(
+        current["body"], HEAD, triage=None, error="completed", base_sha=B1
+    )
+
+    unchanged, duplicate, duplicate_order = queue_through_admission(
+        current, absent, reservations
+    )
+    assert duplicate is None and duplicate_order == [] and len(reservations) == 1
+    assert unchanged["body"] == current["body"]
+    duplicate_admitted, duplicate_key = admit_claim(first.review_context, claims)
+    assert not duplicate_admitted and duplicate_key == first_key
+
+    first_vision = observed_item(item(B1, V1))
+    current, vision_permit, _order = queue_through_admission(
+        current, first_vision, reservations
+    )
+    assert vision_permit is not None and len(reservations) == 2
+    vision_admitted, vision_key = resolve_and_claim(
+        current, vision_permit, claims, B1, V1
+    )
+    assert vision_admitted and vision_key != first_key
+    queued = state_of(current["body"])
+    assert queued[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+    assert rc.TRIAGE_CONTEXT_FIELD not in queued
+
+
+def test_verified_vision_removal_uses_context_allowance_and_new_claim():
+    present = observed_item(item(B1, V1))
+    current, first, _order = queue_through_admission(
+        projection_card(present), present, reservations := []
+    )
+    current["body"] = rc.body_with_triage_result(
+        current["body"], HEAD, triage=None, error="completed", base_sha=B1,
+        vision_sha=V1
+    )
+    absent = observed_item(item(B1, ""))
+    assert not rc.triage_fresh(absent, state_of(current["body"]))
+    assert rc.triage_context_refresh(absent, state_of(current["body"])) == (B1, "")
+    current, second, _order = queue_through_admission(current, absent, reservations)
+    queued = state_of(current["body"])
+    assert second is not None and len(reservations) == 2
+    assert queued[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 1
+    assert queued[rc.TRIAGE_CONTEXT_FIELD]["uses"] == [
+        {"base_sha": B1, "vision_sha": ""}
+    ]
+    claims = []
+    first_admitted, first_key = admit_claim(first.review_context, claims)
+    second_admitted, second_key = resolve_and_claim(current, second, claims, B1, None)
+    assert first_admitted and second_admitted and second_key != first_key
+
+
+def test_completed_backfill_marker_does_not_block_later_context_review():
+    original = observed_item(item(B1, V1))
+    current, first, _order = queue_through_admission(
+        projection_card(original), original, reservations := []
+    )
+    assert first is not None
+    current["body"] = rc.body_with_triage_result(
+        current["body"],
+        HEAD,
+        triage=None,
+        error="completed policy recovery",
+        base_sha=B1,
+        vision_sha=V1,
+    )
+    completed_state = state_of(current["body"])
+    _record, original_context = rc.triage_admission_context_for_state(
+        completed_state, HEAD
+    )
+    assert original_context
+    completed_state[rc.TRIAGE_BACKFILL_FIELD] = {
+        "version": rc.TRIAGE_BACKFILL_VERSION,
+        "policy": "fixture-policy",
+        "wave": "fixture-wave",
+        "revision": HEAD,
+        "review_context": original_context,
+        "at": "2026-07-23T12:00:00Z",
+        "run_number": 1,
+    }
+    current["body"] = rc._replace_state_block(current["body"], completed_state)
+
+    moved = observed_item(item(B2, V1))
+    current, second, _order = queue_through_admission(current, moved, reservations)
+    assert second is not None and len(reservations) == 2
+    assert second.review_context != original_context
+    assert second.recovery_context == ""
+    queued_state = state_of(current["body"])
+    assert queued_state[rc.TRIAGE_BACKFILL_FIELD]["review_context"] == original_context
+    assert queued_state[rc.TRIAGE_ADMISSION_CONTEXT_FIELD]["base_sha"] == B2
+    claims = []
+    first_admitted, first_key = admit_claim(original_context, claims)
+    second_admitted, second_key = resolve_and_claim(current, second, claims, B2, V1)
+    assert first_admitted and second_admitted and second_key != first_key
+
+
+def test_complete_observation_drift_reaches_a_distinct_claim():
+    original = observed_item(item())
+    current, first, _order = queue_through_admission(
+        projection_card(original), original, reservations := []
+    )
+    queued_state = state_of(current["body"])
+    payload = successful_triage()
+    payload["recommendation_basis"] = {
+        "kind": "other",
+        "observation_id": queued_state[rc.REVIEW_OBSERVATION_FIELD]["observation_id"],
+        "context_id": queued_state[rc.DECISION_CONTEXT_FIELD]["context_id"],
+    }
+    current["body"] = rc.body_with_triage_result(
+        current["body"], HEAD, triage=payload, owner="example", base_sha=B1, vision_sha=V1
+    )
+    completed_state = state_of(current["body"])
+    assert rc.assessment_current_admitted(completed_state)
+
+    drifted = observed_item(item(), changed_path="src/rotated.py")
+    drifted_state = dict(completed_state)
+    drifted_state[rc.REVIEW_OBSERVATION_FIELD] = drifted["target_observation"]
+    drifted_state[rc.DECISION_CONTEXT_FIELD] = drifted["decision_context"]
+    current["body"] = rc._replace_state_block(current["body"], drifted_state)
+    assert rc.observation_drift_retriage_needed(drifted, drifted_state)
+
+    current, second, _order = queue_through_admission(current, drifted, reservations)
+    assert second is not None and len(reservations) == 2
+    assert second.review_context != first.review_context
+    claims = []
+    first_admitted, first_key = admit_claim(first.review_context, claims)
+    second_admitted, second_key = resolve_and_claim(current, second, claims, B1, V1)
+    assert first_admitted and second_admitted and second_key != first_key
+    assert state_of(current["body"])[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+
+
+def test_untrusted_or_raced_context_denies_before_reservation():
+    valid = observed_item(item())
+    cases = []
+    unavailable = dict(valid, triage_vision_status="unavailable")
+    cases.append((projection_card(valid), unavailable))
+
+    incomplete_observation = copy.deepcopy(valid["target_observation"])
+    incomplete_observation["completeness"]["complete"] = False
+    incomplete = dict(valid, target_observation=incomplete_observation)
+    cases.append((projection_card(valid), incomplete))
+
+    raced = projection_card(valid)
+    stale_body = raced["body"]
+    raced_state = state_of(stale_body)
+    raced_state["priority"] = "high"
+    raced["body"] = rc._replace_state_block(stale_body, raced_state)
+    cases.append((raced, valid, stale_body))
+
+    for case in cases:
+        card_value, queued_item = case[:2]
+        supplied_body = case[2] if len(case) == 3 else card_value["body"]
+        reservations = []
+        current, order, get_card, gh = ledger_card_boundary(card_value)
+        config = {
+            "repos": {"wheelhouse": {"name": "wheelhouse"}},
+            "triage_attempt_cap_per_revision": 2,
+            "triage_daily_ceiling": 100,
+            "triage_context_refresh_allowance": 2,
+            "triage_context_allowances": {"wheelhouse": 2},
+        }
+        with (
+            patched(
+                rc,
+                {
+                    "get_card": get_card,
+                    "reserve_triage_budget": lambda *args: reservations.append(args) or True,
+                    "_gh": gh,
+                },
+            ),
+            patched(core, {"load_config": lambda: config}),
+            redirect_stdout(io.StringIO()),
+        ):
+            assert rc.mark_triage_queued(42, queued_item, supplied_body) is None
+        assert reservations == [] and order == []
+        assert current["body"] == card_value["body"]
+
+    current, permit, _order = queue_through_admission(
+        projection_card(valid), valid, reservations := []
+    )
+    assert permit is not None and len(reservations) == 1
+    claims = []
+    try:
+        resolve_and_claim(current, permit, claims, B2, V1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("raced base context reached durable claim admission")
+    assert claims == []
 
 
 def test_context_exhaustion_reserves_nothing_and_never_dispatches():
@@ -712,7 +1119,7 @@ def test_context_exhaustion_reserves_nothing_and_never_dispatches():
         patched(core, {"load_config": lambda: config}),
         redirect_stdout(output),
     ):
-        permit = rc.mark_triage_queued(42, item(B3, V2), body)
+        permit = rc.mark_triage_queued(42, observed_item(item(B3, V2)), body)
     assert permit is None
     assert order == [], order  # no reservation, no card write, no dispatch
     text = output.getvalue()
@@ -774,7 +1181,7 @@ def test_reservation_failure_consumes_no_allowance():
         ),
         patched(core, {"load_config": lambda: config}),
     ):
-        permit = rc.mark_triage_queued(42, item(B2, V1), body)
+        permit = rc.mark_triage_queued(42, observed_item(item(B2, V1)), body)
     assert permit is None
     assert order == ["reserve"], order
     assert rc.TRIAGE_CONTEXT_FIELD not in state_of(current["body"])

@@ -74,6 +74,12 @@ on:
       revision:
         description: "Target issue updatedAt revision from the decision-card state (issue-triage only)"
         required: false
+      review_context:
+        description: "Opaque queue-issued PR review-context digest (pr-review only)"
+        required: false
+      recovery_context:
+        description: "Opaque queue-issued policy-recovery digest (pr-review only)"
+        required: false
 
 permissions:
   actions: write
@@ -108,6 +114,8 @@ jobs:
       number: ${{ steps.resolve.outputs.number }}
       kind: ${{ steps.resolve.outputs.kind }}
       revision: ${{ steps.resolve.outputs.revision }}
+      review_context: ${{ steps.resolve.outputs.review_context }}
+      recovery_context: ${{ steps.resolve.outputs.recovery_context }}
       head_ok: ${{ steps.verify_head.outputs.head_ok }}
       head_message: ${{ steps.verify_head.outputs.message }}
       event_fresh: ${{ steps.event-freshness.outputs.fresh }}
@@ -194,6 +202,9 @@ jobs:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
           ISSUE_REVISION: ${{ github.event.inputs.revision }}
         run: |
+          # No trusted review context exists before a PR queue checkpoint, so
+          # PR auth-denial telemetry deliberately emits no claim-keyed stage.
+          if [ "$KIND" = "pr-review" ]; then exit 0; fi
           revision="$HEAD_SHA"
           if [ "$KIND" = "issue-triage" ]; then revision="$ISSUE_REVISION"; fi
           event_key="$(python scripts/agent_runtime.py event-key \
@@ -215,6 +226,9 @@ jobs:
           INPUT_KIND: ${{ github.event.inputs.kind }}
           INPUT_HEAD_SHA: ${{ github.event.inputs.head_sha }}
           INPUT_REVISION: ${{ github.event.inputs.revision }}
+          INPUT_REVIEW_CONTEXT: ${{ github.event.inputs.review_context }}
+          INPUT_RECOVERY_CONTEXT: ${{ github.event.inputs.recovery_context }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
         run: |
           set -euo pipefail
           if ! printf '%s' "$INPUT_ISSUE" | grep -Eq '^[0-9]+$'; then
@@ -259,6 +273,7 @@ jobs:
           import wheelhouse_core
           import target_observation
           import decision_context
+          import triage_admission
 
           with open("card.json", encoding="utf-8") as f:
               card = json.load(f)
@@ -313,6 +328,18 @@ jobs:
                           out.write("skip=true\n")
                           out.write("reason=card lacks a current observation-bound review context\n")
                           raise SystemExit(0)
+                      try:
+                          review_token, recovery_token = triage_admission.verify(
+                              card,
+                              os.environ["GITHUB_REPOSITORY_OWNER"],
+                              revision,
+                              os.environ["INPUT_REVIEW_CONTEXT"],
+                              os.environ["INPUT_RECOVERY_CONTEXT"],
+                          )
+                      except ValueError as error:
+                          out.write("skip=true\n")
+                          out.write("reason=queued review context no longer verified: %s\n" % str(error)[:180])
+                          raise SystemExit(0)
                       with open("review-facts.json", "w", encoding="utf-8") as facts:
                           json.dump(
                               {
@@ -334,6 +361,9 @@ jobs:
                   out.write("number=%s\n" % os.environ["INPUT_NUMBER"])
                   out.write("kind=%s\n" % kind)
                   out.write("revision=%s\n" % revision)
+                  if kind == "pr-review":
+                      out.write("review_context=%s\n" % review_token)
+                      out.write("recovery_context=%s\n" % recovery_token)
                   out.write(
                       "slug=%s/%s\n"
                       % (
@@ -364,6 +394,9 @@ jobs:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
           ISSUE_REVISION: ${{ github.event.inputs.revision }}
         run: |
+          # A skipped PR has no verified queued review context. Do not forge a
+          # legacy stage identity from workflow_dispatch values.
+          if [ "$KIND" = "pr-review" ]; then exit 0; fi
           revision="$HEAD_SHA"
           if [ "$KIND" = "issue-triage" ]; then revision="$ISSUE_REVISION"; fi
           event_key="$(python scripts/agent_runtime.py event-key \
@@ -426,9 +459,50 @@ jobs:
             echo "auto triage readonly search disabled (READONLY_TOKEN absent)"
           fi
 
+      - id: event-freshness
+        name: Verify queued target context before durable claim
+        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          CARD_REPO: ${{ github.repository }}
+          CARD_ISSUE: ${{ steps.resolve.outputs.issue }}
+          OWNER: ${{ github.repository_owner }}
+          SLUG: ${{ steps.resolve.outputs.slug }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          EXPECTED_REVISION: ${{ steps.resolve.outputs.revision }}
+          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = "pr-review" ]; then
+            if GH_TOKEN="$CARD_TOKEN" gh issue view "$CARD_ISSUE" -R "$CARD_REPO" \
+              --json body,state,labels > current-card.json \
+              && python scripts/triage_admission.py \
+              --card current-card.json --owner "$OWNER" \
+              --revision "$EXPECTED_REVISION" \
+              --review-context "$REVIEW_CONTEXT" \
+              --recovery-context "$RECOVERY_CONTEXT"; then
+              echo "fresh=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "fresh=false" >> "$GITHUB_OUTPUT"
+              echo "message=Auto triage did not run because the queued PR review context moved or could not be verified." >> "$GITHUB_OUTPUT"
+            fi
+          else
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+            if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+              echo "fresh=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "fresh=false" >> "$GITHUB_OUTPUT"
+              echo "message=Auto triage did not run because the target revision moved or could not be verified." >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
       - id: event-claim
         name: Claim the exact triage revision before spend
-        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true'
+        if: steps.event-freshness.outputs.fresh == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
@@ -439,50 +513,24 @@ jobs:
           REVISION: ${{ steps.resolve.outputs.revision }}
           HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
           REPO_SLUG: ${{ github.repository }}
+          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
         run: |
           set -euo pipefail
           if [ "$KIND" = "issue-triage" ]; then action="triage.issue"; else action="triage.pr"; fi
           if [ "$HAS_READONLY_TOKEN" = "true" ]; then action="${action}.search"; else action="${action}.local"; fi
           echo "action=$action" >> "$GITHUB_OUTPUT"
+          claim_context=()
+          if [ "$KIND" = "pr-review" ]; then
+            claim_context=(--review-context "$REVIEW_CONTEXT")
+            if [ -n "$RECOVERY_CONTEXT" ]; then
+              claim_context+=(--recovery-context "$RECOVERY_CONTEXT")
+            fi
+          fi
           python scripts/agent_claim.py \
             --action "$action" --owner "$OWNER" --repo "$REPO" \
             --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
-            --repo-slug "$REPO_SLUG"
-
-      - id: event-freshness
-        name: Verify target revision before triage task build
-        if: steps.event-claim.outputs.admitted == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
-          CARD_TOKEN: ${{ github.token }}
-          SLUG: ${{ steps.resolve.outputs.slug }}
-          NUMBER: ${{ steps.resolve.outputs.number }}
-          KIND: ${{ steps.resolve.outputs.kind }}
-          EXPECTED_REVISION: ${{ steps.resolve.outputs.revision }}
-          CLAIM_ID: ${{ steps.event-claim.outputs.comment_id }}
-          CLAIM_MARKER: ${{ steps.event-claim.outputs.marker }}
-          CARD_REPO: ${{ github.repository }}
-        run: |
-          observed=""
-          if [ "$KIND" = "issue-triage" ]; then
-            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
-          else
-            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
-          fi
-          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
-            echo "fresh=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "fresh=false" >> "$GITHUB_OUTPUT"
-            echo "message=Auto triage did not run because the target revision moved or could not be verified." >> "$GITHUB_OUTPUT"
-            body="Auto triage was rejected before task construction because the target revision changed or could not be verified. The card remains available for deterministic controls. ${CLAIM_MARKER}"
-            GH_TOKEN="$CARD_TOKEN" gh api --method PATCH \
-              "repos/$CARD_REPO/issues/comments/$CLAIM_ID" -f "body=$body" >/dev/null
-            python scripts/agent_runtime.py stage \
-              --action "${{ steps.event-claim.outputs.action }}" \
-              --source-sha "${{ github.sha }}" \
-              --event-key "${{ steps.event-claim.outputs.event_key }}" \
-              --stage stale --status failed --code target.stale
-          fi
+            "${claim_context[@]}" --repo-slug "$REPO_SLUG"
 
       - name: Record triage admission stage
         if: always() && steps.event-claim.outputs.event_key != ''
@@ -540,17 +588,21 @@ jobs:
               --queued-only
 
       - id: prepare
-        if: steps.event-freshness.outputs.fresh == 'true'
+        if: steps.event-claim.outputs.admitted == 'true'
         env:
           FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
           NUMBER: ${{ steps.resolve.outputs.number }}
           SLUG: ${{ steps.resolve.outputs.slug }}
           KIND: ${{ steps.resolve.outputs.kind }}
           HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+          EXPECTED_BASE_SHA: ${{ steps.event-freshness.outputs.base_sha }}
+          EXPECTED_VISION_PRESENT: ${{ steps.event-freshness.outputs.vision_present }}
+          EXPECTED_VISION_SHA: ${{ steps.event-freshness.outputs.vision_sha }}
           READONLY_SEARCH_ENABLED: ${{ steps.readonly.outputs.enabled }}
         run: |
           set -euo pipefail
           BASE_SHA=""
+          if [ "$KIND" = "pr-review" ]; then BASE_SHA="$EXPECTED_BASE_SHA"; fi
           {
             echo "<target-content repo=\"$SLUG\" number=\"$NUMBER\" kind=\"$KIND\">"
             if [ "$KIND" = "issue-triage" ]; then
@@ -580,8 +632,11 @@ jobs:
               DIFF_COMPLETE=false
               diff_limit_bytes=1500000
               diff_raw="diff.raw"
-              if GH_TOKEN="$FLEET_TOKEN" gh api "repos/$SLUG/pulls/$NUMBER" > pr.json 2>/dev/null; then
-                BASE_SHA="$(jq -r '.base.sha // empty' pr.json)"
+              if ! GH_TOKEN="$FLEET_TOKEN" gh api "repos/$SLUG/pulls/$NUMBER" > pr.json 2>/dev/null \
+                || [ "$(jq -r '.head.sha // empty' pr.json)" != "$HEAD_SHA" ] \
+                || [ "$(jq -r '.base.sha // empty' pr.json)" != "$BASE_SHA" ]; then
+                echo "::error::target head/base moved after queued-context verification"
+                exit 1
               fi
               if printf '%s' "$BASE_SHA" | grep -Eq '^[0-9A-Fa-f]{7,64}$' \
                 && printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9A-Fa-f]{7,64}$'; then
@@ -668,6 +723,10 @@ jobs:
             if GH_TOKEN="$FLEET_TOKEN" gh api "repos/$SLUG/contents/VISION.md" \
               > vision.json 2>/dev/null; then
               VISION_SHA="$(jq -r 'if type == "object" and .type == "file" and (.sha | type == "string") then .sha else empty end' vision.json)"
+              if [ "$EXPECTED_VISION_PRESENT" != "true" ] || [ "$VISION_SHA" != "$EXPECTED_VISION_SHA" ]; then
+                echo "::error::default-branch VISION.md moved after queued-context verification"
+                exit 1
+              fi
               VISION_SIZE="$(jq -r 'if type == "object" and .type == "file" and (.size | type == "number") and .size >= 0 then .size else empty end' vision.json)"
               if printf '%s' "$VISION_SIZE" | grep -Eq '^[0-9]+$' \
                 && [ "$VISION_SIZE" -le "$vision_limit_bytes" ]; then
@@ -677,12 +736,26 @@ jobs:
                 set -e
                 vision_bytes="$(wc -c < vision.md | tr -d '[:space:]')"
                 if [ "${decode_status[0]}" -eq 0 ] && [ "${decode_status[1]}" -eq 0 ] \
-                  && [ "$vision_bytes" = "$VISION_SIZE" ] && [ "$vision_bytes" -gt 0 ] \
-                  && [ -n "$VISION_SHA" ]; then
+                  && [ "$vision_bytes" = "$VISION_SIZE" ] && [ "$vision_bytes" -gt 0 ]; then
                   VISION_PRESENT=true
                   VISION_CONTENT_SHA256="$(sha256sum vision.md | cut -d ' ' -f1)"
                 fi
               fi
+            elif [ "$EXPECTED_VISION_PRESENT" = "true" ]; then
+              echo "::error::queued default-branch VISION.md could not be reread"
+              exit 1
+            else
+              WHEELHOUSE_FLEET_TOKEN="$FLEET_TOKEN" \
+                EXPECTED_VISION_PRESENT="$EXPECTED_VISION_PRESENT" \
+                python - <<'PY'
+          import os
+          import sys
+          sys.path.insert(0, "scripts")
+          import triage_admission
+          owner, repo = os.environ["SLUG"].split("/", 1)
+          if triage_admission._vision_sha(owner, repo) is not None:
+              raise SystemExit("default-branch VISION.md appeared after queued-context verification")
+          PY
             fi
             if [ "$DIFF_COMPLETE" = "true" ]; then
               AUTOMERGE_BEHAVIOR_AVAILABLE=true
@@ -892,7 +965,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - id: search-tool
-        if: ${{ steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' && steps.readonly.outputs.enabled == 'true' }}
+        if: ${{ steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' && steps.readonly.outputs.enabled == 'true' }}
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           TARGET_REPO: ${{ steps.resolve.outputs.slug }}
@@ -900,7 +973,7 @@ jobs:
 
       - id: claude-task
         name: Build the immutable Claude triage AgentTask
-        if: ${{ steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' }}
+        if: ${{ steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.resolve.outputs.repo }}
@@ -959,7 +1032,7 @@ jobs:
           allowed-repos: ${{ steps.search-tool.outputs.repos || '[]' }}
 
       - name: Prepare the pinned Codex sandboxed adapter worker
-        if: ${{ steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
+        if: ${{ steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'codex' }}
         env:
           CODEX_PREFIX: ${{ runner.temp }}/wheelhouse-codex
         run: |
@@ -987,7 +1060,7 @@ jobs:
 
       - id: agent-runtime-task
         name: Build the immutable triage AgentTask
-        if: ${{ steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
+        if: ${{ steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'codex' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.resolve.outputs.repo }}
@@ -1065,11 +1138,11 @@ jobs:
         run: python scripts/agent_runtime.py summary --result '${{ steps.agent-runtime.outputs.result }}'
 
       - id: target-artifact-name
-        if: ${{ steps.event-freshness.outputs.fresh == 'true' }}
+        if: ${{ steps.event-claim.outputs.admitted == 'true' }}
         run: echo "artifact=wheelhouse-triage-target-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Upload exact target evidence for trusted projection
-        if: ${{ steps.event-freshness.outputs.fresh == 'true' }}
+        if: ${{ steps.event-claim.outputs.admitted == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.target-artifact-name.outputs.artifact }}
@@ -1179,12 +1252,20 @@ jobs:
           NUMBER: ${{ steps.resolve.outputs.number }}
           ISSUE: ${{ steps.resolve.outputs.issue }}
           REVISION: ${{ steps.resolve.outputs.revision }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
           REPO_SLUG: ${{ github.repository }}
         run: |
+          context=()
+          if [ "$KIND" = "pr-review" ]; then
+            context=(--review-context "$REVIEW_CONTEXT")
+            if [ -n "$RECOVERY_CONTEXT" ]; then context+=(--recovery-context "$RECOVERY_CONTEXT"); fi
+          fi
           python scripts/agent_claim.py \
             --action triage.schema-repair --owner "$OWNER" --repo "$REPO" \
             --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
-            --repo-slug "$REPO_SLUG"
+            "${context[@]}" --repo-slug "$REPO_SLUG"
 
       - name: Prepare the pinned Codex worker for schema repair
         if: ${{ always() && steps.repair-gate.outputs.enabled == 'true' && steps.repair-gate.outputs.mode == 'codex' && steps.gate.outputs.mode != 'codex' }}
@@ -1315,23 +1396,39 @@ jobs:
           echo "path=$result_path" >> "$GITHUB_OUTPUT"
 
       - id: post-model-freshness
-        name: Re-read target revision before triage projection
-        if: ${{ always() && steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode != 'claude' }}
+        name: Re-read target context before triage projection
+        if: ${{ always() && steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode != 'claude' }}
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          CARD_REPO: ${{ github.repository }}
+          CARD_ISSUE: ${{ steps.resolve.outputs.issue }}
+          OWNER: ${{ github.repository_owner }}
           SLUG: ${{ steps.resolve.outputs.slug }}
           NUMBER: ${{ steps.resolve.outputs.number }}
           KIND: ${{ steps.resolve.outputs.kind }}
           EXPECTED_REVISION: ${{ steps.resolve.outputs.revision }}
+          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
         run: |
           set -euo pipefail
-          observed=""
-          if [ "$KIND" = "issue-triage" ]; then
-            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          fresh=false
+          if [ "$KIND" = "pr-review" ]; then
+            if GH_TOKEN="$CARD_TOKEN" gh issue view "$CARD_ISSUE" -R "$CARD_REPO" \
+              --json body,state,labels > post-model-card.json \
+              && python scripts/triage_admission.py \
+              --card post-model-card.json --owner "$OWNER" \
+              --revision "$EXPECTED_REVISION" \
+              --review-context "$REVIEW_CONTEXT" \
+              --recovery-context "$RECOVERY_CONTEXT"; then
+              fresh=true
+            fi
           else
-            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+            if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then fresh=true; fi
           fi
-          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+          if [ "$fresh" = "true" ]; then
             echo "fresh=true" >> "$GITHUB_OUTPUT"
           else
             {
@@ -1858,12 +1955,16 @@ jobs:
           NUMBER: ${{ needs.triage.outputs.number }}
           ISSUE: ${{ needs.triage.outputs.issue }}
           REVISION: ${{ needs.triage.outputs.revision }}
+          REVIEW_CONTEXT: ${{ needs.triage.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ needs.triage.outputs.recovery_context }}
           REPO_SLUG: ${{ github.repository }}
         run: |
+          context=(--review-context "$REVIEW_CONTEXT")
+          if [ -n "$RECOVERY_CONTEXT" ]; then context+=(--recovery-context "$RECOVERY_CONTEXT"); fi
           python scripts/agent_claim.py \
             --action triage.schema-repair --owner "$OWNER" --repo "$REPO" \
             --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
-            --repo-slug "$REPO_SLUG"
+            "${context[@]}" --repo-slug "$REPO_SLUG"
 
       - id: claude-repair-task
         name: Build the immutable context-equivalent correction AgentTask
@@ -2023,22 +2124,38 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - id: post-model-freshness
-        name: Re-read target revision before triage projection
+        name: Re-read target context before triage projection
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          CARD_REPO: ${{ github.repository }}
+          CARD_ISSUE: ${{ needs.triage.outputs.issue }}
+          OWNER: ${{ github.repository_owner }}
           SLUG: ${{ needs.triage.outputs.slug }}
           NUMBER: ${{ needs.triage.outputs.number }}
           KIND: ${{ needs.triage.outputs.kind }}
           EXPECTED_REVISION: ${{ needs.triage.outputs.revision }}
+          REVIEW_CONTEXT: ${{ needs.triage.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ needs.triage.outputs.recovery_context }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
         run: |
           set -euo pipefail
-          observed=""
-          if [ "$KIND" = "issue-triage" ]; then
-            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          fresh=false
+          if [ "$KIND" = "pr-review" ]; then
+            if GH_TOKEN="$CARD_TOKEN" gh issue view "$CARD_ISSUE" -R "$CARD_REPO" \
+              --json body,state,labels > post-model-card.json \
+              && python scripts/triage_admission.py \
+              --card post-model-card.json --owner "$OWNER" \
+              --revision "$EXPECTED_REVISION" \
+              --review-context "$REVIEW_CONTEXT" \
+              --recovery-context "$RECOVERY_CONTEXT"; then
+              fresh=true
+            fi
           else
-            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+            if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then fresh=true; fi
           fi
-          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+          if [ "$fresh" = "true" ]; then
             echo "fresh=true" >> "$GITHUB_OUTPUT"
           else
             {

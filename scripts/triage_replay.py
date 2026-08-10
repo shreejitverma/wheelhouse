@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import assessment_admission  # noqa: E402
 import projection_writer  # noqa: E402
+import triage_admission  # noqa: E402
 import reconcile  # noqa: E402
 import render_card  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
@@ -34,6 +35,16 @@ from scripts import agent_claim  # noqa: E402
 
 REPLAY_FIELD = "triage_replay"
 REPLAY_VERSION = 1
+BACKFILL_CLEARED = "policy-backfill"
+# This is a registry, not a free-form successful-cache reset. A future
+# triage-logic repair adds one reviewed predicate here, then uses the same
+# exact-selector, second-read, daily-reservation, sealed-permit machinery.
+BACKFILL_POLICIES = {
+    "admission-context-v1": {
+        "description": "recover terminal admission.duplicate projections after context-bound PR admission",
+    },
+}
+BACKFILL_POLICY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,60}$")
 ATTEMPT_RESET_REPLAY_VERSION = 2
 INCIDENT_PERMIT_REPLAY_VERSION = 3
 REPLAY_LIMIT_DEFAULT = 25
@@ -518,6 +529,21 @@ def _canonical_exact_selector(numbers):
     return EXACT_SELECTOR_PREFIX + ",".join(str(number) for number in numbers)
 
 
+def _backfill_policy_scope(value, exact_scope, attempts_reset_cards):
+    """Bind a reusable logic-fix backfill to a checked-in policy and exact wave."""
+    if value == "":
+        return ""
+    if not isinstance(value, str) or not BACKFILL_POLICY_RE.fullmatch(value):
+        raise ValueError("backfill policy must be a checked-in policy slug")
+    if value not in BACKFILL_POLICIES:
+        raise ValueError("backfill policy is not registered in this source revision")
+    if not exact_scope:
+        raise ValueError("backfill policy requires an exact card selector")
+    if attempts_reset_cards:
+        raise ValueError("backfill policy cannot be combined with attempt reset")
+    return value
+
+
 def _incident_permit_scope(wave, exact_scope):
     """Admit only the code-defined wave with its one immutable selector."""
     permit = INCIDENT_REPLAY_PERMITS.get(wave)
@@ -664,6 +690,87 @@ def _fleet_json(endpoint):
 def _source_json(owner, repo, number, kind):
     noun = "pulls" if kind == "pr-review" else "issues"
     return _fleet_json("repos/%s/%s/%s/%s" % (owner, repo, noun, number))
+
+
+def _current_pr_review_context(owner, repo, number, revision, state, source):
+    """Build the only PR admission context a replay/backfill may use.
+
+    The card supplies the complete persisted ReviewObservation; live fleet
+    reads re-prove the PR is open at its exact head/base and re-prove the
+    default-branch VISION.md SHA-or-absence. No workflow input, model output,
+    or attempt counter participates.
+    """
+    head = (source.get("head") or {}).get("sha") if isinstance(source, dict) else ""
+    base = (source.get("base") or {}).get("sha") if isinstance(source, dict) else ""
+    if head != revision or not isinstance(base, str) or not re.fullmatch(r"[0-9A-Fa-f]{7,64}", base):
+        return None, None, "", "review-context-target-moved"
+    try:
+        vision = triage_admission._vision_sha(owner, repo)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None, None, "", "review-context-vision-unreadable"
+    item = {
+        "repo": repo,
+        "number": number,
+        "kind": "pr-review",
+        "head_sha": revision,
+        "base_sha": base,
+        "automerge_vision_sha": vision or "",
+        "triage_vision_status": "present" if vision is not None else "absent",
+    }
+    record = render_card._triage_admission_context_record(state, item, revision)
+    token = render_card.triage_admission_context_token(record)
+    if record is None or not token:
+        return None, None, "", "review-context-untrusted"
+    prior, _prior_token = render_card.triage_admission_context_for_state(state, revision)
+    if prior is not None and prior != record:
+        return None, None, "", "review-context-moved"
+    return item, record, token, ""
+
+
+def _backfill_refusal(policy, state, kind, revision):
+    """Policy-specific eligibility remains checked-in and fail-closed."""
+    if policy not in BACKFILL_POLICIES:
+        return "backfill-policy-unrecognized"
+    if kind != "pr-review":
+        return "backfill-kind-unsupported"
+    if state.get("held") or state.get("triaged_sha") != revision:
+        return "backfill-cache-unproven"
+    if state.get(render_card.TRIAGE_BACKFILL_FIELD) is not None:
+        return "backfill-allowance-consumed-or-untrusted"
+    if state.get(REPLAY_FIELD) is not None:
+        # Do not repurpose or overwrite incident-scoped replay permits such as
+        # card #1585. A future policy must explicitly model any exception.
+        return "backfill-replay-marker-present"
+    if policy == "admission-context-v1":
+        expected = (
+            "Auto triage did not run because exact-revision admission was denied "
+            "(admission.duplicate)."
+        )
+        if state.get("triage_status") != "error" or state.get("triage_error") != expected:
+            return "backfill-policy-not-affected"
+        return ""
+    return "backfill-policy-unrecognized"
+
+
+def _backfill_marker(policy, wave, revision, review_context, run_number):
+    if (
+        policy not in BACKFILL_POLICIES
+        or not REPLAY_WAVE_RE.fullmatch(wave or "")
+        or not re.fullmatch(r"[0-9a-f]{64}", review_context or "")
+    ):
+        raise ValueError("backfill marker context was invalid")
+    return {
+        "version": render_card.TRIAGE_BACKFILL_VERSION,
+        "policy": policy,
+        "wave": wave,
+        "revision": revision,
+        "review_context": review_context,
+        "at": datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "run_number": run_number,
+    }
 
 
 def _incident_source_binding_reason(
@@ -877,6 +984,7 @@ def inspect_candidate(
     attempt_reset_wave="",
     incident_permit=None,
     exact_selected=False,
+    backfill_policy="",
 ):
     """Return an eligible replay plan or a fail-closed skip reason.
 
@@ -1005,7 +1113,12 @@ def inspect_candidate(
         )
     )
     duplicate_reentry = False
-    if incident_permit is not None:
+    if backfill_policy:
+        # Policy eligibility runs below after the exact live base/VISION
+        # context is reconstructed. It deliberately bypasses none of the
+        # replay-marker validation above.
+        cleared = BACKFILL_CLEARED
+    elif incident_permit is not None:
         if number != incident_permit.get("card"):
             return None, "incident-card-mismatch"
         expected_binding = incident_permit["source_binding"]
@@ -1069,6 +1182,9 @@ def inspect_candidate(
                 revision=revision,
                 repo_slug=_card_repo_slug(owner),
                 replayed_at=marker["at"],
+                review_context=(
+                    render_card.triage_admission_context_for_state(state, revision)[1]
+                ),
             )
         except Exception:
             return None, "duplicate-evidence-unreadable"
@@ -1117,6 +1233,42 @@ def inspect_candidate(
         ),
         **policy,
     }
+    review_context = ""
+    if kind == "pr-review":
+        context_item, _record, review_context, context_reason = _current_pr_review_context(
+            owner, repo, target_number, revision, state, source
+        )
+        if context_reason:
+            return None, context_reason
+        if context_item is not None:
+            item.update(context_item)
+    if backfill_policy:
+        refusal = _backfill_refusal(backfill_policy, state, kind, revision)
+        if refusal:
+            return None, refusal
+        if not review_context:
+            return None, "review-context-untrusted"
+        item["triage_backfill_policy"] = backfill_policy
+        if not render_card.should_hold(item, has_token):
+            return None, "auto-triage-disabled"
+        return {
+            "number": number,
+            "card": card,
+            "state": state,
+            "item": item,
+            "revision": revision,
+            "cleared": BACKFILL_CLEARED,
+            "attempt_count": render_card.triage_attempt_count(
+                state, kind, revision, policy["triage_attempt_cap_per_revision"]
+            ),
+            "action": action,
+            "duplicate_reentry": False,
+            "attempt_reset": False,
+            "attempt_reset_applied": False,
+            "incident_permit": "",
+            "backfill_policy": backfill_policy,
+            "review_context": review_context,
+        }, "eligible"
     cap = policy["triage_attempt_cap_per_revision"]
     if incident_permit is not None:
         attempt_count = _attempt_reset_count(state, kind, revision, cap)
@@ -1165,6 +1317,8 @@ def inspect_candidate(
         "incident_permit": (
             incident_permit.get("id") if incident_permit is not None else ""
         ),
+        "backfill_policy": "",
+        "review_context": review_context,
     }, "eligible"
 
 
@@ -1325,6 +1479,8 @@ def _plans_match(initial, reread):
         and initial.get("attempt_count") == reread.get("attempt_count")
         and initial.get("action") == reread.get("action")
         and initial.get("incident_permit") == reread.get("incident_permit")
+        and initial.get("backfill_policy") == reread.get("backfill_policy")
+        and initial.get("review_context") == reread.get("review_context")
         and initial.get("item") == reread.get("item")
         and initial.get("state") == reread.get("state")
         and _card_snapshot_identity(initial.get("card"))
@@ -1363,7 +1519,8 @@ def _preflight_attempt_reset(
 
 
 def _preflight_exact_scope(
-    selected, exact_scope, config, owner, has_token, incident_permit=None
+    selected, exact_scope, config, owner, has_token, incident_permit=None,
+    backfill_policy=""
 ):
     """Atomically revalidate every requested card before any exact-scope write."""
     if not exact_scope:
@@ -1381,6 +1538,7 @@ def _preflight_exact_scope(
             has_token,
             incident_permit=incident_permit,
             exact_selected=True,
+            backfill_policy=backfill_policy,
         )
         if not plan or not _plans_match(initial, plan):
             refusal = reason if not plan else "card-raced-before-replay"
@@ -1396,6 +1554,62 @@ def _preflight_exact_scope(
             "exact card selector refused because a requested card changed before mutation"
         )
     return reread_plans
+
+
+def _preflight_policy_claims(plans, owner):
+    if not plans or not all(plan.get("backfill_policy") for plan in plans):
+        return plans
+    repo_slug = _card_repo_slug(owner)
+    verified = []
+    for plan in plans:
+        candidates = []
+        try:
+            for action in ("triage.pr.local", "triage.pr.search"):
+                claim = agent_claim.triage_claim_recovery_state(
+                    action=action,
+                    owner=owner,
+                    repo=plan["item"]["repo"],
+                    number=plan["item"]["number"],
+                    issue=plan["number"],
+                    revision=plan["revision"],
+                    repo_slug=repo_slug,
+                    review_context=plan.get("review_context", ""),
+                )
+                if claim.get("status") in {"active", "superseded"}:
+                    candidates.append((action, claim))
+                elif claim.get("status") != "missing":
+                    raise ValueError("prior claim status was invalid")
+        except Exception as error:
+            print(
+                "::error::policy backfill refused card #%s: prior-claim-unreadable (%s)"
+                % (plan["number"], str(error)[:180])
+            )
+            raise ValueError(
+                "policy backfill requires every prior claim to be readable"
+            )
+        if len(candidates) != 1:
+            reason = (
+                "exact-prior-claim-missing"
+                if not candidates
+                else "exact-prior-claim-ambiguous"
+            )
+            print(
+                "::error::policy backfill refused card #%s: %s"
+                % (plan["number"], reason)
+            )
+            raise ValueError(
+                "policy backfill requires every exact prior claim before mutation"
+            )
+        action, claim = candidates[0]
+        rebound = dict(plan)
+        rebound["prior_claim"] = {
+            "action": action,
+            "event_key": claim["event_key"],
+            "status": claim["status"],
+            "comment_id": claim["claim"]["id"],
+        }
+        verified.append(rebound)
+    return verified
 
 
 def _print_exact_plans(exact_scope, plans):
@@ -1419,6 +1633,21 @@ def _print_exact_plans(exact_scope, plans):
                 plan["cleared"],
             )
         )
+        if plan.get("backfill_policy"):
+            print(
+                "replay %s card #%s policy-backfill basis: policy=%s "
+                "head=%s base=%s vision=%s review_context=%s"
+                % (
+                    EXACT_SELECTOR_LABEL,
+                    plan["number"],
+                    plan["backfill_policy"],
+                    plan["revision"][:12],
+                    str(plan["item"].get("base_sha") or "")[:12],
+                    str(plan["item"].get("automerge_vision_sha") or "absent")[:12],
+                    plan.get("review_context", "")[:16],
+                )
+            )
+            continue
         if plan["cleared"] == OBSERVATION_DRIFT_REFRESH_CLEARED:
             state = plan["state"]
             assessment = (
@@ -1549,6 +1778,33 @@ def _body_with_replay_marker(body, plan, wave, run_number):
         or plan["duplicate_reentry"]
         else body
     )
+    return render_card._replace_state_block(clean, new_state)
+
+
+def _body_with_backfill_marker(body, plan, wave, run_number):
+    """Atomically retire stale authority and arm one policy recovery attempt."""
+    state = render_card._unique_state_block(body)
+    if state != plan["state"]:
+        return body
+    if plan.get("backfill_policy") not in BACKFILL_POLICIES:
+        return body
+    review_context = plan.get("review_context", "")
+    new_state = dict(state)
+    # Clear every card-side field that can present stale agent authority. Keep
+    # the normal attempt/context records untouched: the policy marker, not a
+    # reset, is the only extra allowance.
+    for field in set(TRIAGE_ADVISORY_CACHE_FIELDS) | {
+        "triaged_sha",
+        "triaged_base_sha",
+        "triaged_vision_sha",
+        render_card.TRIAGE_ADMISSION_CONTEXT_FIELD,
+    }:
+        new_state.pop(field, None)
+    new_state[render_card.TRIAGE_BACKFILL_FIELD] = _backfill_marker(
+        plan["backfill_policy"], wave, plan["revision"], review_context, run_number
+    )
+    clean = render_card.remove_triage_section(body)
+    clean = render_card._set_recommendation_section(clean, None)
     return render_card._replace_state_block(clean, new_state)
 
 
@@ -1688,11 +1944,17 @@ def run(
     dry_run=False,
     attempts_reset_cards="",
     exact_cards="",
+    backfill_policy="",
 ):
     owner, run_number = _entry(wave, limit)
     exact_scope = _exact_card_scope(exact_cards)
     attempt_reset_scope = _attempt_reset_scope(wave, attempts_reset_cards)
+    policy_backfill = _backfill_policy_scope(
+        backfill_policy, exact_scope, attempts_reset_cards
+    )
     incident_permit = _incident_permit_scope(wave, exact_scope)
+    if policy_backfill and incident_permit is not None:
+        raise ValueError("backfill policy cannot be combined with incident permit")
     if exact_scope and attempt_reset_scope:
         raise ValueError("exact card selector cannot be combined with attempt reset")
     if incident_permit is not None and not _incident_anchor_fix_present(
@@ -1725,6 +1987,7 @@ def run(
             attempt_reset_wave=wave,
             incident_permit=incident_permit,
             exact_selected=bool(exact_scope),
+            backfill_policy=policy_backfill,
         )
         if plan:
             eligible.append(plan)
@@ -1799,10 +2062,43 @@ def run(
         owner,
         has_token,
         incident_permit=incident_permit,
+        backfill_policy=policy_backfill,
     )
+    selected = _preflight_policy_claims(selected, owner)
     _print_exact_plans(exact_scope, selected)
     if dry_run:
         for plan in selected:
+            if plan.get("backfill_policy"):
+                base_sha = plan["item"].get("base_sha", "") or "unavailable"
+                vision_sha = plan["item"].get("automerge_vision_sha", "") or "absent"
+                print(
+                    "DRY-RUN card #%s revision=%s policy=%s: write one "
+                    "triage_backfill v%s allowance bound to head=%s base=%s "
+                    "vision=%s; atomically clear stale triage authority "
+                    "(assessment/result/admission, recommendation, verdict, "
+                    "primary/repair telemetry, queued context, visible triage), "
+                    "tombstone only the exact prior primary claim, then queue "
+                    "through the shared sealed permit without changing the "
+                    "ordinary attempt cap."
+                    % (
+                        plan["number"],
+                        plan["revision"],
+                        plan["backfill_policy"],
+                        render_card.TRIAGE_BACKFILL_VERSION,
+                        plan["revision"][:12],
+                        base_sha[:12],
+                        vision_sha[:12],
+                    )
+                )
+                print(
+                    "DRY-RUN card #%s planned model spend: exactly one "
+                    "policy-backfill triage attempt (at most two model calls "
+                    "with bounded correction), one re-read daily-ledger "
+                    "reservation, and one context-bound primary claim; "
+                    "writes=0."
+                    % plan["number"]
+                )
+                continue
             if exact_scope:
                 marker_version = (
                     INCIDENT_PERMIT_REPLAY_VERSION
@@ -1925,6 +2221,7 @@ def run(
             attempt_reset_wave=wave,
             incident_permit=incident_permit,
             exact_selected=bool(exact_scope),
+            backfill_policy=policy_backfill,
         )
         if not plan or (exact_scope and not _plans_match(initial, plan)):
             refusal = reason if not plan else "card-raced-before-replay"
@@ -1982,13 +2279,18 @@ def run(
             written += 1
         try:
             superseded = agent_claim.supersede_triage_claim(
-                action=plan["action"],
+                action=(
+                    (initial.get("prior_claim") or {}).get("action")
+                    if policy_backfill
+                    else plan["action"]
+                ),
                 owner=owner,
                 repo=plan["item"]["repo"],
                 number=plan["item"]["number"],
                 issue=plan["number"],
                 revision=plan["revision"],
                 repo_slug=repo_slug,
+                review_context=plan.get("review_context", ""),
             )
         except Exception as error:
             print(
@@ -2010,6 +2312,16 @@ def run(
         ):
             raise ValueError(
                 "incident permit requires the exact prior claim to be superseded"
+            )
+        if policy_backfill and (
+            superseded.get("superseded") is not True
+            or superseded.get("event_key")
+            != (initial.get("prior_claim") or {}).get("event_key")
+            or superseded.get("comment_id")
+            != (initial.get("prior_claim") or {}).get("comment_id")
+        ):
+            raise ValueError(
+                "policy backfill requires the preflighted exact prior claim"
             )
         if superseded["superseded"]:
             print("replay superseded stale triage claim for card #%s" % plan["number"])
@@ -2038,6 +2350,11 @@ def run(
                 return _body_with_incident_queue_transition(
                     body, plan, consumed_state
                 )
+
+        elif policy_backfill:
+
+            def prepare_body(body, plan=plan):
+                return _body_with_backfill_marker(body, plan, wave, run_number)
 
         else:
 
@@ -2106,6 +2423,12 @@ def parser():
         help="Incident-scoped comma-separated card numbers. Non-empty is "
         "accepted only for the exact sanctioned cohort and wave.",
     )
+    root.add_argument(
+        "--backfill-policy",
+        default="",
+        help="Checked-in triage-logic recovery policy. Requires --exact-cards; "
+        "never accepts a free-form cache reset.",
+    )
     return root
 
 
@@ -2119,6 +2442,7 @@ def main():
             dry_run=args.dry_run,
             attempts_reset_cards=args.attempts_reset_cards,
             exact_cards=args.exact_cards,
+            backfill_policy=args.backfill_policy,
         )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print("::error::triage replay refused: %s" % str(error)[:240])

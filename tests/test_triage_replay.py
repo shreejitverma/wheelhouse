@@ -153,6 +153,7 @@ def replay_environment(
     incident_binding_reason="",
     incident_prior_evidence_reason="",
     has_readonly_token=False,
+    prior_claim_action=None,
     repository_owner="owner",
     edit_error=None,
     queue_error=None,
@@ -165,6 +166,7 @@ def replay_environment(
     dispatched = []
     claims = []
     events = []
+    preflighted_claims = {}
 
     def get_card(number):
         card_reads.append(number)
@@ -265,6 +267,42 @@ def replay_environment(
             card["comments"] = comments
             card["updatedAt"] = "2026-07-16T11:00:00Z"
 
+        def recovery_state(**kwargs):
+            expected_action = prior_claim_action or (
+                "triage.pr.search" if has_readonly_token else "triage.pr.local"
+            )
+            if kwargs["action"] != expected_action:
+                identity = replay.agent_claim.normalized_event_identity(
+                    action=kwargs["action"],
+                    owner=kwargs["owner"],
+                    repo=kwargs["repo"],
+                    number=kwargs["number"],
+                    card_issue=kwargs["issue"],
+                    revision=kwargs["revision"],
+                    review_context=kwargs.get("review_context", ""),
+                )
+                return {
+                    "event_key": replay.agent_claim.event_key_sha256(identity),
+                    "status": "missing",
+                }
+            identity = replay.agent_claim.normalized_event_identity(
+                action=kwargs["action"],
+                owner=kwargs["owner"],
+                repo=kwargs["repo"],
+                number=kwargs["number"],
+                card_issue=kwargs["issue"],
+                revision=kwargs["revision"],
+                review_context=kwargs.get("review_context", ""),
+            )
+            event_key = replay.agent_claim.event_key_sha256(identity)
+            comment_id = 9000 + int(kwargs["issue"])
+            preflighted_claims[kwargs["issue"]] = (event_key, comment_id)
+            return {
+                "event_key": event_key,
+                "status": "active",
+                "claim": {"id": comment_id, "body": "trusted active claim"},
+            }
+
         def supersede(**kwargs):
             events.append("tombstone")
             claims.append(kwargs)
@@ -275,10 +313,12 @@ def replay_environment(
                 number=kwargs["number"],
                 card_issue=kwargs["issue"],
                 revision=kwargs["revision"],
+                review_context=kwargs.get("review_context", ""),
             )
             event_key = replay.agent_claim.event_key_sha256(identity)
             superseded = (
                 kwargs["issue"] == replay.CARD_1585_INCIDENT_PERMIT["card"]
+                or preflighted_claims.get(kwargs["issue"], (None,))[0] == event_key
             )
             result = {"event_key": event_key, "superseded": superseded}
             if superseded:
@@ -306,6 +346,7 @@ def replay_environment(
             "supersede_triage_claim": supersede if stub_claim else supersede_live,
         }
         if stub_claim:
+            claim_patches["triage_claim_recovery_state"] = recovery_state
             claim_patches["triage_replay_duplicate_only_evidence"] = (
                 lambda **kwargs: False
             )
@@ -323,6 +364,25 @@ def replay_environment(
                     ),
                     "_incident_prior_evidence_reason": (
                         lambda owner, permit: incident_prior_evidence_reason
+                    ),
+                    # Legacy replay fixtures predate v2 ReviewObservation.
+                    # The production helper is separately exercised with an
+                    # authoritative projected card; preserve these focused
+                    # replay-state tests' old identity shape.
+                    "_current_pr_review_context": (
+                        lambda owner, repo, number, revision, state, source: (
+                            {
+                                "repo": repo,
+                                "number": number,
+                                "kind": "pr-review",
+                                "head_sha": revision,
+                                "base_sha": "b" * 40,
+                                "automerge_vision_sha": "",
+                            },
+                            None,
+                            "" if repo == "no-mistakes" else "a" * 64,
+                            "",
+                        )
                     ),
                 },
             ),
@@ -3649,6 +3709,8 @@ def triage_claim_args():
         issue=42,
         revision="abcdef1",
         event_id="",
+        review_context="a" * 64,
+        recovery_context="",
         repo_slug="owner/wheelhouse",
     )
 
@@ -3807,7 +3869,13 @@ def test_duplicate_only_parked_replay_does_not_consume_cap_or_once_marker():
                         record_args(event_key, "error", "consumer.committed")
                     )
 
-                    with replay_environment(cards, sources, stub_claim=False):
+                    with (
+                        replay_environment(cards, sources, stub_claim=False),
+                        patched(
+                            replay.agent_claim,
+                            {"triage_replay_duplicate_only_evidence": lambda **kwargs: True},
+                        ),
+                    ):
                         result = replay.run(path, "cohort-reentry", 25)
 
                     new_state = rc._unique_state_block(cards[42]["body"])
@@ -4258,6 +4326,17 @@ def test_post_visibility_foreign_mutation_still_fails_projection_cas():
                     "get_card": get_card_foreign_race,
                     "reserve_triage_budget": lambda number, item, ceiling: True,
                     "_configured_triage_spend_limits": lambda item: (2, 1200, 2),
+                    # This focused legacy replay-CAS fixture predates the v2
+                    # observation contract. The production-shaped admission
+                    # lifecycle is covered separately below.
+                    "_triage_admission_context_record": lambda state, item, revision: {
+                        "version": rc.TRIAGE_ADMISSION_CONTEXT_VERSION,
+                        "kind": "pr-review",
+                        "revision": revision,
+                        "observation_id": "sha256:" + "a" * 64,
+                        "base_sha": "b" * 40,
+                        "vision_sha": None,
+                    },
                 },
             ),
             patched(projection_writer, {"commit_preplanned": commit_tracking}),
@@ -4329,6 +4408,9 @@ def test_duplicate_only_replay_retry_survives_post_tombstone_queue_deferral():
 
                     with replay_environment(
                         cards, sources, stub_queue=False, stub_claim=False
+                    ), patched(
+                        replay.agent_claim,
+                        {"triage_replay_duplicate_only_evidence": lambda **kwargs: True},
                     ):
                         with patched(
                             rc,
@@ -4354,7 +4436,10 @@ def test_duplicate_only_replay_retry_survives_post_tombstone_queue_deferral():
                         in fake.comments[0]["body"]
                     )
 
-                    with replay_environment(cards, sources, stub_claim=False):
+                    with replay_environment(cards, sources, stub_claim=False), patched(
+                        replay.agent_claim,
+                        {"triage_replay_duplicate_only_evidence": lambda **kwargs: True},
+                    ):
                         retried = replay.run(path, "retry-reentry", 25)
 
                     new_state = rc._unique_state_block(cards[42]["body"])
@@ -4437,7 +4522,9 @@ def test_result_records_cover_success_failure_bound_and_duplicate_editing():
     )
 
 
-def _scan_workflow_step_plan(event_name, wave="", dry_run=False, exact_cards=""):
+def _scan_workflow_step_plan(
+    event_name, wave="", dry_run=False, exact_cards="", backfill_policy=""
+):
     """Evaluate the scan workflow's production step conditions for one event."""
     document = yaml.safe_load(
         (ROOT / ".github/workflows/scan-backstop.yml").read_text(encoding="utf-8")
@@ -4447,6 +4534,7 @@ def _scan_workflow_step_plan(event_name, wave="", dry_run=False, exact_cards="")
         "inputs.replay_wave": wave,
         "inputs.replay_dry_run": dry_run,
         "inputs.replay_exact_cards": exact_cards,
+        "inputs.replay_backfill_policy": backfill_policy,
     }
     planned = []
     for step in document["jobs"]["reconcile"]["steps"]:
@@ -4544,6 +4632,15 @@ def test_workflow_exact_selector_replay_only_posture_matrix():
     except ValueError:
         pass
 
+    # A raw checked-in-policy input is replay-only before selector validation,
+    # so malformed/incomplete policy waves never fall through to maintenance.
+    policy_only = set(
+        _scan_workflow_step_plan(
+            "workflow_dispatch", backfill_policy="admission-context-v1"
+        )
+    )
+    assert policy_only == prerequisites | {replay_step}
+
     # Empty exact-selector input preserves all prior owners: scheduled and
     # ordinary manual maintenance, generic write replay, and generic dry-run.
     scheduled = set(_scan_workflow_step_plan("schedule"))
@@ -4579,6 +4676,7 @@ def test_workflow_is_inert_and_reuses_existing_queue_and_record_boundaries():
     assert "v1:N,N" in dispatch_inputs["replay_exact_cards"]["description"]
     assert "replay_limit" in dispatch_inputs["replay_exact_cards"]["description"]
     assert dispatch_inputs["replay_attempts_reset_cards"]["default"] == ""
+    assert dispatch_inputs["replay_backfill_policy"]["default"] == ""
     dry_run_guard = (
         "github.event_name == 'workflow_dispatch' && "
         "inputs.replay_wave != '' && inputs.replay_dry_run"
@@ -4742,6 +4840,275 @@ def test_workflow_is_inert_and_reuses_existing_queue_and_record_boundaries():
     assert "ADMISSION_DENIED" in triage_text
 
 
+def test_generic_policy_backfill_dry_run_is_exact_bounded_and_zero_write():
+    cards, sources, _revisions = exact_fixture([42])
+    state = rc._unique_state_block(cards[42]["body"])
+    state = rc._state_with_triage(
+        state,
+        "000002a",
+        "error",
+        error=(
+            "Auto triage did not run because exact-revision admission was denied "
+            "(admission.duplicate)."
+        ),
+    )
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "000002a",
+        "count": 2,
+    }
+    cards[42]["body"] = rc._replace_state_block(cards[42]["body"], state)
+    path = cards_file([42])
+    try:
+        with replay_environment(cards, sources) as run:
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    dry_run=True,
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError as error:
+                assert "requires an exact card selector" in str(error)
+            else:
+                raise AssertionError("policy backfill accepted no exact selector")
+            assert not run["source_reads"] and not run["edits"]
+
+        output = StringIO()
+        with replay_environment(cards, sources) as run, redirect_stdout(output):
+            result = replay.run(
+                path,
+                "admission-context-backfill",
+                1,
+                dry_run=True,
+                exact_cards="v1:42",
+                backfill_policy="admission-context-v1",
+            )
+        assert result == {"eligible": 1, "planned": 1, "deferred": 0, "written": 0}
+        assert not run["edits"] and not run["claims"] and not run["dispatched"]
+        text = output.getvalue()
+        assert "policy=admission-context-v1" in text
+        assert "head=000002a" in text and "writes=0" in text
+
+        with (
+            replay_environment(cards, sources) as run,
+            patched(
+                replay.agent_claim,
+                {
+                    "triage_claim_recovery_state": lambda **kwargs: {
+                        "event_key": "a" * 64,
+                        "status": "missing",
+                    }
+                },
+            ),
+        ):
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    exact_cards="v1:42",
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError as error:
+                assert "every exact prior claim" in str(error)
+            else:
+                raise AssertionError("policy backfill queued without a claim tombstone")
+            assert not run["claims"]
+            assert not run["edits"] and not run["queued"] and not run["dispatched"]
+
+        # A policy cannot overwrite a separately constrained replay marker,
+        # and unknown policy IDs fail before candidate reads.
+        state = rc._unique_state_block(cards[42]["body"])
+        state[replay.REPLAY_FIELD] = valid_marker(revision="000002a")
+        cards[42]["body"] = rc._replace_state_block(cards[42]["body"], state)
+        with replay_environment(cards, sources) as run:
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    dry_run=True,
+                    exact_cards="v1:42",
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError as error:
+                assert "exact card selector refused" in str(error)
+            else:
+                raise AssertionError("policy backfill accepted an existing replay marker")
+            assert not run["edits"] and not run["claims"]
+        with replay_environment(cards, sources) as run:
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    dry_run=True,
+                    exact_cards="v1:42",
+                    backfill_policy="not-checked-in",
+                )
+            except ValueError as error:
+                assert "not registered" in str(error)
+            else:
+                raise AssertionError("unknown policy backfill was accepted")
+            assert not run["source_reads"] and not run["edits"]
+    finally:
+        os.unlink(path)
+
+
+def test_policy_backfill_recovers_prior_claim_across_search_mode_change():
+    cards, sources, _revisions = exact_fixture([42])
+    state = rc._unique_state_block(cards[42]["body"])
+    state = rc._state_with_triage(
+        state,
+        "000002a",
+        "error",
+        error=(
+            "Auto triage did not run because exact-revision admission was denied "
+            "(admission.duplicate)."
+        ),
+    )
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "000002a",
+        "count": 1,
+    }
+    cards[42]["body"] = rc._replace_state_block(cards[42]["body"], state)
+    path = cards_file([42])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            prior_claim_action="triage.pr.local",
+        ) as run:
+            result = replay.run(
+                path,
+                "admission-context-backfill",
+                1,
+                exact_cards="v1:42",
+                backfill_policy="admission-context-v1",
+            )
+        assert result["queued"] == 1
+        assert result["written"] > 0
+        assert len(run["claims"]) == 1
+        assert run["claims"][0]["action"] == "triage.pr.local"
+        assert len(run["dispatched"]) == 1
+    finally:
+        os.unlink(path)
+
+
+def test_policy_backfill_preflights_complete_claim_cohort_before_mutation():
+    cards, sources, _revisions = exact_fixture([42, 43])
+    for number in cards:
+        state = rc._unique_state_block(cards[number]["body"])
+        revision = "%07x" % number
+        state = rc._state_with_triage(
+            state,
+            revision,
+            "error",
+            error=(
+                "Auto triage did not run because exact-revision admission was denied "
+                "(admission.duplicate)."
+            ),
+        )
+        state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+            "version": rc.TRIAGE_ATTEMPTS_VERSION,
+            "kind": "pr-review",
+            "revision": revision,
+            "count": 2,
+        }
+        cards[number]["body"] = rc._replace_state_block(cards[number]["body"], state)
+    path = cards_file([42, 43])
+
+    def claim_state(**kwargs):
+        if kwargs["issue"] == 43 or kwargs["action"] != "triage.pr.local":
+            return {"event_key": "b" * 64, "status": "missing"}
+        return {
+            "event_key": "a" * 64,
+            "status": "active",
+            "claim": {"id": 9042, "body": "trusted"},
+        }
+
+    try:
+        with (
+            replay_environment(cards, sources) as run,
+            patched(replay.agent_claim, {"triage_claim_recovery_state": claim_state}),
+        ):
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    2,
+                    exact_cards="v1:42,43",
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("partial policy claim cohort reached mutation")
+            assert not run["claims"] and not run["edits"] and not run["queued"]
+            assert not run["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_superseded_policy_claim_is_resumable_after_queue_deferral():
+    identity = agent_claim.normalized_event_identity(
+        action="triage.pr.local",
+        owner="owner",
+        repo="wheelhouse",
+        number=17,
+        card_issue=42,
+        revision="abcdef1",
+        review_context="a" * 64,
+    )
+    event_key = agent_claim.event_key_sha256(identity)
+    marker = agent_claim.event_claim_marker(event_key)
+    comments = [{
+        "id": 7,
+        "body": "Agent triage event finished with consumer.committed. %s" % marker,
+        "user": {"login": "github-actions[bot]"},
+        "created_at": "2026-07-16T09:00:00Z",
+        "updated_at": "2026-07-16T09:00:00Z",
+    }]
+
+    def gh_json(*args):
+        if "--paginate" in args:
+            return [copy.deepcopy(comments)]
+        if "--method" in args and "PATCH" in args:
+            body = next(value[5:] for value in args if value.startswith("body="))
+            comments[0]["body"] = body
+            comments[0]["updated_at"] = "2026-07-16T09:01:00Z"
+            return copy.deepcopy(comments[0])
+        return copy.deepcopy(comments[0])
+
+    kwargs = {
+        "action": "triage.pr.local",
+        "owner": "owner",
+        "repo": "wheelhouse",
+        "number": 17,
+        "issue": 42,
+        "revision": "abcdef1",
+        "repo_slug": "owner/wheelhouse",
+        "review_context": "a" * 64,
+    }
+    with patched(agent_claim, {"gh_json": gh_json}):
+        first = agent_claim.supersede_triage_claim(**kwargs)
+        second = agent_claim.supersede_triage_claim(**kwargs)
+    assert first["superseded"] is True
+    assert second == {
+        "event_key": event_key,
+        "superseded": True,
+        "comment_id": 7,
+        "body": comments[0]["body"],
+        "already_superseded": True,
+    }
+
+
 TESTS = [
     test_advisory_cache_recovers_only_through_the_exact_card_selector,
     test_advisory_cache_write_run_clears_only_the_dead_advisory_state,
@@ -4808,6 +5175,10 @@ TESTS = [
     test_admission_denial_terminalizes_only_the_exact_queued_revision,
     test_workflow_exact_selector_replay_only_posture_matrix,
     test_workflow_is_inert_and_reuses_existing_queue_and_record_boundaries,
+    test_generic_policy_backfill_dry_run_is_exact_bounded_and_zero_write,
+    test_policy_backfill_recovers_prior_claim_across_search_mode_change,
+    test_policy_backfill_preflights_complete_claim_cohort_before_mutation,
+    test_superseded_policy_claim_is_resumable_after_queue_deferral,
 ]
 
 

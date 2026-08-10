@@ -104,6 +104,82 @@ def list_claims(repo_slug: str, issue: int, marker: str) -> list[dict]:
     return matches
 
 
+def triage_claim_recovery_state(
+    *,
+    action: str,
+    owner: str,
+    repo: str,
+    number: int,
+    issue: int,
+    revision: str,
+    repo_slug: str,
+    review_context: str = "",
+) -> dict:
+    if action not in TRIAGE_ACTIONS:
+        raise ContractError("only a primary triage claim may be superseded")
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_slug)
+        or repo_slug.split("/", 1)[0] != owner
+    ):
+        raise ContractError("triage claim repository was invalid")
+    identities = []
+    if review_context:
+        identities.append(
+            normalized_event_identity(
+                action=action,
+                owner=owner,
+                repo=repo,
+                number=number,
+                card_issue=issue,
+                revision=revision,
+                review_context=review_context,
+            )
+        )
+    identities.append(
+        normalized_event_identity(
+            action=action,
+            owner=owner,
+            repo=repo,
+            number=number,
+            card_issue=issue,
+            revision=revision,
+        )
+    )
+    candidates = []
+    for identity in identities:
+        event_key = event_key_sha256(identity)
+        marker = event_claim_marker(event_key)
+        claims = list_claims(repo_slug, issue, marker)
+        superseded = list_superseded_triage_claims(repo_slug, issue, event_key)
+        if claims and superseded:
+            raise ContractError("triage replay found conflicting primary claim state")
+        if claims:
+            candidates.append(
+                {
+                    "event_key": event_key,
+                    "marker": marker,
+                    "status": "active",
+                    "claim": claims[0],
+                }
+            )
+        elif superseded:
+            candidates.append(
+                {
+                    "event_key": event_key,
+                    "status": "superseded",
+                    "claim": superseded[0],
+                }
+            )
+    if len(candidates) > 1:
+        raise ContractError("triage replay found ambiguous primary claims")
+    if not candidates:
+        return {
+            "event_key": event_key_sha256(identities[0]),
+            "status": "missing",
+        }
+    return candidates[0]
+
+
 def supersede_triage_claim(
     *,
     action: str,
@@ -113,6 +189,7 @@ def supersede_triage_claim(
     issue: int,
     revision: str,
     repo_slug: str,
+    review_context: str = "",
 ) -> dict:
     """Tombstone one exact auto-triage claim before a trusted replay.
 
@@ -120,28 +197,30 @@ def supersede_triage_claim(
     its own action key. Restricting this helper to primary triage actions keeps
     replay incapable of superseding either class of claim.
     """
-    if action not in TRIAGE_ACTIONS:
-        raise ContractError("only a primary triage claim may be superseded")
-    if (
-        not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_slug)
-        or repo_slug.split("/", 1)[0] != owner
-    ):
-        raise ContractError("triage claim repository was invalid")
-    identity = normalized_event_identity(
+    recovery = triage_claim_recovery_state(
         action=action,
         owner=owner,
         repo=repo,
         number=number,
-        card_issue=issue,
+        issue=issue,
         revision=revision,
+        repo_slug=repo_slug,
+        review_context=review_context,
     )
-    event_key = event_key_sha256(identity)
-    marker = event_claim_marker(event_key)
-    existing = list_claims(repo_slug, issue, marker)
-    if not existing:
+    event_key = recovery["event_key"]
+    if recovery["status"] == "missing":
         return {"event_key": event_key, "superseded": False}
-
-    claim = existing[0]
+    if recovery["status"] == "superseded":
+        claim = recovery["claim"]
+        return {
+            "event_key": event_key,
+            "superseded": True,
+            "comment_id": claim["id"],
+            "body": claim["body"],
+            "already_superseded": True,
+        }
+    marker = recovery["marker"]
+    claim = recovery["claim"]
     original_updated_at = claim.get("updated_at")
     if _trusted_comment_time(original_updated_at) is None:
         raise ContractError("triage claim timestamp was not trusted")
@@ -335,6 +414,7 @@ def triage_replay_duplicate_only_evidence(
     revision: str,
     repo_slug: str,
     replayed_at: str,
+    review_context: str = "",
 ) -> bool:
     """Prove an old replay could only have been denied by its stale claim.
 
@@ -361,6 +441,7 @@ def triage_replay_duplicate_only_evidence(
         number=number,
         card_issue=issue,
         revision=revision,
+        review_context=review_context,
     )
     event_key = event_key_sha256(identity)
     marker = event_claim_marker(event_key)
@@ -565,6 +646,15 @@ def record_triage_result(args: argparse.Namespace) -> int:
 
 
 def claim(args: argparse.Namespace) -> int:
+    # A primary PR attempt may only be admitted from the opaque context token
+    # written and verified by the queued-card path. Legacy identities remain
+    # parseable solely so exact replay can tombstone historical claims.
+    review_context = getattr(args, "review_context", "")
+    recovery_context = getattr(args, "recovery_context", "")
+    if args.action.startswith("triage.pr.") and not review_context:
+        raise ContractError("PR triage claim requires a verified review context")
+    if recovery_context and not review_context:
+        raise ContractError("recovery claim requires a verified review context")
     identity = normalized_event_identity(
         action=args.action,
         owner=args.owner,
@@ -573,6 +663,8 @@ def claim(args: argparse.Namespace) -> int:
         card_issue=args.issue,
         revision=args.revision,
         event_id=args.event_id,
+        review_context=review_context,
+        recovery_context=recovery_context,
     )
     event_key = event_key_sha256(identity)
     marker = event_claim_marker(event_key)
@@ -617,6 +709,8 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--issue", type=int, required=True)
     root.add_argument("--revision", required=True)
     root.add_argument("--event-id", default="")
+    root.add_argument("--review-context", default="")
+    root.add_argument("--recovery-context", default="")
     root.add_argument("--repo-slug", required=True)
     return root
 

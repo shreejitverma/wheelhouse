@@ -111,6 +111,8 @@ def option_b_item(**overrides):
     head = value["head_sha"]
     base_sha = str(value.get("base_sha") or "b" * 40)
     value["base_sha"] = base_sha
+    value.setdefault("triage_vision_status", "absent")
+    value.setdefault("automerge_vision_sha", "")
     observation = rc.target_contracts.make_observation(
         "o",
         value["repo"],
@@ -3352,8 +3354,13 @@ def test_scan_and_ingest_can_dispatch_with_default_token():
 # Held cards (visibility gated on the first auto-triage attempt completing)
 # --------------------------------------------------------------------------- #
 def test_should_hold_gates():
-    it = item(auto_triage=True)
+    it = option_b_item(auto_triage=True)
     check("hold: eligible pr-review with token", rc.should_hold(it, True) is True)
+    unavailable_vision = dict(it, triage_vision_status="unavailable")
+    check(
+        "hold: untrusted VISION context leaves decision controls visible",
+        rc.should_hold(unavailable_vision, True) is False,
+    )
     check("hold: no token -> never held", rc.should_hold(it, False) is False)
     check(
         "hold: auto_triage off (item-level opt-out) -> never held",

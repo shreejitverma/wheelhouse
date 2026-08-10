@@ -665,6 +665,7 @@ scripts/
   scheduled_epoch.py           trusted schedule-only soft-close epoch ledger
   target_reconcile.py          pure exact observation + action receipt -> CI-wait card projection planner
   render_card.py               build decision cards, including held and first-absence inert states, observation freshness, related context, admitted assessments, auto-merge criteria, history-only workflow holds, and advisory CI security reviews; create/reuse/refresh/activity-reflect/close cards; queue/update auto triage; label automated status lines
+  triage_admission.py          verify a queued PR's complete observation, live head/base, and default-branch VISION identity before durable claim admission and result projection
   apply_decision.py            parse a tick/slash/label/plain-English comment, execute it on the target repo
   auto_merge.py                read-only preclaim G0-G6, claim passers, reevaluate under claim, run G7/merge, persist final-gate manual-merge holds, and audit strictly eligible scan-time PR auto-merges
   automerge_criteria.py        stable schema for authoritative auto-merge criterion rows
@@ -692,7 +693,8 @@ tests/test_presentation_migration.py
 tests/test_canonical_recommendation.py
                                offline unit test for the one canonical recommendation surface: the card-1746 shape, the PR-triage basis/optin generation contract, and the render-version migration
 tests/test_auto_triage.py      offline unit test for automatic triage config, cache, evidence normalization/anchoring, rendering, structured recommendations, held-card publish/recovery, same-pass new-card dispatch, ref qualification, automated-status labeling, and workflow isolation
-tests/test_triage_replay.py    offline unit test for owner-only replay plus ordinary complete-observation drift recovery, claim tombstones, duplicate-only re-entry, sanctioned attempt reset, dry-run behavior, exact-revision gates, and result records
+tests/test_triage_context_allowance.py offline regression test for context-bound PR admission, identical-context deduplication, first-VISION and base/VISION/observation changes, spend allowances, and malformed or raced denial
+tests/test_triage_replay.py    offline unit test for owner-only replay, checked-in bounded policy backfills, ordinary complete-observation drift recovery, claim tombstones, duplicate-only re-entry, sanctioned attempt reset, dry-run behavior, exact-revision gates, and result records
 tests/test_triage_prompt_size.py offline regression test for bounded pass-by-reference triage and deep-review prompts
 tests/test_auto_merge_v1.py    offline unit test for scan-time auto-merge gates, same-closing-issue overlap holds, claims, live rechecks, audit records, and ledger recovery
 tests/test_automerge_card_ui.py offline end-to-end test for authoritative criterion evaluation, fail-closed display states, and real card rendering

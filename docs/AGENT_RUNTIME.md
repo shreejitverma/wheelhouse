@@ -32,9 +32,9 @@ Both Claude production lanes keep the immutable model identifier, bounded turns,
 Trusted parent jobs construct and validate an immutable `AgentTask`, upload a bounded content-addressed handoff with signed hidden paths preserved, and invoke `claude-model.yml` through a local reusable-workflow job.
 GitHub resolves that local reusable workflow from the caller's commit, and every caller also passes its exact `github.sha` as the expected source revision.
 That separate workflow has only `actions: read` and `contents: read`, receives no `FLEET_TOKEN`, and cannot write cards or target repositories.
-Before task construction, every spend-capable event creates a durable default-token claim whose key binds the action, target, decision card, exact target revision, and the trigger identity required for deep review and natural-language decisions.
+Before task construction, every spend-capable event creates a durable default-token claim whose key binds the action, target, decision card, exact target revision, and the trigger identity required for deep review and natural-language decisions. PR-triage primary and correction claims additionally bind the queue-authorized complete ReviewObservation, base SHA, and default-branch VISION.md SHA-or-trusted-absence through an opaque review-context digest; a checked-in policy recovery also adds its one-use recovery digest. Issue-triage identities remain revision-bound and unchanged.
 An eligible natural-language schema repair uses a distinct durable claim bound to the same authorized comment event, so a rerun cannot spend another repair turn. Its visible admission copy identifies the schema-repair phase while the hidden marker preserves the separate repair identity and idempotency key.
-The triage correction turn claims the same distinct `triage.schema-repair` identity (action plus exact target revision) before spend, while its AgentTask carries the ORIGINAL triage action for exact capability parity plus a `metadata.correction` block binding the original task hash, execution id, and rejected `valueSha256`.
+The triage correction turn claims the same distinct `triage.schema-repair` action identity, bound to the exact target revision and, for PR triage, the same verified review/recovery context as the primary attempt, before spend. Its AgentTask carries the ORIGINAL triage action for exact capability parity plus a `metadata.correction` block binding the original task hash, execution id, and rejected `valueSha256`.
 Schema-repair actions are structurally ineligible to create another repair task, and a correction task declares `retry.repairTask: null`, carries `metadata.correction`, and is refused as a correction source, so no correction can recurse.
 Duplicate delivery exits before task construction, and the claim key becomes the AgentTask `idempotencyKey`, so task, result, and terminal event evidence remain bound to the admitted event without retaining prompt or target content in lifecycle records.
 An operator-approved exact-revision auto-triage replay first tombstones only the matching primary-triage claim marker and directly verifies that admission can no longer discover it.
@@ -111,9 +111,47 @@ gh-axi workflow run scan-backstop.yml \
   --field replay_dry_run=true
 ```
 
-When this selector is present, the candidate listing is not used for discovery. Every requested card and source is still read by exact number and must pass the existing trusted identity, exact-revision, pure-card, applicable cache-eligibility, attempt-cap, replay-marker, claim, daily-budget, sealed-permit, and idempotency checks. Selection grants no admission or authority. The sole code-defined exception to the normal attempt cap is the separately bound, one-use card 1585 incident permit below.
+When this selector is present, the candidate listing is not used for discovery. Every requested card and source is still read by exact number and must pass the existing trusted identity, exact-revision, pure-card, applicable cache-eligibility, replay-marker, claim, daily-budget, sealed-permit, and idempotency checks. Ordinary replay also remains subject to the attempt cap. Selection grants no admission or authority. The one-use card 1585 incident permit and checked-in policy backfills described below have separate bounded allowances; neither resets or weakens the ordinary cap.
 
 The planner reports the canonical selector and one `exact-selector/v1 admitted` line per card containing its revision. Dry-run and write-enabled modes use that same planner. If any requested card is missing, ineligible, changed during the full second-read preflight, already recovered, or the complete cohort exceeds remaining daily budget, the wave fails before writes and no generic candidate is substituted. After mutation starts, an unavoidable later GitHub race or write failure stops the wave immediately; already queued cards remain independently safe, no other card is substituted, and the operator must freeze and dry-run an explicit remaining cohort before another write-enabled dispatch.
+
+### Checked-in policy backfills for landed triage fixes
+
+A triage-logic fix may need one current-code review for a bounded historical
+cohort whose card cache is still current, denied, or at its ordinary retry cap.
+This is a reusable capability, not a successful-cache reset. The owner starts
+`scan-backstop.yml` with all of `replay_wave`, a versioned exact selector,
+`replay_limit` equal to that selector's count, and a checked-in
+`replay_backfill_policy` from `scripts/triage_replay.py`'s
+`BACKFILL_POLICIES` registry. A future logic fix adds a reviewed, fail-closed
+policy predicate to that registry; no workflow input can invent a policy or
+select a review context.
+
+Every policy run is replay-only before selector validation. It remains
+owner-only and workflow-dispatch-only, limits a wave to 25 exact cards, does a
+full exact-card/source plan followed by an all-or-nothing second-read
+preflight, and refuses moved, closed, locked, malformed, changed, already-used,
+or replay-marker-bearing cards rather than substituting another card. Existing
+incident permits, including card 1585's, are never overwritten or bypassed.
+A dry run reads and reports every bound head/base/VISION identity and planned
+mutation with `writes=0`.
+
+A live policy backfill tombstones only the exact prior primary claim, waits for
+that tombstone to become visible through the normal CAS read path, then atomically
+clears the stale triage authority set and writes one versioned
+`triage_backfill` allowance marker. The shared queue checkpoint re-reads the
+daily ledger, card, complete ReviewObservation, target head/base, and
+default-branch VISION.md identity; reserves one sealed dispatch permit; and
+keeps the ordinary per-revision counter unchanged. Its new admission key binds
+both the queue-derived review-context digest and the policy-recovery digest.
+Thus one policy allowance can never become an unbounded retry route, and a
+same-context duplicate still stops before model spend.
+
+The initial registered policy, `admission-context-v1`, applies only to the
+terminal `admission.duplicate` projection produced before context-bound PR
+triage admission. It exists to recover that defect's historical cohort, while
+the generic registry/allowance machinery is the reusable future backfill
+capability.
 
 ### Advisory-cache recovery for a failed primary
 

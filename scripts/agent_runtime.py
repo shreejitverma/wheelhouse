@@ -59,6 +59,8 @@ def cmd_event_key(args: argparse.Namespace) -> int:
             card_issue=args.issue,
             revision=args.revision,
             event_id=args.event_id,
+            review_context=args.review_context,
+            recovery_context=args.recovery_context,
         )
     )
     output("event_key", event_key)
@@ -417,6 +419,8 @@ def parser() -> argparse.ArgumentParser:
     event_key.add_argument("--issue", type=int, required=True)
     event_key.add_argument("--revision", required=True)
     event_key.add_argument("--event-id", default="")
+    event_key.add_argument("--review-context", default="")
+    event_key.add_argument("--recovery-context", default="")
     event_key.set_defaults(func=cmd_event_key)
     stage = commands.add_parser("stage")
     stage.add_argument("--action", required=True)

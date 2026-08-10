@@ -46,6 +46,10 @@ on:
         description: "One-time sanctioned comma-separated cohort cards (empty disables reset)"
         required: false
         default: ""
+      replay_backfill_policy:
+        description: "Checked-in triage-logic recovery policy (requires exact selector)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -75,7 +79,7 @@ jobs:
       # optional, read-only CI security-summary cache; an unreadable list falls
       # back to an empty cache so the fleet scan still runs and re-analyzes.
       - name: List open cards
-        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -96,7 +100,7 @@ jobs:
       # pending-contributor PRs, so this step requires FLEET_TOKEN with Actions
       # write scope.
       - name: Scan the fleet
-        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -106,7 +110,7 @@ jobs:
       # action-lock label can reorder a card. Denied or unavailable candidates
       # produce content-free telemetry with card_writes=0.
       - name: Evaluate auto-merge candidates before claim
-        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -116,7 +120,7 @@ jobs:
       # Action locks stay card-local and use only the default token. This step
       # can claim only an exact read-only preclaim passer.
       - name: Claim auto-merge decision cards
-        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -124,7 +128,7 @@ jobs:
         run: python scripts/auto_merge.py claim scan.json cards.json automerge-preclaims.json
 
       - name: Validate auto-merge decision cards
-        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -139,7 +143,7 @@ jobs:
       # manual-merge hold; the resolved decision record and ledger stay in the
       # default-token "Record auto-merges" step below.
       - name: Auto-merge eligible PRs
-        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           WHEELHOUSE_CARD_TOKEN: ${{ github.token }}
@@ -151,7 +155,7 @@ jobs:
       # default-token verification/retry of any manual-merge hold before claim
       # release. This is THIS repo's bookkeeping, never FLEET_TOKEN.
       - name: Record auto-merges
-        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -164,7 +168,7 @@ jobs:
       # for one exact, complete target read, then restore the default token before
       # any card mutation.
       - name: Reconcile the queue
-        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -176,9 +180,10 @@ jobs:
       # Phase 3 replay is deliberately operator-only and inert by default.
       # Scheduled runs can never reach this step, and workflow_dispatch keeps
       # replay_wave empty unless the owner explicitly names a reviewed wave.
-      # Any raw non-empty replay_exact_cards input, plus the one sanctioned
-      # card-1585 incident wave even if its selector is malformed, enters
-      # replay-only posture before validation: every ordinary maintenance step above and scan-health
+      # Any raw non-empty replay_exact_cards or replay_backfill_policy input,
+      # plus the one sanctioned card-1585 incident wave even if its selector is
+      # malformed, enters replay-only posture before validation: every ordinary
+      # maintenance step above and scan-health
       # below is skipped, while malformed or incomplete input reaches this owner
       # and fails closed instead of falling through to maintenance. Candidate rows
       # contribute issue numbers only; the script re-reads every card and target
@@ -188,7 +193,7 @@ jobs:
       # Replay then re-enters reconcile.maybe_queue_auto_triage so
       # queue-before-dispatch and both spend guards stay authoritative.
       - name: Replay one bounded auto-triage wave
-        if: github.event_name == 'workflow_dispatch' && (inputs.replay_wave != '' || inputs.replay_exact_cards != '')
+        if: github.event_name == 'workflow_dispatch' && (inputs.replay_wave != '' || inputs.replay_exact_cards != '' || inputs.replay_backfill_policy != '')
         env:
           GH_TOKEN: ${{ github.token }}
           FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -202,6 +207,7 @@ jobs:
           REPLAY_DRY_RUN: ${{ inputs.replay_dry_run }}
           REPLAY_EXACT_CARDS: ${{ inputs.replay_exact_cards }}
           REPLAY_ATTEMPTS_RESET_CARDS: ${{ inputs.replay_attempts_reset_cards }}
+          REPLAY_BACKFILL_POLICY: ${{ inputs.replay_backfill_policy }}
         run: |
           args=(cards.json --wave "$REPLAY_WAVE" --limit "$REPLAY_LIMIT")
           if [ "$REPLAY_DRY_RUN" = "true" ]; then
@@ -213,6 +219,9 @@ jobs:
           if [ -n "$REPLAY_ATTEMPTS_RESET_CARDS" ]; then
             args+=(--attempts-reset-cards "$REPLAY_ATTEMPTS_RESET_CARDS")
           fi
+          if [ -n "$REPLAY_BACKFILL_POLICY" ]; then
+            args+=(--backfill-policy "$REPLAY_BACKFILL_POLICY")
+          fi
           python scripts/triage_replay.py "${args[@]}"
 
       # Track per-repo consecutive scan failures in a dedicated (closed) ledger
@@ -223,7 +232,7 @@ jobs:
       # last and `always()` so it never skips reconcile and fails open on its own
       # I/O errors.
       - name: Check fleet-scan health
-        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}

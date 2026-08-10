@@ -231,6 +231,16 @@ REVIEW_OBSERVATION_FIELD = "review_observation"
 DECISION_CONTEXT_FIELD = "decision_context"
 ASSESSMENT_FIELD = "triage_assessment"
 ASSESSMENT_RESULT_FIELD = "assessment_result_id"
+# A PR's head alone is not its automatic-review event identity. This exact,
+# non-material record is written by the verified queued-card checkpoint and
+# binds the complete stored ReviewObservation, base SHA, and default-branch
+# VISION.md presence/revision. Workflows receive only its digest.
+TRIAGE_ADMISSION_CONTEXT_FIELD = "triage_admission_context"
+TRIAGE_ADMISSION_CONTEXT_VERSION = 1
+# A checked-in policy-backfill capability may consume one separate recovery
+# allowance. It is never a generic cache reset or ordinary attempt counter.
+TRIAGE_BACKFILL_FIELD = "triage_backfill"
+TRIAGE_BACKFILL_VERSION = 1
 PROJECTION_OWNER_FIELD = "projection_owner"
 PROJECTION_OWNER = "pr-review-projection-writer/v2"
 
@@ -1052,18 +1062,19 @@ def triage_fresh(item, state):
         return True
     if observation_drift_retriage_needed(item, state):
         return False
-    verdict = state.get("automerge_verdict")
-    verdict = verdict if isinstance(verdict, dict) else {}
-    for item_field, state_field, verdict_field in (
-        ("base_sha", "triaged_base_sha", "base_sha"),
-        ("automerge_vision_sha", "triaged_vision_sha", "vision_sha"),
-    ):
-        expected = str(item.get(item_field) or "")
-        if not expected:
-            continue
-        actual = str(state.get(state_field) or verdict.get(verdict_field) or "")
-        if actual != expected:
+    actual_base, actual_vision, actual_vision_known = _triage_context_actual(
+        state, revision
+    )
+    expected_base = str(item.get("base_sha") or "")
+    if expected_base and actual_base != expected_base:
+        return False
+    vision_status = item.get("triage_vision_status")
+    expected_vision = str(item.get("automerge_vision_sha") or "")
+    if vision_status == "present":
+        if not expected_vision or actual_vision != expected_vision:
             return False
+    elif vision_status == "absent" and actual_vision_known and actual_vision:
+        return False
     return True
 
 
@@ -1072,6 +1083,212 @@ def triage_queued_for_head(state, revision):
         revision
         and (state or {}).get("triaged_sha") == revision
         and (state or {}).get("triage_status") == "queued"
+    )
+
+
+def _queue_state_with_current_review_observation(state, item, revision):
+    """Overlay the queue-authorized current v2 observation, or deny it.
+
+    A base/VISION refresh may not otherwise require a visible full-card render.
+    The queue checkpoint still must bind the observation that authorized its
+    review, so it folds the current scan item into its one atomic card write.
+    """
+    state = dict(state or {})
+    if (item or {}).get("kind", "pr-review") != "pr-review":
+        return state
+    raw = (item or {}).get("target_observation") or (item or {}).get(
+        REVIEW_OBSERVATION_FIELD
+    )
+    if raw is None:
+        return state
+    observation = target_contracts.normalize_review_observation(raw)
+    context = context_contracts.normalize_decision_context(
+        (item or {}).get(DECISION_CONTEXT_FIELD)
+    )
+    if (
+        observation is None
+        or context is None
+        or not review_inputs_complete(item)
+        or observation["target"].get("repo") != state.get("repo")
+        or observation["target"].get("number") != state.get("number")
+        or observation["revision"].get("head_sha") != revision
+        or context["target"].get("observation_id") != observation.get("observation_id")
+    ):
+        return None
+    state[REVIEW_OBSERVATION_FIELD] = observation
+    state[DECISION_CONTEXT_FIELD] = context
+    state["configured_checks"] = observation["facts"]["configured_checks"]
+    state["changed_path_digest"] = observation["changed_paths"]["digest"]
+    return state
+
+
+def _triage_admission_context_record(state, item, revision):
+    """Return the one trusted PR review context record, else ``None``.
+
+    This derives only from a complete stored v2 ReviewObservation plus the
+    queue-authorized item's current base/VISION facts. It intentionally does
+    not accept a workflow input, result, counter, or DecisionContext as an
+    identity source.
+    """
+    if (item or {}).get("kind", "pr-review") != "pr-review":
+        return None
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9A-Fa-f]{7,64}", revision):
+        return None
+    observation = target_contracts.normalize_review_observation(
+        (state or {}).get(REVIEW_OBSERVATION_FIELD)
+    )
+    if (
+        observation is None
+        or observation.get("compatibility") != "native-v2"
+        or not (observation.get("completeness") or {}).get("complete")
+    ):
+        return None
+    target = observation.get("target") or {}
+    observed_revision = observation.get("revision") or {}
+    number = (item or {}).get("number")
+    expected_owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
+    if (
+        expected_owner
+        and target.get("owner") != expected_owner
+    ):
+        return None
+    if (
+        target.get("repo") != (item or {}).get("repo")
+        or target.get("number") != number
+        or observed_revision.get("head_sha") != revision
+        or (state or {}).get("head_sha") != revision
+        or not isinstance(observation.get("observation_id"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", observation["observation_id"])
+    ):
+        return None
+    base_sha = str((item or {}).get("base_sha") or "")
+    if (
+        not re.fullmatch(r"[0-9A-Fa-f]{7,64}", base_sha)
+        or observed_revision.get("base_sha") != base_sha
+    ):
+        return None
+    vision_status = (item or {}).get("triage_vision_status")
+    vision_sha = str((item or {}).get("automerge_vision_sha") or "")
+    if (
+        vision_status not in {"present", "absent"}
+        or vision_status == "present"
+        and not re.fullmatch(r"[0-9A-Fa-f]{7,64}", vision_sha)
+        or vision_status == "absent"
+        and vision_sha
+    ):
+        return None
+    return {
+        "version": TRIAGE_ADMISSION_CONTEXT_VERSION,
+        "kind": "pr-review",
+        "revision": revision,
+        "observation_id": observation["observation_id"],
+        "base_sha": base_sha,
+        # JSON null is an explicit default-branch VISION.md absence, not an
+        # omitted field or a falsey fallback.
+        "vision_sha": vision_sha or None,
+    }
+
+
+def triage_admission_context_token(record):
+    """Return the opaque canonical digest for one validated review context."""
+    if not isinstance(record, dict) or set(record) != {
+        "version", "kind", "revision", "observation_id", "base_sha", "vision_sha"
+    }:
+        return ""
+    if (
+        record.get("version") != TRIAGE_ADMISSION_CONTEXT_VERSION
+        or record.get("kind") != "pr-review"
+        or not isinstance(record.get("revision"), str)
+        or not re.fullmatch(r"[0-9A-Fa-f]{7,64}", record["revision"])
+        or not isinstance(record.get("observation_id"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", record["observation_id"])
+        or not isinstance(record.get("base_sha"), str)
+        or not re.fullmatch(r"[0-9A-Fa-f]{7,64}", record["base_sha"])
+        or record.get("vision_sha") is not None
+        and (
+            not isinstance(record.get("vision_sha"), str)
+            or not re.fullmatch(r"[0-9A-Fa-f]{7,64}", record["vision_sha"])
+        )
+    ):
+        return ""
+    return hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def triage_admission_context_for_state(state, revision):
+    """Validate the queued-state context record and return ``(record, token)``."""
+    record = (state or {}).get(TRIAGE_ADMISSION_CONTEXT_FIELD)
+    # Use the record's base/VISION values only as equality constraints. The
+    # underlying ReviewObservation remains the sole observation source.
+    item = {
+        "kind": "pr-review",
+        "repo": (state or {}).get("repo"),
+        "number": (state or {}).get("number"),
+        "base_sha": (record or {}).get("base_sha") if isinstance(record, dict) else "",
+        "automerge_vision_sha": (record or {}).get("vision_sha") if isinstance(record, dict) else "",
+        "triage_vision_status": (
+            "present"
+            if isinstance(record, dict) and record.get("vision_sha") is not None
+            else "absent"
+        ),
+    }
+    expected = _triage_admission_context_record(state, item, revision)
+    token = triage_admission_context_token(record)
+    if expected is None or not token or record != expected:
+        return None, ""
+    return expected, token
+
+
+def triage_backfill_recovery_token(marker, review_token):
+    """Digest the policy-bound, one-use recovery allowance for admission."""
+    if not isinstance(marker, dict) or not re.fullmatch(r"[0-9a-f]{64}", review_token or ""):
+        return ""
+    if set(marker) != {"version", "policy", "wave", "revision", "review_context", "at", "run_number"}:
+        return ""
+    if (
+        marker.get("version") != TRIAGE_BACKFILL_VERSION
+        or not isinstance(marker.get("policy"), str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,60}", marker["policy"])
+        or not isinstance(marker.get("wave"), str)
+        or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,40}", marker["wave"])
+        or not isinstance(marker.get("revision"), str)
+        or not re.fullmatch(r"[0-9A-Fa-f]{7,64}", marker["revision"])
+        or marker.get("review_context") != review_token
+        or not isinstance(marker.get("at"), str)
+        or _parse_iso_timestamp(marker["at"]) is None
+        or isinstance(marker.get("run_number"), bool)
+        or not isinstance(marker.get("run_number"), int)
+        or not 1 <= marker["run_number"] <= 9_007_199_254_740_991
+    ):
+        return ""
+    return hashlib.sha256(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def triage_backfill_recovery_gate(item, state):
+    """True only for the policy capability that the caller already bound.
+
+    A scanner item never carries ``triage_backfill_policy``. The replay/backfill
+    planner sets it only after all exact card/source checks and an approved
+    policy predicate. The marker is still fully self-validating here so a raw
+    card edit or a workflow input cannot buy a queue reservation.
+    """
+    policy = (item or {}).get("triage_backfill_policy")
+    revision = triage_revision(item or {})
+    if not isinstance(policy, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,60}", policy):
+        return False
+    record = _triage_admission_context_record(state, item, revision)
+    review_token = triage_admission_context_token(record)
+    if record is None or not review_token:
+        return False
+    marker = (state or {}).get(TRIAGE_BACKFILL_FIELD)
+    return bool(
+        isinstance(marker, dict)
+        and marker.get("policy") == policy
+        and marker.get("revision") == revision
+        and triage_backfill_recovery_token(marker, review_token)
     )
 
 
@@ -1213,16 +1430,25 @@ def triage_context_allowance(item):
     )
 
 
-def _triage_context_actual(state):
-    """The base/VISION identity the card's current attempt was bound to,
-    mirroring the fallback order `triage_fresh` uses."""
+def _triage_context_actual(state, revision=""):
+    """The base/VISION identity the card's current attempt was bound to.
+
+    The queue-owned admission record distinguishes a trusted VISION absence
+    from legacy state that never observed VISION at all.
+    """
     state = state if isinstance(state, dict) else {}
+    record, token = triage_admission_context_for_state(
+        state, revision or state.get("triaged_sha", "")
+    )
+    if record is not None and token:
+        return record["base_sha"], record["vision_sha"] or "", True
     verdict = state.get("automerge_verdict")
     verdict = verdict if isinstance(verdict, dict) else {}
-    return (
-        str(state.get("triaged_base_sha") or verdict.get("base_sha") or ""),
-        str(state.get("triaged_vision_sha") or verdict.get("vision_sha") or ""),
+    base_sha = str(state.get("triaged_base_sha") or verdict.get("base_sha") or "")
+    vision_sha = str(
+        state.get("triaged_vision_sha") or verdict.get("vision_sha") or ""
     )
+    return base_sha, vision_sha, bool(vision_sha)
 
 
 def triage_context_refresh(item, state):
@@ -1249,14 +1475,28 @@ def triage_context_refresh(item, state):
         return None
     if triage_fresh(item, state):
         return None
-    actual_base, actual_vision = _triage_context_actual(state)
+    actual_base, actual_vision, actual_vision_known = _triage_context_actual(
+        state, revision
+    )
     expected_base = str(item.get("base_sha") or "")
     expected_vision = str(item.get("automerge_vision_sha") or "")
+    expected_vision_status = item.get("triage_vision_status")
+    if expected_vision_status not in {"present", "absent"}:
+        return None
+    if expected_vision_status == "present" and not expected_vision:
+        return None
+    if expected_vision_status == "absent" and expected_vision:
+        return None
     # Every expected component must also have a recorded prior counterpart,
     # otherwise the movement is not verified and the ordinary budget owns it.
     if expected_base and not actual_base:
         return None
-    if expected_vision and not actual_vision:
+    if not actual_vision_known:
+        return None
+    # First VISION appearance remains an ordinary-budget admission. The
+    # context allowance owns movement between existing policies and verified
+    # removal of a previously present policy.
+    if expected_vision_status == "present" and not actual_vision:
         return None
     # Require a verified base/VISION component mismatch. `triage_fresh` can now
     # also be false solely for complete same-head observation drift (card #1819);
@@ -1265,7 +1505,7 @@ def triage_context_refresh(item, state):
     moved = False
     if expected_base and actual_base and expected_base != actual_base:
         moved = True
-    if expected_vision and actual_vision and expected_vision != actual_vision:
+    if expected_vision != actual_vision:
         moved = True
     if not moved:
         return None
@@ -1465,8 +1705,32 @@ def should_hold(item, has_token):
         return False
     if item.get(flag, True) is False:
         return False
-    if kind == "pr-review" and not review_inputs_complete(item):
-        return False
+    if kind == "pr-review":
+        if not review_inputs_complete(item):
+            return False
+        has_review_context = any(
+            item.get(field) is not None
+            for field in (
+                "target_observation",
+                REVIEW_OBSERVATION_FIELD,
+                DECISION_CONTEXT_FIELD,
+            )
+        )
+        if has_review_context:
+            revision = triage_revision(item)
+            state = _queue_state_with_current_review_observation(
+                {
+                    "repo": item.get("repo"),
+                    "number": item.get("number"),
+                    "head_sha": revision,
+                },
+                item,
+                revision,
+            )
+            if state is None or _triage_admission_context_record(
+                state, item, revision
+            ) is None:
+                return False
     return bool(triage_revision(item))
 
 
@@ -1572,6 +1836,8 @@ def should_auto_triage(item, state, labels, has_token=True):
         return False
     if triage_fresh(item, state):
         return False
+    if triage_backfill_recovery_gate(item, state):
+        return True
     if triage_context_refresh(item, state) is not None:
         admitted, _reason = triage_context_allowance_gate(item, state)
         if not admitted:
@@ -1594,6 +1860,8 @@ def triage_attempt_deferral_needed(item, state, labels, has_token=True):
         return False
     if triage_fresh(item, state):
         return False
+    if triage_backfill_recovery_gate(item, state):
+        return False
     if triage_context_refresh(item, state) is not None:
         return False
     return triage_attempts_exhausted(item, state)
@@ -1610,6 +1878,8 @@ def triage_context_deferral_reason(item, state, labels, has_token=True):
     if kind == "issue-triage" and _issue_revision_is_older(revision, state):
         return ""
     if triage_fresh(item, state):
+        return ""
+    if triage_backfill_recovery_gate(item, state):
         return ""
     if triage_context_refresh(item, state) is None:
         return ""
@@ -4694,6 +4964,8 @@ def _preserve_same_revision_triage(body, existing_body, item, old_state, owner="
         "assessment_admission",
         TRIAGE_ATTEMPTS_FIELD,
         TRIAGE_CONTEXT_FIELD,
+        TRIAGE_ADMISSION_CONTEXT_FIELD,
+        TRIAGE_BACKFILL_FIELD,
         "triage_replay",
     ):
         if key in (old_state or {}):
@@ -4864,6 +5136,7 @@ def body_with_triage_queued(body, item, attempt_cap=None, context_allowance=None
     state = _unique_state_block(body)
     kind = item.get("kind", "pr-review")
     revision = triage_revision(item)
+    state = _queue_state_with_current_review_observation(state, item, revision)
     if not state or kind not in AUTO_TRIAGE_FLAG_BY_KIND or state.get("kind") != kind:
         return body
     if not revision:
@@ -4874,9 +5147,15 @@ def body_with_triage_queued(body, item, attempt_cap=None, context_allowance=None
         # budget - callers gate on `should_auto_triage`, and this no-op keeps
         # the shared checkpoint writer safe even for a raced or replayed call.
         return body
+    backfill_recovery = triage_backfill_recovery_gate(item, state)
     context_identity = triage_context_refresh(item, state)
     context_uses = None
-    if context_identity is not None:
+    if backfill_recovery:
+        # The checked-in policy recovery marker is its own one-use allowance.
+        # It neither changes nor consumes the ordinary retry record or F13
+        # context allowance.
+        pass
+    elif context_identity is not None:
         allowance = (
             triage_context_allowance(item)
             if context_allowance is None
@@ -4898,7 +5177,7 @@ def body_with_triage_queued(body, item, attempt_cap=None, context_allowance=None
         context_uses = uses + [
             {"base_sha": context_identity[0], "vision_sha": context_identity[1]}
         ]
-    else:
+    elif not backfill_recovery:
         cap = (
             triage_attempt_cap(item)
             if attempt_cap is None
@@ -4949,13 +5228,14 @@ def body_with_triage_queued(body, item, attempt_cap=None, context_allowance=None
             "revision": revision,
             "uses": context_uses,
         }
-    else:
+    elif not backfill_recovery:
         new_state[TRIAGE_ATTEMPTS_FIELD] = {
             "version": TRIAGE_ATTEMPTS_VERSION,
             "kind": kind,
             "revision": revision,
             "count": attempt_count + 1,
         }
+    new_state.pop(TRIAGE_ADMISSION_CONTEXT_FIELD, None)
     # This queued write already proves the target returned to the worklist, so
     # clear stale absence state here instead of issuing a second body edit.
     new_state.pop(RECONCILE_ABSENCE_FIELD, None)
@@ -7886,13 +8166,19 @@ _TRIAGE_DISPATCH_SEAL = object()
 class _TriageDispatchPermit:
     """Unforgeable-in-normal-use proof that reservation and queueing verified."""
 
-    __slots__ = ("_number", "_item", "_seal")
+    __slots__ = ("_number", "_item", "_review_context", "_recovery_context", "_seal")
 
-    def __init__(self, number, item, seal):
+    def __init__(self, number, item, review_context, recovery_context, seal):
         if seal is not _TRIAGE_DISPATCH_SEAL:
             raise RuntimeError("triage dispatch permit may only be issued by queueing")
+        if review_context and not re.fullmatch(r"[0-9a-f]{64}", review_context):
+            raise RuntimeError("triage dispatch permit review context was invalid")
+        if recovery_context and not re.fullmatch(r"[0-9a-f]{64}", recovery_context):
+            raise RuntimeError("triage dispatch permit recovery context was invalid")
         self._number = int(number)
         self._item = MappingProxyType(dict(item))
+        self._review_context = review_context
+        self._recovery_context = recovery_context
         self._seal = seal
 
     @property
@@ -7902,6 +8188,14 @@ class _TriageDispatchPermit:
     @property
     def item(self):
         return dict(self._item)
+
+    @property
+    def review_context(self):
+        return self._review_context
+
+    @property
+    def recovery_context(self):
+        return self._recovery_context
 
 
 def _configured_triage_spend_limits(item):
@@ -7984,22 +8278,6 @@ def mark_triage_queued(
     candidate_body = prepare_body(body) if prepare_body else body
     if prepare_body and candidate_body == body:
         return None
-    state = parse_state_block(candidate_body)
-    if triage_context_refresh(item, state) is not None:
-        admitted, reason = triage_context_allowance_gate(
-            item, state, allowance=context_allowance
-        )
-        if not admitted:
-            report_triage_context_deferral(number, item, reason, ceiling=ceiling)
-            return None
-    elif triage_attempts_exhausted(item, state, cap=cap):
-        report_triage_attempt_exhaustion(number, item, ceiling=ceiling)
-        return None
-    new_body = body_with_triage_queued(
-        candidate_body, item, attempt_cap=cap, context_allowance=context_allowance
-    )
-    if new_body == body or new_body == candidate_body:
-        return None
     before = get_card(number)
     if not _queue_card_snapshot_matches(before, number, item, body):
         _defer_triage_budget(
@@ -8025,6 +8303,61 @@ def mark_triage_queued(
             ceiling=ceiling,
         )
         return None
+    state = parse_state_block(candidate_body)
+    state = _queue_state_with_current_review_observation(
+        state, item, triage_revision(item)
+    )
+    if state is None:
+        _defer_triage_budget(
+            number,
+            item,
+            "admission-observation-untrusted",
+            "current ReviewObservation or DecisionContext was unavailable",
+            error=True,
+            ceiling=ceiling,
+        )
+        return None
+    backfill_recovery = triage_backfill_recovery_gate(item, state)
+    if backfill_recovery:
+        pass
+    elif triage_context_refresh(item, state) is not None:
+        admitted, reason = triage_context_allowance_gate(
+            item, state, allowance=context_allowance
+        )
+        if not admitted:
+            report_triage_context_deferral(number, item, reason, ceiling=ceiling)
+            return None
+    elif triage_attempts_exhausted(item, state, cap=cap):
+        report_triage_attempt_exhaustion(number, item, ceiling=ceiling)
+        return None
+    new_body = body_with_triage_queued(
+        candidate_body, item, attempt_cap=cap, context_allowance=context_allowance
+    )
+    if new_body == body or new_body == candidate_body:
+        return None
+    if item.get("kind", "pr-review") == "pr-review":
+        planned_state = _unique_state_block(new_body)
+        context = _triage_admission_context_record(
+            planned_state, item, triage_revision(item)
+        )
+        if context is None:
+            _defer_triage_budget(
+                number,
+                item,
+                "admission-context-untrusted",
+                "complete queue-authorized review context was unavailable",
+                error=True,
+                ceiling=ceiling,
+            )
+            return None
+        planned_state[TRIAGE_ADMISSION_CONTEXT_FIELD] = context
+        new_body = _replace_state_block(new_body, planned_state)
+    if item.get("kind", "pr-review") == "pr-review":
+        _record, planned_token = triage_admission_context_for_state(
+            _unique_state_block(new_body), triage_revision(item)
+        )
+        if not planned_token:
+            return None
     if not reserve_triage_budget(number, item, ceiling):
         if not publish_budget_deferral:
             return None
@@ -8080,7 +8413,39 @@ def mark_triage_queued(
             ceiling=ceiling,
         )
         return None
-    return _TriageDispatchPermit(number, item, _TRIAGE_DISPATCH_SEAL)
+    review_context = ""
+    recovery_context = ""
+    if item.get("kind", "pr-review") == "pr-review":
+        queued_state = _unique_state_block(verified.get("body", ""))
+        _record, review_context = triage_admission_context_for_state(
+            queued_state, triage_revision(item)
+        )
+        if not review_context:
+            _defer_triage_budget(
+                number,
+                item,
+                "queued-admission-context-unverified",
+                "queued review context was not authoritatively readable",
+                error=True,
+                ceiling=ceiling,
+            )
+            return None
+        if backfill_recovery:
+            marker = (queued_state or {}).get(TRIAGE_BACKFILL_FIELD)
+            recovery_context = triage_backfill_recovery_token(marker, review_context)
+            if not recovery_context:
+                _defer_triage_budget(
+                    number,
+                    item,
+                    "queued-backfill-context-unverified",
+                    "queued policy recovery allowance was not authoritatively readable",
+                    error=True,
+                    ceiling=ceiling,
+                )
+                return None
+    return _TriageDispatchPermit(
+        number, item, review_context, recovery_context, _TRIAGE_DISPATCH_SEAL
+    )
 
 
 def publish_triage_budget_deferral(number, item, body):
@@ -8231,7 +8596,14 @@ def dispatch_triage_workflow(permit):
     if kind == "issue-triage":
         args += ["-f", "revision=%s" % (item.get("updated_at") or "")]
     else:
-        args += ["-f", "head_sha=%s" % (item.get("head_sha") or "")]
+        if not permit.review_context:
+            raise RuntimeError("PR triage dispatch requires a verified review context")
+        args += [
+            "-f", "head_sha=%s" % (item.get("head_sha") or ""),
+            "-f", "review_context=%s" % permit.review_context,
+        ]
+        if permit.recovery_context:
+            args += ["-f", "recovery_context=%s" % permit.recovery_context]
     _gh(args)
 
 

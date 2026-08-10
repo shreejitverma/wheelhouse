@@ -42,6 +42,22 @@ def main():
     check("identity: duplicate triage revision is stable", triage == event_key_sha256(identity("triage.pr.local")))
     check("identity: triage action is part of the key", triage != event_key_sha256(identity("triage.pr.search")))
     check("identity: triage revision is part of the key", triage != event_key_sha256(identity("triage.pr.local", "abcdef2")))
+    pr_context_one = event_key_sha256(
+        normalized_event_identity(
+            action="triage.pr.local", owner="owner", repo="repo", number=7,
+            card_issue=42, revision="abcdef1", review_context="a" * 64,
+        )
+    )
+    pr_context_two = event_key_sha256(
+        normalized_event_identity(
+            action="triage.pr.local", owner="owner", repo="repo", number=7,
+            card_issue=42, revision="abcdef1", review_context="b" * 64,
+        )
+    )
+    check("identity: same PR review context is stable", pr_context_one == event_key_sha256(normalized_event_identity(action="triage.pr.local", owner="owner", repo="repo", number=7, card_issue=42, revision="abcdef1", review_context="a" * 64)))
+    check("identity: changed PR review context gets a distinct key", pr_context_one != pr_context_two)
+    check("identity: policy recovery has a distinct context-bound key", pr_context_one != event_key_sha256(normalized_event_identity(action="triage.pr.local", owner="owner", repo="repo", number=7, card_issue=42, revision="abcdef1", review_context="a" * 64, recovery_context="c" * 64)))
+    check("identity: issue triage remains legacy-compatible", identity("triage.issue.local") == {"version": 1, "action": "triage.issue.local", "target": {"owner": "owner", "repo": "repo", "number": 7}, "cardIssue": 42, "revision": "abcdef1", "eventId": None})
 
     repair = event_key_sha256(identity("triage.schema-repair"))
     check("identity: duplicate repair revision is stable", repair == event_key_sha256(identity("triage.schema-repair")))
@@ -151,7 +167,7 @@ def main():
         with tempfile.TemporaryDirectory() as directory:
             output_path = Path(directory) / "output"
             os.environ["GITHUB_OUTPUT"] = str(output_path)
-            args = argparse.Namespace(action="nl-decision.local", owner="owner", repo="repo", number=7, issue=42, revision="abcdef1", event_id="comment:100", repo_slug="owner/cards")
+            args = argparse.Namespace(action="nl-decision.local", owner="owner", repo="repo", number=7, issue=42, revision="abcdef1", event_id="comment:100", review_context="", recovery_context="", repo_slug="owner/cards")
             comments.append(
                 {
                     "id": 999,
@@ -201,10 +217,32 @@ def main():
             )
 
             output_path.write_text("", encoding="utf-8")
+            args.action = "triage.pr.local"
+            args.event_id = ""
+            args.review_context = "a" * 64
+            agent_claim.claim(args)
+            same_context = output_path.read_text(encoding="utf-8")
+            output_path.write_text("", encoding="utf-8")
+            agent_claim.claim(args)
+            same_context_duplicate = output_path.read_text(encoding="utf-8")
+            output_path.write_text("", encoding="utf-8")
+            args.review_context = "b" * 64
+            agent_claim.claim(args)
+            changed_context = output_path.read_text(encoding="utf-8")
+            check(
+                "claim: identical PR context denies before another spend while a changed context admits once",
+                "admitted=true" in same_context
+                and "admitted=false" in same_context_duplicate
+                and "admitted=true" in changed_context,
+            )
+
+            output_path.write_text("", encoding="utf-8")
             args.action = "nl-decision.local"
             args.event_id = "comment:101"
+            args.review_context = ""
+            args.recovery_context = ""
             agent_claim.claim(args)
-            check("claim: distinct same-revision comment gets a distinct claim", "admitted=true" in output_path.read_text(encoding="utf-8") and len(comments) == 4)
+            check("claim: distinct same-revision comment gets a distinct claim", "admitted=true" in output_path.read_text(encoding="utf-8") and len(comments) == 6)
 
             workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/decision-handler.yml").read_text(encoding="utf-8")
             check(

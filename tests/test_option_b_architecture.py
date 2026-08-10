@@ -196,6 +196,8 @@ def item_for(obs, context=None, assessment=None):
         "kind": "pr-review",
         "head_sha": obs["revision"]["head_sha"],
         "base_sha": obs["revision"]["base_sha"],
+        "triage_vision_status": "absent",
+        "automerge_vision_sha": "",
         "title": facts["title"],
         "author": facts["author"],
         "updated_at": facts["updated_at"],
