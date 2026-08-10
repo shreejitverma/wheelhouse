@@ -143,7 +143,7 @@ def plan_ci_wait_projection(owner, item, observation, receipt=None):
             "Approval succeeded for this head, but the exact read still reported "
             "approval-required state.",
         )
-    if bucket in {"needs-ci-approval", "mergeability-pending"}:
+    if bucket == "needs-ci-approval":
         return _unknown_projection(
             item, observation, "Exact classification remained conservative or ambiguous."
         )

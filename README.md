@@ -5,8 +5,8 @@
 A personal, always-on, cross-repo **"what needs my decision"** command center, built entirely on GitHub Issues + GitHub Actions.
 Every issue in this repo is one pending decision about the repositories you maintain - a PR worth merging, a fork-CI run worth approving, an issue worth triaging.
 The scheduled scan keeps the queue focused on other people's work: PRs and issues authored by the repo owner, the configured maintainer, or bots stay out of the scan-built worklist, while missing author metadata fails open.
-PR-review candidates that GitHub reports as merge-conflicted leave the maintainer worklist until the contributor rebases or merges the base branch and pushes a mergeable head.
-If GitHub is still calculating mergeability after a base-branch update, Wheelhouse waits for a conclusive answer without changing that PR's card membership.
+PR-review candidates that GitHub reports as merge-conflicted stay in the maintainer worklist for the captain's decision; contributors are never asked to rebase.
+GitHub mergeability is display-only for the maintainer queue, so a base-branch update never changes that PR's card membership while GitHub recalculates it.
 You drive cards by ticking a checkbox, replying with a slash-command, or replying in plain English; a workflow executes your call on the real repo and closes the card after a successful resolving action.
 If a non-retryable action error occurs, Wheelhouse leaves the card open and marks it `blocked` for manual follow-up.
 No server, no database, no bot to host - just this repo and a small set of secrets.
@@ -19,7 +19,7 @@ PRs to `main` must be raised by `git push no-mistakes`, which writes the signatu
 ## How it works
 
 - **The queue is the issue list.** Each open issue is one decision that needs you. Open = pending, closed = consumed.
-- **Labels carry state:** `needs-decision` (in the queue), `pending-triage` (first auto-triage attempt is still publishing), `processing` (a handler is acting), `resolved` (a successful resolving action consumed the card), `blocked` (a manual hold or non-retryable action error needs follow-up), `wheelhouse:manual-merge-required` (scan-time auto-merge proved the current head needs a manual workflow-aware merge), `wheelhouse:confirming-target-state` (a visible inert first-absence confirmation), plus metadata labels `repo:<name>`, `kind:<pr-review|ci-approval|issue-triage>`, `priority:<high|med|low>`.
+- **Labels carry state:** `needs-decision` (in the queue), `pending-triage` (first auto-triage attempt is still publishing), `processing` (a handler is acting), `resolved` (a successful resolving action consumed the card), `blocked` (a manual hold or non-retryable action error needs follow-up), `wheelhouse:manual-merge-required` (scan-time auto-merge proved the current head needs a manual workflow-aware merge), `wheelhouse:confirming-target-state` (a visible inert first-absence confirmation), `wheelhouse:maintainer-edits-required` (an inert fork-source policy card), `wheelhouse:closing-target` (its verified notice-to-close transaction is in progress), plus metadata labels `repo:<name>`, `kind:<pr-review|ci-approval|issue-triage>`, `priority:<high|med|low>`.
 - **Each issue body is a decision card:** a link to the target, the target author shown as plain text instead of a notifying `@mention`, the situation, an overlap note, and quick-decision checkboxes.
   A scan-created contributor CI-approval card that holds for changed workflow/action files also includes a deterministic, read-only *Security review (advisory)* section to inform the same manual approval decision.
   A PR-review card whose final auto-merge gate proves a history-only workflow touch includes a head-scoped *Manual merge required* section with bounded evidence.
@@ -177,8 +177,7 @@ contract are documented in [Current-body compliance evidence](docs/CURRENT_BODY_
 > After a safe run is approved, Wheelhouse waits for its checks to finish before classifying the PR or creating a card.
 > During that wait, an existing pure PR-review card follows the [fork-CI approval wait](#daily-use) behavior.
 > If the approval call verifies that no matching run is awaiting approval, the scan normally emits no card and any stale CI-approval card follows the [scheduled backstop lifecycle](#daily-use).
-> For a contributor fork whose safe no-op PR is conclusively `CONFLICTING`, it also posts the existing one-per-head rebase nudge before consuming the card; it never does so for an approved run or unresolved mergeability.
-> If the mergeability settlement required for that exception errors, the repo scan is unhealthy and reconcile preserves an existing card instead.
+> A no-op CI approval never asks a contributor to rebase. Mergeability is informational and does not change the card lifecycle.
 > The scan log records every CI-approval candidate it handles: approved runs and verified no-pending runs emit one `::notice::`, contributor PRs that need a decision emit one `::warning::wheelhouse auto-approve carded <repo>#<pr>: ...` line, and excluded owner, maintainer, or bot PRs that cannot be approved emit one `::warning::wheelhouse auto-approve suppressed-card <repo>#<pr>: ...` line.
 > Both warning forms include the safety or uncertainty reason and any approval status/message.
 > Set it to `false` to opt out for contributor PRs (every contributor fork-CI candidate raises a card, as you click to approve each), or add `auto_approve_ci: false` to a single `repos:` entry to opt that one repo out.
@@ -215,11 +214,8 @@ contract are documented in [Current-body compliance evidence](docs/CURRENT_BODY_
 
 > **Heads-up - `pending_contributor_cleanup` defaults OFF.**
 > When this key is absent Wheelhouse never auto-closes a target for contributor inactivity.
-> When enabled, the scheduled scan watches only PRs with a provable pending-contributor ask created by Wheelhouse: a successful `/request-changes` review or a merge-conflict rebase nudge.
-> A provable legacy rebase nudge that predates cleanup arming is eligible too, so an already-nudged conflicting PR can join the same reminder-then-close lifecycle without a new contributor-facing ask.
-> The [security notes](#security-notes) define the CI-approval reminder/close exception and clear-only behavior.
+> When enabled, the scheduled scan watches only PRs with a provable pending-contributor ask created by Wheelhouse: a successful `/request-changes` review. Historical rebase records are silently disarmed; conflicts never start an inactivity clock.
 > It posts one reminder at `pending_contributor_reminder_days` and closes at `pending_contributor_cleanup_days` only if the reminder already exists.
-> A rebase-specific repeat reminder uses the same visible `Automated reminder:` label as the initial conflict nudge; request-changes reminders retain their distinct wording.
 > It skips instead of closing if any required target timeline or PR edit-history read fails, if the ask marker cannot be proven, if the PR head moved, if a non-maintainer human commented, reviewed, left a review comment, edited the PR body, pushed, or performed another target timeline action after the ask, if the target has an unaccounted post-ask update, or if the target has the `wheelhouse:keep-open` label.
 > Maintainer and bot activity never reset the clock.
 > A missing review timestamp is re-read by review ID when possible; a failed re-read or a genuinely unexplained target update still skips cleanup.
@@ -243,6 +239,12 @@ Only you can mint it (it's tied to your account).
 5. In **this** repo: **Settings** ▸ **Secrets and variables** ▸ **Actions** ▸ **New repository secret** ▸ name it exactly `FLEET_TOKEN`, paste the value.
 
 That is the only secret the deterministic machine needs.
+
+### Future assisted-merge credential (not enabled in Phase 0)
+
+Phase 0 does not read `ASSISTED_MERGE_PUSH_TOKEN` and never pushes a contributor fork. A later, separately reviewed captain-initiated conflict-resolution phase will require the repository owner to mint a short-lived classic PAT from their own account with only `public_repo` scope, rotate it, and store it as the `ASSISTED_MERGE_PUSH_TOKEN` Actions secret. Do not create a bot account for this.
+
+That future token is intentionally confined to one validated, non-force push to a contributor's existing branch. It must never reach a model, checkout, target workflow, git config or credential helper, command-line argument, or log.
 
 ### 4. (Optional) Add the Claude production token for agent-assisted features
 
@@ -355,7 +357,7 @@ You drive the queue three ways - whichever fits the decision:
 - **Nuanced calls - comment a slash-command.** Reply on the card with one of:
   Target-facing reason, comment, and review text has `@` characters removed before posting so it cannot notify accounts; the trusted post-merge contributor thank-you is the narrow exception.
   - `/merge` - merge the target PR. On success, a friendly `@`-mentioning thank-you comment is posted on the PR (opt-out: `thank_on_merge`).
-    PRs that change `.github/workflows/**` (in the net diff **or** in any commit in the PR history) are never API-merged: the card stays open and `blocked` with guidance to review and merge by hand in the GitHub UI (or retry after a rebase drops the workflow touch).
+    PRs that change `.github/workflows/**` (in the net diff **or** in any commit in the PR history) are never API-merged: the card stays open and `blocked` with guidance to review and merge by hand in the GitHub UI (or retry after a new head drops the workflow touch).
     A rename into or out of `.github/workflows/` also counts as a workflow touch.
     That is intentional - `FLEET_TOKEN` keeps no Workflows write permission.
   - `/approve-ci` - approve the fork-CI run (security-gated; CI/action-file changes are held, while non-default bases and `pull_request_target` posture add warnings).
@@ -388,9 +390,9 @@ You drive the queue three ways - whichever fits the decision:
 
 An item is **consumed** when the handler closes its card after a successful resolving action; the card is labeled `resolved` for audit.
 A `/hold` or a non-retryable action error leaves the card open with the `blocked` label for manual follow-up.
-A workflow-touch or unable-to-verify workflow-history refusal from a direct owner merge decision also lands `blocked` (will not API-merge; merge by hand in the GitHub UI, or retry after a rebase drops the workflow touch).
+A workflow-touch or unable-to-verify workflow-history refusal from a direct owner merge decision also lands `blocked` (will not API-merge; merge by hand in the GitHub UI, or retry after a new head drops the workflow touch).
 A retryable merge refusal for a stale head leaves the card as `needs-decision` so you can retry after the card is current.
-A merge attempt that GitHub rejects because the PR has a merge conflict also leaves the card as `needs-decision`; after the contributor pushes a clean new head, the normal scan refreshes that same card in place.
+A merge attempt that GitHub rejects because the PR has a merge conflict also leaves the card as `needs-decision`; Phase 0 requires the captain to resolve the conflict manually without asking the contributor to rebase, then retry the merge.
 For the "what changed most recently?" view, use the Issues list sorted by Recently updated, or bookmark `https://github.com/<owner>/<wheelhouse-repo>/issues?q=is%3Aissue%20is%3Aopen%20label%3Aneeds-decision%20sort%3Aupdated-desc`.
 Wheelhouse bumps a pure pending card's own updated time when the target PR or issue's GitHub `updatedAt` advances, so recently active targets rise to the top.
 That signal is target-level GitHub activity and may include owner, maintainer, or bot activity.
@@ -417,9 +419,7 @@ Pure pending PR-review and issue-triage cards that were already open before auto
 If you act before that refresh lands, a `/merge` (or a "merge it" comment) and `/request-changes` still refuse a stale head with a note.
 The scheduled backstop also self-heals: if the underlying PR/issue gets merged or closed elsewhere, its card is closed automatically on the next successful complete scan.
 If a repo scan is unreadable or incomplete, Wheelhouse leaves existing cards open because it cannot prove the target disappeared.
-After a base-branch push, GitHub can temporarily report a PR's mergeability as `UNKNOWN` while it recalculates it.
-Wheelhouse polls an otherwise merge-ready or review-needed PR for a conclusive value before changing its worklist membership.
-If it does not settle within the bounded poll, Wheelhouse emits no new item and freezes any existing card unchanged until a later scan can decide it safely.
+GitHub mergeability is displayed as an informational fact only. A base-branch push may make it `UNKNOWN`, and a conflict may make it `CONFLICTING`, but neither changes worklist membership: ready work stays ready for the captain to decide.
 If an open target no longer needs a maintainer decision, its pure pending card stays open after the first complete, conclusive scheduled observation and is soft-closed only when the next adjacent qualifying scheduled observation confirms the absence.
 The first absence is a visible, inert card projection bound to a dedicated trusted scheduled-observation epoch: it shows the current observation and reason, removes decision controls, and carries `wheelhouse:confirming-target-state`.
 A manual run neither advances nor resets that epoch; a worklist return clears the confirmation while keeping the same card.
@@ -429,27 +429,17 @@ If several trusted candidates share the same exact identity, Wheelhouse determin
 The current body and managed labels are prepared while the issue remains closed, then the issue is reopened and uniqueness is verified before triage or any decision can proceed.
 Legacy, owner-resolved, blocked, hard-closed, audit-protected, malformed, untrusted, identity-conflicting, or human-touched closed cards are never reopened; an incomplete or ambiguous lookup fails closed instead of creating another card.
 The scan, ingest, triage, and decision workflows share one queued card-lifecycle concurrency group so projections, create, reopen, close, and owner decisions cannot race each other.
-Any intervening nonqualifying scheduled observation - present, failed, truncated, unresolved-mergeability, or fork-CI-wait - breaks the epoch adjacency without closing, even when that run cannot safely edit the stored absence record.
+Any intervening nonqualifying scheduled observation - present, failed, truncated, or fork-CI-wait - breaks the epoch adjacency without closing, even when that run cannot safely edit the stored absence record.
 An open `blocked` card is not soft-closed merely because its target leaves the worklist, so a non-retryable action error stays visible.
 If that target is genuinely merged or closed, the scheduled backstop still hard-closes the `blocked` card.
 That includes scan-built targets authored by the repo owner, the configured maintainer, or bots: they remain in the open target set but leave the worklist, so reconcile consumes any old pure pending card for them after two adjacent complete, conclusive scheduled observations.
-It also includes PR-review candidates whose GraphQL `mergeable` value is `CONFLICTING`.
-Those leave the maintainer worklist as `needs-rebase`; contributor-authored PRs get at most one rebase nudge per head SHA, and the backstop consumes any stale pure pending card after the two-adjacent-observation soft-close threshold.
-There is one fork-CI exception: when safe automatic CI approval verifies that no run is awaiting approval and the contributor PR's mergeability conclusively settles to `CONFLICTING`, Wheelhouse keeps its `needs-ci-approval` classification and emits no card, but posts that same rebase nudge before consuming the PR from the worklist.
-An actual CI approval is unchanged and does not post a conflict nudge.
-An `UNKNOWN` mergeability value is settled before this exception can nudge, and a missing or still-indeterminate value does not nudge.
-If stale pending-contributor cleanup is enabled, a rebase nudge from the normal `needs-rebase` path is also a provable ask for the reminder and close sweep.
-The sweep also recognizes an existing provable rebase nudge on a currently conflicting cross-repo `needs-ci-approval` ci-noop PR.
-That narrow exception does not change CI routing or create a nudge from the CI-approval state alone.
-It re-checks mergeability immediately before a reminder or close, so a non-conflicting, `UNKNOWN`, or unreadable PR is skipped.
-Apply `wheelhouse:keep-open` on the target PR when you want to exempt it from that sweep.
+Conflicted PR-review candidates remain in the maintainer worklist. Wheelhouse never posts a rebase nudge, never reminds a contributor about rebasing, and never closes a PR for rebase inactivity. Historical rebase-cleanup records are silently disarmed. The only stale-contributor cleanup lane is a captain's explicit `/request-changes` review; apply `wheelhouse:keep-open` on the target PR to exempt it.
 By default the scan also **auto-approves fork-CI runs it proves safe** (`auto_approve_ci`, on unless you opt out), so an *Approve the CI run* card now appears only for contributor fork PRs with risky or uncertain cases - a run that changes CI/action files, targets a non-default base branch, has unreadable safety state, hits an approval error, has unknown fork status, or whose repo has a `pull_request_target` workflow (see [Security notes](#security-notes)).
 Owner, maintainer, and bot-authored fork PRs follow the same safe approve/noop path, but risky or uncertain cases are logged with `suppressed-card` and do not emit decision cards.
 Same-repo PRs with no CI signal are routed to normal PR review, not CI approval.
 The approval step still binds each awaiting workflow run to the target PR by PR association, or by exact head SHA plus branch for fork runs where GitHub returns an empty association list.
 For the exact per-run approval contract, see [Security notes](#security-notes).
-If the approval step verifies that no matching run is awaiting approval, the scan normally emits no worklist item and any stale CI-approval card enters the soft-close lifecycle described above; for a contributor fork that conclusively conflicts, it also posts the rebase nudge described above, and a later pending run re-enters the normal approve, card, or suppressed-card path.
-A mergeability-settlement error for that narrow nudge exception marks the repo scan unhealthy instead, so reconcile preserves existing cards.
+If the approval step verifies that no matching run is awaiting approval, the scan normally emits no worklist item and any stale CI-approval card enters the soft-close lifecycle described above; a later pending run re-enters the normal approve, card, or suppressed-card path.
 Each CI-approval candidate the auto path handles also writes exactly one scan-log line, so approved runs, no-pending runs, approval failures, and fail-closed safety reasons are visible in `scan-backstop`.
 
 ## Security notes
@@ -459,17 +449,8 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   PRs and issues authored by the repo owner, the configured `maintainer`, or bots are excluded from the scan-built worklist; bot detection uses GitHub's author type plus the `[bot]` login suffix, and missing author metadata fails open so a real contributor is not silently dropped.
   The explicit dispatch fast path trusts what your source workflow sends, so filter there too if you want it to match the scan.
   If an explicit dispatch creates a PR-review card for your own PR, `/request-changes` refuses to submit the review because GitHub rejects self-review.
-- **Merge-conflict routing.** The scheduled scan treats only GitHub's authoritative GraphQL `mergeable: CONFLICTING` value as a merge conflict.
-  A conflicting PR that would otherwise become a merge-ready or review-needed PR-review card leaves the maintainer queue as `needs-rebase`.
-  Classification never rewrites a fork `needs-ci-approval` target to `needs-rebase`, because CI approval and eventual mergeability are independent.
-  However, if automatic approval for a non-excluded contributor fork verifies `noop` because no matching CI run is awaiting approval, and that PR's mergeability is conclusively `CONFLICTING`, the scan posts the same one-per-head rebase nudge while still emitting no decision card.
-  This narrow exception does not apply when a CI run was actually approved, and it does not write the structured pending-contributor cleanup state.
-  GitHub's explicit `UNKNOWN` value is a pending computation, not a routing answer: Wheelhouse polls an otherwise merge-ready or review-needed candidate and freezes that PR-review card's membership if it cannot settle the result, so `UNKNOWN` never creates, closes, or consumes that card.
-  For the fork-CI no-op exception, `UNKNOWN` is likewise only a pending value: the scan settles it before nudging, never nudges an unresolved or missing value, and treats a settlement-query error as an unhealthy scan rather than guessing.
-  A missing mergeability value still fails open and routes normally.
-  Contributor-authored conflicted PRs get one plain-language rebase nudge per head SHA under `FLEET_TOKEN`: it leads with a visible `Automated reminder:` label, explains the base-branch conflict, asks the contributor to rebase onto or merge the latest base branch, resolve the conflict, and push, then says checks will re-run and the PR will get looked at again.
-  A hidden marker in the PR comment prevents duplicates.
-  Owner, maintainer, and bot-authored conflicted PRs are not nudged and do not emit decision cards.
+- **Merge-conflict readiness.** Mergeability is never a PR classification or routing input. A conflicted or `UNKNOWN` PR with green compliance and tests is merge-ready, while merge state remains visible context. Auto-merge still requires a fresh live clean state. Until the later captain-initiated assisted-resolution phase ships, a manual `/merge` conflict tells the captain to resolve it manually without asking the contributor to rebase.
+- **Fork source permission policy.** Before fork-CI approval, model dispatch, normal routing, or cleanup, Wheelhouse reads `maintainerCanModify`, source ownership, fork status, head ref, and head SHA. A personal fork with **Allow edits from maintainers** is eligible for a later captain-initiated in-place resolution path. An organization-owned fork, explicitly disabled permission, or a source proven to be a non-fork is given the policy notice and closed only after an inert default-token audit card exists. Incomplete source evidence remains a retryable inert card and never contacts or closes the contributor; unavailable or deleted-looking source metadata alone is incomplete evidence, not proof that permits closure. See [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests-from-forks).
 - **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler).
   Acting on your other repos uses `FLEET_TOKEN`, which is never printed and is only used in cross-repo scan, approval, execution, and read-only fetch steps.
   Scope it to just your fleet with Actions, Contents, Issues, and Pull requests read/write on the target repos.
@@ -478,12 +459,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
 - **`request-changes` reuses `FLEET_TOKEN`, no new scope.** `/request-changes <text>` (pr-review only) submits a GitHub "changes requested" review on the target PR through the same `execute`-step `FLEET_TOKEN` wiring `/merge`/`/comment` already use - no new secret, no new token scope.
   It is deterministic, owner-gated, and non-terminal exactly like `/comment`, and it is also selectable by the natural-language intent-mapper (unlike `investigate`, which is checkbox-only).
   A "changes requested" review is a slightly larger effect on the target repo than a plain comment: under branch-protection required-reviews, it can put the target PR into a merge-blocked state until it is dismissed or a new review clears it.
-- **Pending-contributor cleanup is deterministic and fail-open.** The scheduled scan runs the stale cleanup sweep under `FLEET_TOKEN`, the same deterministic target-side context that posts normal `needs-rebase` merge-conflict nudges and approves safe fork CI.
-  It never runs in a Claude path and never uses `READONLY_TOKEN`.
-  It closes only PRs with a structured target-side marker plus active `wheelhouse:pending-contributor-action` label, or legacy rebase nudges whose original hidden per-head marker and timestamp can still be proven.
-  A ci-noop fork PR with `needs-ci-approval` is eligible for reminders or closing through that legacy-nudge proof only when scan-time and pre-write mergeability reads are both conclusively `CONFLICTING`.
-  A non-conflicting CI-approval PR is clear-only: a head move or qualifying contributor activity after a proven `/request-changes` ask clears its stale pending label without a reminder, close, or classification change.
-  CI routing alone is never treated as a cleanup ask.
+- **Pending-contributor cleanup is deterministic and fail-open.** The scheduled scan runs the stale cleanup sweep under `FLEET_TOKEN`, but only for a captain's explicit structured `/request-changes` review. It never runs in a Claude path and never uses `READONLY_TOKEN`. Historical rebase asks are silently disarmed, and conflicts or CI routing are never treated as contributor work. A CI-approval card is clear-only: a head move or qualifying contributor activity after a proven `/request-changes` ask clears its stale pending label without a reminder, close, or classification change.
   Closing also requires a prior visible reminder.
   Every reminder or close requires an open target, no `wheelhouse:keep-open` label, the same PR head SHA, a verified original ask, and complete target timeline and PR edit-history reads.
   Any uncertainty skips the close.
@@ -520,10 +496,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   After that safety verdict passes, the approval call approves only `action_required` runs for the PR head: when GitHub populates `workflow_run.pull_requests`, it must contain exactly that PR; when fork-originated runs leave that list empty, the run detail must match the PR's head SHA and branch.
   Every independently actionable verified current-head run is approved, including duplicate runs that share a stable `workflowDatabaseId`.
   If no matching run is awaiting approval, Wheelhouse normally emits no worklist item and any stale CI-approval card follows the [scheduled backstop lifecycle](#daily-use); a later pending run re-enters the normal approve, card, or suppressed-card path.
-  For a contributor fork whose no-op PR is conclusively `CONFLICTING`, that no-card path also posts the existing fire-once-per-head rebase nudge before it drops the PR from the worklist.
-  It does not change the CI-approval bucket, affect an `approved` path with real workflows, or write the structured pending-contributor cleanup state.
-  An explicit `UNKNOWN` mergeability is settled before this nudge can be sent, while a missing value or an unresolved value produces no nudge.
-  A settlement-query error also produces no nudge, marks the repo scan unhealthy, and preserves existing cards rather than letting reconcile consume them.
+  A no-pending result never posts a contributor rebase request. Mergeability remains informational and does not change the CI-approval bucket or stale-cleanup state.
   Every contributor uncertainty fails closed to a card (unknown fork status, unreadable PR files, a non-default PR base branch, unreadable workflows, or an approve error).
   The same uncertainty for owner, maintainer, or bot-authored PRs is still not approved, but it is logged and no decision card is emitted because those authors are excluded from the queue.
   It runs in the cross-repo `FLEET_TOKEN` scan step; every approved or no-pending run logs a `::notice::`, every contributor carded run logs a `::warning::wheelhouse auto-approve carded <repo>#<pr>: ...` line, and every excluded-author suppressed card logs a `::warning::wheelhouse auto-approve suppressed-card <repo>#<pr>: ...` line.
@@ -571,8 +544,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   Confirm the repo names in the config are correct (names only, no `owner/` prefix).
   Run `scan-backstop` manually and read the logs - a repo that can't be read is reported as a warning and skipped, not fatal.
   If the target is authored by the repo owner, the configured maintainer, or a bot, the scheduled scan intentionally leaves it out of the queue.
-  If an otherwise merge-ready or review-needed PR has a merge conflict, the scheduled scan intentionally leaves it out of the queue until the contributor pushes a mergeable head; contributor-authored PRs get a rebase nudge comment.
-  If the log says its mergeability is pending, GitHub has not finished recalculating after a base-branch update; Wheelhouse leaves the PR out of a new card and preserves any existing card until a later scan gets a conclusive result.
+  A conflicted or mergeability-`UNKNOWN` PR remains in the normal queue. Mergeability is display-only, so no contributor rebase or settlement wait is required.
 - **The `scan-backstop` run failed with `fleet-scan health`.**
   One fleet repo returned `ok:false` for three consecutive scans, so the final health step failed the run after reconcile had already processed the healthy repos.
   Read the scan warnings and restore the repo's readable state, then a successful scan resets its counter in the closed `wheelhouse:scan-health` ledger issue.
@@ -588,10 +560,10 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   It still closes automatically if that target is later genuinely merged or closed.
   A `/merge` refused with a "head moved" note is working as intended - the PR changed after the card was rendered, so re-scan before merging.
   A `/merge` that leaves the card `blocked` saying the PR changes CI workflow files (or that Wheelhouse could not verify workflow history) is also working as intended: `FLEET_TOKEN` intentionally has no Workflows write, so Wheelhouse never attempts that doomed API merge.
-  Review the workflow changes and merge the target PR by hand in the GitHub UI (the card comment includes the PR URL), or after a rebase drops the workflow touch clear the hold and retry `/merge` - the gate re-runs fresh and will merge a workflow-clean PR.
+  Review the workflow changes and merge the target PR by hand in the GitHub UI (the card comment includes the PR URL), or after a new head drops the workflow touch clear the hold and retry `/merge` - the gate re-runs fresh and will merge a workflow-clean PR.
   A `/request-changes` refused for a moved head leaves the card pending; the next scan refreshes it to the new code automatically, then you can re-review and request changes again if needed.
   A `/request-changes` refused because it is your own PR is also working as intended - GitHub does not allow self-review, and scan-built queues normally filter those PRs out.
-  A `/merge` that fails with a merge-conflict message means the contributor must rebase or merge the base branch, resolve the conflict, and push before Wheelhouse can merge it.
+  A `/merge` that finds a conflict remains retryable. Phase 0 tells the captain to resolve it manually without asking the contributor to rebase; a later captain-initiated in-place resolution phase will replace that fallback.
 - **Approve-CI cards appear for PRs that look safe.**
   Open the latest `scan-backstop` run logs and search for `wheelhouse auto-approve carded` or `wheelhouse auto-approve suppressed-card`.
   The line names the repo and PR, includes the safety or uncertainty reason, and includes the `approve_ci` status/message when Wheelhouse tried to approve but had to fail closed.
@@ -608,7 +580,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
 - **An Approve-CI card disappeared before I acted.**
   Search the latest `scan-backstop` logs for `approve_ci noop`.
   That means Wheelhouse verified no matching workflow run was still awaiting approval, emitted no worklist item, and let the stale card follow the [scheduled backstop lifecycle](#daily-use).
-  If that safe contributor-fork PR is also conclusively merge-conflicted, Wheelhouse posts one rebase nudge for its current head before consuming the card; an `UNKNOWN` or missing mergeability value does not nudge.
+  Mergeability does not cause a contributor contact or change the CI card lifecycle.
 - **Cron lag.**
   The scheduled keep-current path runs hourly, but GitHub cron is best-effort and can be delayed.
   For lower-latency items, wire the dispatch path from [`docs/ONBOARDING.md`](docs/ONBOARDING.md); dispatches nudge the same keep-current logic immediately.
@@ -655,7 +627,8 @@ wheelhouse.config.yml          the one file you edit
   deep-review.yml              always-on, code-grounded: Investigate box / label / manual issue run -> read-only target review -> workflow labels and posts Claude's verdict
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
-  wheelhouse_core.py           resilient GraphQL scan/classify and exact-target adapters, mergeability settlement, scan-health ledger, author filtering, dedup/overlap, target cleanup, CI safety, auto-approval, read-only CI security summaries, ref qualification, and scan logs
+  wheelhouse_core.py           resilient GraphQL scan/classify and exact-target adapters, source pushability policy, scan-health ledger, author filtering, dedup/overlap, request-changes cleanup, CI safety, auto-approval, read-only CI security summaries, ref qualification, and scan logs
+  maintainer_edits_policy.py   ordered policy notice / exact re-read / close transaction for non-modifiable fork sources
   target_observation.py        strict ReviewObservation v2, concrete v1 compatibility, approval-receipt, and projection-reference contracts
   decision_context.py          bounded neutral same-issue/reference/exact-shared-path advisory context
   assessment_admission.py      typed observation-bound PR assessment admission; context identity is provenance only
@@ -680,8 +653,9 @@ tests/test_nl_schema_repair.py offline unit test for native-first natural-langua
 tests/test_card_refresh.py     offline unit test for refresh change detection, activity reflection, guards, labels, render-version triage ref repair, and preserved automated-status labeling
 tests/test_reconcile.py        offline unit test for reconcile routing, activity reflection, fixed-K soft-close hysteresis, race guards, and self-healing
 tests/test_card_reuse.py       offline end-to-end card soft-close, trusted reuse, ambiguity, and lifecycle serialization tests
-tests/test_merge_conflict.py   offline unit test for mergeability routing, rebase nudges, cleanup arming, and stale-card self-healing
-tests/test_pending_contributor_cleanup.py offline unit test for deterministic pending-contributor reminders, closing, keep-open, legacy and ci-noop rebase-nudge proof, review-timestamp recovery, and fail-open target-activity proof
+tests/test_merge_conflict.py   offline unit test for mergeability-independent readiness, source-permission policy routing, inert cards, and Phase 0 conflict copy
+tests/test_maintainer_edits_policy.py offline target-order and fail-closed policy-close tests
+tests/test_pending_contributor_cleanup.py offline unit test for deterministic request-changes cleanup, silent legacy-rebase disarming, review-timestamp recovery, and fail-open target-activity proof
 tests/test_ci_autoapprove.py   offline unit test for CI safety, scan-time auto-approval, head-bound receipts, duplicate-run approval, and logging
 tests/test_target_observation.py offline unit test for versioned observation/receipt contracts and pure pending/current/unknown projection planning
 tests/test_option_b_architecture.py complete Option B contract, golden, E2E-01 through E2E-07, workflow/token, migration, and rollback acceptance
@@ -702,7 +676,7 @@ tests/test_automerge_workflow_hold.py offline end-to-end test for durable histor
 tests/test_deep_review.py      offline unit test for the always-on deep-review + Investigate wiring and trusted verdict posting, including ref qualification and automated-status labeling
 tests/test_workflow_lint.py    offline regression guard for workflow `gh api --slurp` / `--jq` misuse
 tests/test_qualify_refs.py     offline unit test for shared bare `#N` -> `<owner>/<repo>#N` qualification
-tests/test_scan_reliability.py offline unit test for scan retry/pagination, scan-health ledger, and UNKNOWN-mergeability safety
+tests/test_scan_reliability.py offline unit test for scan retry/pagination, scan-health ledger, and mergeability-display-only readiness
 tests/test_config_schema.py    offline structural test for checked-in fleet-config entry shape, normalized names/patterns, and case-insensitive name uniqueness
 docs/ONBOARDING.md             how to wire a source repo's dispatch (the fast path)
 ```

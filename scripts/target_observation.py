@@ -470,7 +470,7 @@ def _normalize_common(value, *, v2):
         if completeness["complete"] and (
             facts["comp"] == "unknown"
             or facts["tests"] == "unknown"
-            or facts["bucket"] in {"ci-state-unknown", "mergeability-pending"}
+            or facts["bucket"] == "ci-state-unknown"
         ):
             return None
     claimed_id = value.get("observation_id")

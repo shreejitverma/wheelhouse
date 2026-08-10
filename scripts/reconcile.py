@@ -25,8 +25,8 @@ fleet (scan.json) and the current open cards in THIS repo (cards.json), it:
     only after two adjacent scheduled workflow runs conclusively observe it
     absent - so any intervening inconclusive or present run breaks the streak.
     This also consumes old scan-built cards for owner/maintainer/bot-authored
-    targets after the author filter removes them from the current worklist, and
-    for conflicted PR-review targets after the scan moves them to needs-rebase.
+    targets after the author filter removes them from the current worklist.
+    Conflicted PR-review targets remain in the worklist.
 
 Both card operations run against THIS repo via the ambient GH_TOKEN, which the
 workflow sets to the default GITHUB_TOKEN (card activity must not re-trigger the
@@ -102,6 +102,26 @@ def current_card(row):
         "labels": card.get("labels", []),
         "updated_at": render_card.card_updated_at(card),
         "comments": _comment_count(card.get("comments")),
+    }
+
+
+def policy_action_for_card(card, item, policy):
+    try:
+        state = render_card.trusted_open_target_card(card, item)
+    except render_card.CardLifecycleError as error:
+        print(
+            "::warning::refused untrusted maintainer-edits policy card for %s#%s: %s"
+            % (item["repo"], item["number"], str(error)[:160])
+        )
+        return None
+    if state.get(render_card.MAINTAINER_EDITS_POLICY_FIELD) != policy:
+        return None
+    return {
+        "card_issue": card["number"],
+        "repo": item["repo"],
+        "number": int(item["number"]),
+        "comment_id": policy["target_comment_id"],
+        "policy": policy,
     }
 
 
@@ -531,6 +551,11 @@ def main():
     admission_deferred = 0
     has_triage_token = auto_triage_has_token()
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "").strip()
+    # The policy applier runs only after this default-token writer has created
+    # or verified the exact inert audit card. It receives a number-based handoff
+    # rather than discovering cards through an eventually-consistent list.
+    policy_action_path = os.environ.get("WHEELHOUSE_POLICY_ACTIONS_FILE", "").strip()
+    created_policy_cards = {}
     for item in items:
         key = (item["repo"], int(item["number"]))
         ex = existing.get(key)
@@ -554,6 +579,8 @@ def main():
                 current_for_triage = (
                     current_card({"number": number}) if number else None
                 )
+                if item.get(render_card.MAINTAINER_EDITS_POLICY_FIELD) and number:
+                    created_policy_cards[key] = number
             except Exception as e:  # one bad item must not abort the whole pass
                 outcome = getattr(e, "outcome", "") or ""
                 should_rollback = bool(getattr(e, "should_rollback", False))
@@ -578,6 +605,33 @@ def main():
                 item, current_for_triage, has_triage_token, owner=owner
             ):
                 triage_queued += 1
+            continue
+        if render_card.maintainer_edits_policy_for_item(item) is not None:
+            policy_transition_needed = (
+                not render_card.is_refreshable(ex["labels"])
+                or render_card.refresh_needed(
+                    item,
+                    ex["state"],
+                    has_triage_token,
+                    labels=ex["labels"],
+                    card_title=ex.get("title"),
+                )
+            )
+            if policy_transition_needed:
+                try:
+                    refresh_result = render_card.upsert_card(
+                        item,
+                        existing=ex,
+                        has_token=has_triage_token,
+                        expected_existing=ex,
+                    )
+                    if refresh_result is not None:
+                        refreshed += 1
+                except Exception as e:
+                    print(
+                        "::warning::failed to transition policy card #%s for %s#%s: %s"
+                        % (ex["number"], item["repo"], item["number"], str(e)[:160])
+                    )
             continue
         if render_card.reconcile_absence_needs_clear(ex.get("body", "")):
             item = {**item, "_projection_cause": "lifecycle-transition"}
@@ -733,6 +787,30 @@ def main():
                     % (ex["number"], item["repo"], item["number"], str(e)[:160])
                 )
 
+    if policy_action_path:
+        policy_actions = []
+        for item in items:
+            policy = item.get(render_card.MAINTAINER_EDITS_POLICY_FIELD)
+            if (
+                not isinstance(policy, dict)
+                or policy.get("mode") != core.PUSHABILITY_FORK_REJECT
+                or policy.get("phase") != "notice-posted"
+                or not isinstance(policy.get("target_comment_id"), int)
+                or policy["target_comment_id"] < 1
+            ):
+                continue
+            key = (item["repo"], int(item["number"]))
+            issue = created_policy_cards.get(key) or (existing.get(key) or {}).get("number")
+            live = render_card.get_card(issue) if issue else None
+            action = policy_action_for_card(live, item, policy) if live else None
+            if action:
+                policy_actions.append(action)
+        try:
+            with open(policy_action_path, "w") as handle:
+                json.dump(policy_actions, handle, sort_keys=True)
+        except OSError as error:
+            print("::error::could not write maintainer-edits policy handoff: %s" % str(error)[:160])
+
     try:
         observation_repo_configs = (core.load_config().get("repos") or {})
     except Exception as error:
@@ -745,8 +823,8 @@ def main():
     # 1b) Anti-masquerade for the approve/wait window. A PR whose fork CI was just
     #     auto-approved this scan, or whose approved checks are still running, emits
     #     NO worklist item while it awaits terminal checks - so its existing
-    #     pr-review card would keep displaying the pre-rebase head's (now
-    #     superseded) state, e.g. a stale merge-ready/green that masquerades as
+    #     pr-review card would keep displaying the prior (now superseded) head's
+    #     state, e.g. a stale merge-ready/green that masquerades as
     #     current. Exact-reread every existing candidate before deciding whether
     #     its card already reflects the final projection. This NEVER creates a card
     #     (creation still defers until checks are terminal), only refreshes a
@@ -813,7 +891,7 @@ def main():
     # 2) Hard-close cards whose target is definitively no longer open. For an
     #    authoritatively still-open target that is outside the maintainer
     #    worklist, require two adjacent complete, conclusive workflow runs before
-    #    the existing soft-close path runs. Failed/truncated/UNKNOWN/CI-wait runs
+    #    the existing soft-close path runs. Failed, truncated, or CI-wait scans
     #    do not mutate the record, but their run-number gap breaks adjacency.
     closed = 0
     for ex in cards_with_state:
@@ -826,9 +904,6 @@ def main():
             continue
         number = int(state.get("number", 0))
         kind = state.get("kind", "pr-review")
-        if kind in PR_KINDS and number in set(r.get("indeterminate_pr_numbers", [])):
-            # UNKNOWN did not settle, so membership is not authoritative.
-            continue
         if kind in PR_KINDS and number in set(r.get("ci_wait_pr_numbers", [])):
             # Fork CI approval/running is another non-membership freeze.
             continue
@@ -851,10 +926,6 @@ def main():
             kind = state.get("kind", "pr-review")
             r = repos.get(repo)
             if not r or not r.get("ok") or r.get("truncated"):
-                continue
-            if kind in PR_KINDS and number in set(
-                r.get("indeterminate_pr_numbers", [])
-            ):
                 continue
             if kind in PR_KINDS and number in set(r.get("ci_wait_pr_numbers", [])):
                 continue
@@ -1105,8 +1176,43 @@ def main():
                 "Self-healed by the scheduled backstop: %s#%s is no longer open "
                 "(merged/closed) - consuming this card." % (repo, number)
             )
+        terminal_state = None
+        remove_labels = ()
+        policy = (current.get("state") or {}).get(
+            render_card.MAINTAINER_EDITS_POLICY_FIELD
+        )
+        if (
+            isinstance(policy, dict)
+            and policy.get("mode") == core.PUSHABILITY_FORK_REJECT
+            and policy.get("phase") == "notice-posted"
+            and isinstance(policy.get("target_comment_id"), int)
+            and policy["target_comment_id"] > 0
+        ):
+            # Recovery for a post-close default-token outage: the successful
+            # complete scan is authoritative proof the target is closed, while
+            # the existing card binds the prior trusted policy notice. Preserve
+            # that terminal provenance atomically rather than generic-hard-close
+            # the audit card without its close result.
+            policy = dict(policy)
+            policy["phase"] = "closed"
+            policy["target_close_result"] = "closed"
+            terminal_state = {render_card.MAINTAINER_EDITS_POLICY_FIELD: policy}
+            remove_labels = {render_card.MAINTAINER_EDITS_CLOSING_LABEL}
+            msg = (
+                "Maintainer-edits contribution policy notice was posted and the "
+                "target PR was closed."
+            )
         try:
-            render_card.close_card(card_number, msg, expected=current)
+            if terminal_state is None:
+                render_card.close_card(card_number, msg, expected=current)
+            else:
+                render_card.close_card(
+                    card_number,
+                    msg,
+                    expected=current,
+                    terminal_state=terminal_state,
+                    remove_labels=remove_labels,
+                )
             closed += 1
         except Exception as e:
             print(

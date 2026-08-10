@@ -198,6 +198,9 @@ AUTOMERGE_WORKFLOW_HOLD_MAX_PATH_LENGTH = 240
 AUTOMERGE_WORKFLOW_HOLD_START = "<!-- wheelhouse-automerge-workflow-hold:start -->"
 AUTOMERGE_WORKFLOW_HOLD_END = "<!-- wheelhouse-automerge-workflow-hold:end -->"
 LIFECYCLE_CONFIRM_LABEL = "wheelhouse:confirming-target-state"
+MAINTAINER_EDITS_REQUIRED_LABEL = "wheelhouse:maintainer-edits-required"
+MAINTAINER_EDITS_CLOSING_LABEL = "wheelhouse:closing-target"
+MAINTAINER_EDITS_POLICY_FIELD = "maintainer_edits_policy"
 LIFECYCLE_START = "<!-- wheelhouse-lifecycle:start -->"
 LIFECYCLE_END = "<!-- wheelhouse-lifecycle:end -->"
 _LIFECYCLE_SECTION_RE = re.compile(
@@ -206,9 +209,19 @@ _LIFECYCLE_SECTION_RE = re.compile(
     re.S,
 )
 SYNCED_EXACT_LABELS = frozenset(
-    {HOLD_LABEL, AUTOMERGE_WORKFLOW_HOLD_LABEL, LIFECYCLE_CONFIRM_LABEL}
+    {
+        HOLD_LABEL,
+        AUTOMERGE_WORKFLOW_HOLD_LABEL,
+        LIFECYCLE_CONFIRM_LABEL,
+        MAINTAINER_EDITS_REQUIRED_LABEL,
+        MAINTAINER_EDITS_CLOSING_LABEL,
+    }
 )
 
+# CARD_RENDER_VERSION 16 -> 17 publishes captain-owned conflict readiness and
+# the maintainer-edits contribution-policy card. It is display/state migration
+# only: mergeability remains informational and policy cards have no controls.
+#
 # The fields whose change makes a card materially stale and worth re-rendering.
 # ``bucket`` and the semantic projection-reference dimensions are material so a
 # current-tense classification cannot silently disagree with its persisted
@@ -225,6 +238,7 @@ MATERIAL_FIELDS = (
     "projection_freshness",
     "projection_head_sha",
     "projection_complete",
+    "pushability",
 )
 PROJECTION_REF_FIELD = "projection_ref"
 REVIEW_OBSERVATION_FIELD = "review_observation"
@@ -253,6 +267,7 @@ CI_SECURITY_SUMMARY_VERSION_FIELD = "ci_security_summary_version"
 CI_SECURITY_SUMMARY_PRESENT_FIELD = "ci_security_summary_present"
 AUTOMERGE_CRITERIA_FIELD = "automerge_criteria"
 AUTOMERGE_CRITERIA_VERSION_FIELD = "automerge_criteria_version"
+MERGE_STATE_DISPLAY_FIELD = "merge_state_display"
 
 # Fixed-K reconcile soft-close hysteresis. This hidden, structured record is
 # non-material and denial-only: it can delay a soft close, but never authorize
@@ -341,7 +356,7 @@ CARD_ADMISSION_ROLLBACK = "rollback"
 # risk wording. These are display-only and zero-spend: no authority, admission,
 # cache-freshness, or gate semantics change. Earlier display-only bumps remain
 # documented in AGENTS.md.
-CARD_RENDER_VERSION = 16
+CARD_RENDER_VERSION = 17
 CONFIRMING_ACCEPT_COPY_SOURCE_VERSION = 13
 ADVISORY_TELEMETRY_CONSISTENCY_SOURCE_VERSION = 14
 
@@ -618,6 +633,39 @@ def marker_label(item):
     return "target:%s-%s" % (item["repo"], item["number"])
 
 
+def maintainer_edits_policy_for_item(item):
+    policy = (item or {}).get(MAINTAINER_EDITS_POLICY_FIELD)
+    if not isinstance(policy, dict):
+        return None
+    version = policy.get("version")
+    if isinstance(version, bool) or version != 1:
+        return None
+    mode = policy.get("mode")
+    if mode not in {core.PUSHABILITY_FORK_REJECT, core.PUSHABILITY_UNVERIFIED}:
+        return None
+    head_sha = policy.get("head_sha")
+    if (
+        not isinstance(head_sha, str)
+        or head_sha != str((item or {}).get("head_sha") or "")
+        or not head_sha
+        and mode != core.PUSHABILITY_UNVERIFIED
+    ):
+        return None
+    if not isinstance(policy.get("source"), dict):
+        return None
+    phase = policy.get("phase")
+    if phase not in {None, "notice-posted"}:
+        return None
+    if phase == "notice-posted" and (
+        mode != core.PUSHABILITY_FORK_REJECT
+        or isinstance(policy.get("target_comment_id"), bool)
+        or not isinstance(policy.get("target_comment_id"), int)
+        or policy["target_comment_id"] < 1
+    ):
+        return None
+    return policy
+
+
 def card_labels(item, held=False, workflow_hold=False, lifecycle_confirming=False):
     labels = [
         "needs-decision",
@@ -632,10 +680,22 @@ def card_labels(item, held=False, workflow_hold=False, lifecycle_confirming=Fals
         labels.append(AUTOMERGE_WORKFLOW_HOLD_LABEL)
     if lifecycle_confirming:
         labels.append(LIFECYCLE_CONFIRM_LABEL)
+    policy = maintainer_edits_policy_for_item(item)
+    if policy:
+        labels.append(MAINTAINER_EDITS_REQUIRED_LABEL)
+        if (
+            policy.get("mode") == "fork-reject"
+            and policy.get("phase") == "notice-posted"
+            and isinstance(policy.get("target_comment_id"), int)
+            and policy["target_comment_id"] > 0
+        ):
+            labels.append(MAINTAINER_EDITS_CLOSING_LABEL)
     return labels
 
 
 def card_options(item):
+    if maintainer_edits_policy_for_item(item):
+        return []
     kind = item.get("kind", "pr-review")
     return checkbox_options(kind, item.get("options"))
 
@@ -733,6 +793,7 @@ def material_signature(item, owner=None):
         "projection_complete": (
             projection.get("complete") if projection else False
         ),
+        "pushability": str(item.get("pushability") or ""),
     }
 
 
@@ -820,6 +881,27 @@ def security_summary_stale(item, state):
         or (state or {}).get(CI_SECURITY_SUMMARY_DIFF_FIELD)
         != item.get(CI_SECURITY_SUMMARY_DIFF_FIELD)
     )
+
+
+def merge_state_display_stale(item, state):
+    if item.get("kind", "pr-review") != "pr-review" or "mergeable" not in item:
+        return False
+    incoming = str(item.get("mergeable") or "").strip().lower()
+    return (state or {}).get(MERGE_STATE_DISPLAY_FIELD) != incoming
+
+
+def maintainer_edits_policy_stale(item, state):
+    """Whether a verified policy notice changed an existing inert card.
+
+    The source mode itself is material through ``pushability``. The notice ID
+    and phase are operational evidence, so they deliberately trigger only this
+    narrow display/state refresh rather than making every ordinary card carry a
+    policy material field.
+    """
+    incoming = maintainer_edits_policy_for_item(item)
+    if incoming is None:
+        return False
+    return (state or {}).get(MAINTAINER_EDITS_POLICY_FIELD) != incoming
 
 
 def automerge_criteria_stale(item, state):
@@ -933,6 +1015,8 @@ def refresh_needed(item, state, has_token=False, labels=None, card_title=None):
         or render_stale(state)
         or held_publish_needed(item, state, has_token)
         or security_summary_stale(item, state)
+        or merge_state_display_stale(item, state)
+        or maintainer_edits_policy_stale(item, state)
         or automerge_criteria_stale(item, state)
         or option_b_projection_stale(item, state)
         or workflow_hold_maintenance_needed(item, state, labels)
@@ -3803,6 +3887,8 @@ def accept_recommendation_available(state):
 
 
 def options_for_state(kind, options, state):
+    if (state or {}).get(MAINTAINER_EDITS_POLICY_FIELD):
+        return []
     cleaned = rendered_checkbox_options(kind, options)
     if accept_recommendation_available(state):
         cleaned = [o for o in cleaned if o != ACCEPT_RECOMMENDATION_OPTION]
@@ -5908,6 +5994,9 @@ def render(
     if projection_ref:
         state[PROJECTION_REF_FIELD] = projection_ref
     if kind == "pr-review":
+        state[MERGE_STATE_DISPLAY_FIELD] = str(
+            item.get("mergeable") or ""
+        ).strip().lower()
         if review_observation and decision_context:
             state[PROJECTION_OWNER_FIELD] = PROJECTION_OWNER
         if review_observation:
@@ -5946,6 +6035,12 @@ def render(
         state["held"] = True
     if workflow_hold:
         state[AUTOMERGE_WORKFLOW_HOLD_FIELD] = workflow_hold
+    policy = maintainer_edits_policy_for_item(item)
+    if policy:
+        # Policy records are deterministic scanner facts, never a decision
+        # input. They make the card inert while the separate target-close
+        # transaction verifies and applies the contributor-facing notice.
+        state[MAINTAINER_EDITS_POLICY_FIELD] = policy
     if triage:
         state["triaged_sha"] = item.get("triaged_sha") or triage_revision(item)
         state["triage_status"] = "succeeded"
@@ -6000,6 +6095,15 @@ def render(
     lines.append("### Situation")
     lines.append("- Compliance: `%s`" % item.get("comp", "n/a"))
     lines.append("- Tests: `%s`" % item.get("tests", "n/a"))
+    if kind == "pr-review" and item.get("mergeable"):
+        merge_state = str(item.get("mergeable") or "").strip().lower()
+        if merge_state == "conflicting":
+            lines.append(
+                "- Merge state: `conflicting` - informational only; the captain "
+                "handles conflict resolution and contributors are not asked to rebase."
+            )
+        else:
+            lines.append("- Merge state: `%s` (informational)" % core._safe_inline(merge_state))
     if review_observation:
         checks = review_observation["facts"]["configured_checks"]
         if review_observation["completeness"]["configured_checks"]:
@@ -6042,13 +6146,13 @@ def render(
     if item.get("summary"):
         lines.append("- Notes: %s" % item["summary"])
     lines.append("")
-    if kind == "pr-review":
+    if kind == "pr-review" and not policy:
         lines.extend(_related_work_section(decision_context))
         lines.append("")
     if workflow_hold:
         lines.extend(_automerge_workflow_hold_section(workflow_hold))
         lines.append("")
-    if kind == "pr-review":
+    if kind == "pr-review" and not policy:
         lines.extend(
             _automerge_criteria_section(
                 state.get(AUTOMERGE_CRITERIA_FIELD)
@@ -6072,6 +6176,41 @@ def render(
     if kind == "ci-approval" and item.get("security_summary"):
         lines.extend(_security_review_section(item["security_summary"]))
         lines.append("")
+    if policy:
+        if policy.get("mode") == "fork-reject":
+            if policy.get("phase") == "notice-posted":
+                copy = (
+                    "This PR is being closed because its fork branch does not grant "
+                    "the maintainer-push path required for small in-place conflict "
+                    "resolution. The contributor-facing policy notice was posted before "
+                    "the target-close transaction."
+                )
+            else:
+                copy = (
+                    "This PR cannot be closed yet because the required contributor-facing "
+                    "policy notice has not been verified. This retryable operational card "
+                    "has no decision controls."
+                )
+            lines.extend(
+                [
+                    "### Contribution requirement",
+                    "",
+                    copy,
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "### Source permission check",
+                    "",
+                    "Wheelhouse could not verify whether this fork grants the required "
+                    "maintainer-push path. This retryable card is intentionally inert: "
+                    "it will not approve CI, contact the contributor, close the PR, or "
+                    "start model work until a complete source read is available.",
+                    "",
+                ]
+            )
     if triage:
         current_authority = accept_recommendation_available(state)
         section = triage_section(
@@ -6113,7 +6252,21 @@ def render(
             )
         )
         lines.append("")
-    lines.append(_decision_section(kind, options, held))
+    if policy:
+        lines.append(
+            "\n".join(
+                [
+                    DECISION_START,
+                    "### Your decision",
+                    "",
+                    "_No captain action is available while the source-branch policy "
+                    "transaction is pending._",
+                    DECISION_END,
+                ]
+            )
+        )
+    else:
+        lines.append(_decision_section(kind, options, held))
     lines.append("")
     lines.append("<!-- wheelhouse-state: %s -->" % _serialize_state(state))
     body = "\n".join(lines)
@@ -6444,13 +6597,14 @@ def _trusted_target_state(issue, item):
         raise CardLifecycleError("card #%s target labels are ambiguous" % number)
     if repo_labels != {"repo:%s" % item["repo"]}:
         raise CardLifecycleError("card #%s repo labels are ambiguous" % number)
-    if "kind:%s" % kind not in names:
-        raise CardLifecycleError("card #%s kind label does not match state" % number)
+    kind_labels = {name for name in names if name.startswith("kind:")}
+    if kind_labels != {"kind:%s" % kind}:
+        raise CardLifecycleError("card #%s kind labels are ambiguous" % number)
     return state
 
 
-def _trusted_open_target_card(issue, item):
-    _trusted_target_state(issue, item)
+def trusted_open_target_card(issue, item):
+    state = _trusted_target_state(issue, item)
     login = ((issue or {}).get("author") or {}).get("login", "")
     if not _trusted_automation_login(login):
         raise CardLifecycleError(
@@ -6459,7 +6613,7 @@ def _trusted_open_target_card(issue, item):
         )
     if str(issue.get("state") or "").upper() != "OPEN":
         raise CardLifecycleError("card #%s is no longer open" % issue.get("number"))
-    return True
+    return state
 
 
 def reusable_closed_card(issue, item):
@@ -6543,7 +6697,7 @@ def lookup_card_lifecycle(item):
             % (marker, ", ".join("#%s" % row["number"] for row in open_rows))
         )
     if open_rows:
-        _trusted_open_target_card(open_rows[0], item)
+        trusted_open_target_card(open_rows[0], item)
         return {"open": open_rows[0], "reusable": None}
 
     reusable = []
@@ -6590,6 +6744,65 @@ def _edit_issue_body_and_labels(
         _gh(args)
     finally:
         os.unlink(body_path)
+
+
+def _commit_maintainer_edits_policy_card(item, existing, has_token=False):
+    number = int(existing["number"])
+    card = render(item, held=False, has_token=None)
+    ensure_labels(card["labels"])
+    current = _get_lifecycle_issue(number)
+    trusted_open_target_card(current, item)
+    if not _card_matches_expected(current, existing):
+        raise CardLifecycleError(
+            "card #%s changed before maintainer-edits policy transition" % number
+        )
+    current_names = _lifecycle_label_names(current)
+    to_add, to_remove = plan_label_update(card["labels"], current.get("labels"))
+    to_remove = sorted(
+        set(to_remove) | current_names.intersection(NON_REFRESHABLE_LABELS)
+    )
+    expected_labels = (current_names | set(to_add)) - set(to_remove)
+    if not (
+        current.get("title") == card["title"]
+        and current.get("body") == card["body"]
+        and current_names == expected_labels
+    ):
+        body_path = _write_body(card["body"])
+        try:
+            args = [
+                "issue",
+                "edit",
+                str(number),
+                "--body-file",
+                body_path,
+                "--title",
+                card["title"],
+            ]
+            for label in to_add:
+                args += ["--add-label", label]
+            for label in to_remove:
+                args += ["--remove-label", label]
+            _gh(args)
+        finally:
+            os.unlink(body_path)
+    verified = _get_lifecycle_issue(number)
+    trusted_state = trusted_open_target_card(verified, item)
+    if not _prepared_lifecycle_matches(
+        verified,
+        card["body"],
+        expected_labels,
+        "OPEN",
+        title=card["title"],
+    ) or trusted_state.get(MAINTAINER_EDITS_POLICY_FIELD) != item.get(
+        MAINTAINER_EDITS_POLICY_FIELD
+    ):
+        raise CardLifecycleError(
+            "card #%s maintainer-edits policy transition was not verified" % number
+        )
+    print("refreshed card #%s for %s as inert maintainer-edits policy" % (
+        number, card["marker"]
+    ))
+    return number
 
 
 def _reused_card_render(item, candidate, has_token):
@@ -6678,7 +6891,7 @@ def _verify_direct_open_card(
                     should_rollback=True,
                     number=number,
                 )
-            _trusted_open_target_card(direct, item)
+            trusted_open_target_card(direct, item)
             if not _prepared_lifecycle_matches(
                 direct,
                 expected_body,
@@ -6808,7 +7021,7 @@ def verify_unique_open_card(
             if row["number"] == number:
                 continue
             try:
-                _trusted_open_target_card(row, item)
+                trusted_open_target_card(row, item)
             except CardLifecycleError as peer_error:
                 detail = "%s; peer #%s untrusted: %s" % (
                     detail,
@@ -9049,6 +9262,7 @@ def upsert_card(
     (e.g. `get_card`/`current_card`) - a label-filtered `find_card` listing is
     not read-after-write consistent immediately after creation."""
     marker = marker_label(item)
+    policy_item = maintainer_edits_policy_for_item(item) is not None
     known_number = (existing or {}).get("number")
     if known_number:
         existing = get_card(known_number)
@@ -9064,7 +9278,7 @@ def upsert_card(
         try:
             lifecycle = lookup_card_lifecycle(item)
             existing = lifecycle["open"]
-            if lifecycle["reusable"] is not None:
+            if lifecycle["reusable"] is not None and not policy_item:
                 return reuse_closed_card(
                     item, lifecycle["reusable"], has_token=has_token
                 )
@@ -9079,7 +9293,9 @@ def upsert_card(
         v2_observation = target_contracts.normalize_review_observation(
             item.get("review_observation") or item.get("target_observation")
         )
-        if item.get("kind", "pr-review") == "pr-review":
+        if policy_item:
+            card = render(item, held=False, has_token=None)
+        elif item.get("kind", "pr-review") == "pr-review":
             if not v2_observation:
                 print(
                     "::warning::defer card creation for %s: current PR observation "
@@ -9127,6 +9343,10 @@ def upsert_card(
             raise
 
     number = existing["number"]
+    if policy_item:
+        return _commit_maintainer_edits_policy_card(
+            item, existing, has_token=has_token
+        )
     if not is_refreshable(existing.get("labels")):
         print(
             "skip card #%s for %s: decision in flight (not pure needs-decision)"
@@ -9259,7 +9479,20 @@ def upsert_card(
     )
 
 
-def close_card(number, message, label="resolved", expected=None):
+def close_card(
+    number,
+    message,
+    label="resolved",
+    expected=None,
+    terminal_state=None,
+    remove_labels=(),
+):
+    """Comment then atomically close a card, optionally recording terminal state.
+
+    `terminal_state` is merged into the one trusted state block in the same
+    PATCH that closes the card. This lets a policy/audit card bind a completed
+    target action without a window where a closed card lacks its evidence.
+    """
     ensure_labels([label])
     _gh(["issue", "comment", str(number), "--body", message], check=False)
     current = _get_lifecycle_issue(number)
@@ -9271,8 +9504,15 @@ def close_card(number, message, label="resolved", expected=None):
         or current.get("comments") != int(expected.get("comments") or 0) + 1
     ):
         raise CardLifecycleError("card #%s changed before close" % number)
+    body = current.get("body", "")
+    if terminal_state is not None:
+        state = _unique_state_block(body)
+        if not state or not isinstance(terminal_state, dict):
+            raise CardLifecycleError("card #%s terminal state is malformed" % number)
+        state.update(terminal_state)
+        body = _replace_state_block(body, state)
     labels = _lifecycle_label_names(current)
-    expected_labels = (labels | {label}) - {"needs-decision"}
+    expected_labels = (labels | {label}) - {"needs-decision", *set(remove_labels)}
     args = [
         "api",
         "--method",
@@ -9281,6 +9521,8 @@ def close_card(number, message, label="resolved", expected=None):
         "-f",
         "state=closed",
     ]
+    if body != current.get("body", ""):
+        args += ["-f", "body=%s" % body]
     for name in sorted(expected_labels):
         args += ["-f", "labels[]=%s" % name]
     result = _gh(args)
@@ -9290,9 +9532,7 @@ def close_card(number, message, label="resolved", expected=None):
         raise CardLifecycleError(
             "card #%s close returned an invalid issue: %s" % (number, error)
         ) from error
-    if not _prepared_lifecycle_matches(
-        closed, current.get("body", ""), expected_labels, "CLOSED"
-    ):
+    if not _prepared_lifecycle_matches(closed, body, expected_labels, "CLOSED"):
         raise CardLifecycleError("card #%s did not close atomically" % number)
 
 

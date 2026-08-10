@@ -5,7 +5,7 @@ This doc is the optional **fast path**: add a tiny dispatch workflow to a source
 
 Nothing here is required to run the machine, and nothing here changes how Wheelhouse classifies items - a dispatch is just a low-latency nudge that creates or safely reuses a card, refreshes a pure pending card when material state has changed, updates the hidden activity stamp when the target `updatedAt` advanced, re-renders when Wheelhouse's internal card render version is stale, or publishes a held card when auto triage is no longer eligible; the backstop still reconciles everything later.
 The scheduled scan applies Wheelhouse's owner/maintainer/bot author filter, but this explicit dispatch path trusts the source workflow and does not re-check author type, so only dispatch items you want carded.
-The scheduled scan also applies merge-conflict `needs-rebase` routing and rebase nudges; explicit dispatches do not, so the backstop may later consume a dispatched PR-review card for a PR GitHub reports as `CONFLICTING`.
+The scheduled scan treats mergeability as display-only, so both dispatched and scan-built conflicted PR-review cards remain in the captain's queue. Contributors are never asked to rebase.
 An ingest dispatch never performs scan-time auto-merge; this fork enables `auto_merge` fleet-wide, but only a later `scan-backstop` pass can evaluate a target repository after it has practically opted in with a non-empty default-branch `VISION.md` and every live safety gate passes.
 For PR-review and issue-triage cards, ingest can also queue the automatic lightweight triage side job after the upsert step, using the same config, token gates, and spend guards as the scheduled scan.
 That includes a newly created card: the hub threads the issue number from the upsert step into the queueing step and reads the card back by number, so the first eligible triage attempt is queued in the same run.
@@ -17,7 +17,7 @@ For any kind, a new `updated_at` can make a hidden state-only card edit for acti
 
 > You add these files to **your source repos**, not to Wheelhouse.
 > The dispatch path reads source-repo state only.
-> The scheduled scan can post a deterministic merge-conflict nudge and, when stale pending-contributor cleanup is enabled, a reminder or close; it can also execute a decision you made.
+> The scheduled scan can perform stale cleanup only after your explicit `/request-changes` review; it never asks contributors to rebase. It can also execute a decision you made.
 
 ## The dispatch contract
 
@@ -55,7 +55,7 @@ For `issue-triage`, `updated_at` is also the triage revision because issues have
 
 Default checkbox sets are `pr-review`: `merge,close,investigate,hold`; `ci-approval`: `approve-ci,close,hold`; and `issue-triage`: `close,investigate,hold`.
 Like a scan-created `pr-review` card, a dispatched card never API-merges a PR that touched `.github/workflows/**` in its net diff or commit history, including a rename into or out of that directory.
-`FLEET_TOKEN` intentionally has no Workflows write, so that refusal leaves the card open and `blocked` with GitHub UI merge guidance (will not API-merge); merge by hand, or after a rebase removes every workflow touch retry `/merge` once the card is actionable again.
+`FLEET_TOKEN` intentionally has no Workflows write, so that refusal leaves the card open and `blocked` with GitHub UI merge guidance (will not API-merge); merge by hand, or after a new head removes every workflow touch retry `/merge` once the card is actionable again.
 Do not send `accept-recommendation` in `options`; Wheelhouse inserts that checkbox only from a fresh successful structured auto-triage recommendation, and never for `ci-approval`.
 `investigate` is non-consuming: it triggers the code-grounded deep-review workflow, clears the box, and leaves the card open for the real decision.
 If you override `options`, include `investigate` only on `pr-review` or `issue-triage` cards when you want that box.
@@ -82,6 +82,10 @@ If `triage.yml` fails before its update step, see the [pending-triage troublesho
 For a newly created card, that queueing happens in the same ingest run, not only on the later hourly scan.
 
 > **Legacy event type.** Before the rename to Wheelhouse the event type was `triage-item`. `ingest.yml` still listens for both (`types: [wheelhouse-item, triage-item]`), so a source repo wired up before the rename keeps working - but new dispatchers should send `wheelhouse-item`.
+
+## Fork contribution policy
+
+Add the [fork contribution requirement](../CONTRIBUTING.md#pull-requests-from-forks) to each fleet repository's `CONTRIBUTING.md`. The README owns the [source-permission policy](../README.md#security-notes) and [future assisted-merge credential](../README.md#future-assisted-merge-credential) contracts.
 
 ## Token for the source side
 
@@ -149,28 +153,19 @@ jobs:
 ### Notes
 
 - **Injection-safe by construction.** GitHub context values are passed through `env:` and read by `jq --arg`, never interpolated into the shell - a hostile PR title cannot break out.
-- **PR-review merge conflicts.** Ingest dispatches create cards from the payload; they do not read GraphQL `mergeable` or post rebase nudges.
-  The scheduled scan later treats `CONFLICTING` PRs as `needs-rebase`, posts any contributor nudge, and sends stale pure pending cards through the [scheduled backstop lifecycle](../README.md#daily-use).
-  After a base-branch push, GitHub can temporarily return `UNKNOWN` while it recalculates mergeability.
-  The scan polls that pending value before changing membership; if it cannot settle it, it leaves any existing card unchanged rather than creating or consuming a card from an indeterminate answer.
+- **PR-review merge conflicts.** Ingest dispatches create cards from the payload; mergeability is not an input. The scheduled scan keeps a `CONFLICTING` or `UNKNOWN` PR in the same queue classification and presents merge state as informational context. It never posts a contributor rebase nudge or closes a PR for rebase inactivity.
 - **`ci-approval` items.** If you want every fork-CI approval to surface fast, add a job that dispatches with `kind:"ci-approval"` when a run reaches `action_required` (e.g. on `workflow_run`).
   Ingest dispatches create, safely reuse, refresh, or activity-reflect a card immediately; they do not run the scan-time `auto_approve_ci` path or the scan author filter.
   Only a scan-created contributor card that holds for changed workflow/action files receives the deterministic, read-only *Security review (advisory)* section; it is context for the unchanged manual hold, not a dispatch-payload feature or an approval.
   If you want provably-safe runs auto-cleared instead of carded, rely on `scan-backstop` for CI approvals.
   If the scan later verifies that no matching run is awaiting approval, it normally emits no worklist item and any stale CI-approval card follows the [scheduled backstop lifecycle](../README.md#daily-use).
-  For a contributor fork whose safe approval returns that no-op result and whose mergeability conclusively settles to `CONFLICTING`, the scan keeps the CI-approval classification and emits no card, but posts the ordinary fire-once-per-head rebase nudge before consuming the target from the worklist.
-  It never sends that nudge for an actually approved CI run, a missing or unresolved mergeability value, or a failed mergeability settlement, and this exception does not write the structured pending-contributor cleanup state.
-  A failed settlement marks the repo scan unhealthy, so reconcile preserves existing cards instead of consuming them.
+  A no-op approval does not contact the contributor about mergeability and does not create stale-cleanup state.
   The `scan-backstop` logs emit one notice for each approved or no-pending run, one `wheelhouse auto-approve carded ...` warning for each contributor run that becomes a card, or one `wheelhouse auto-approve suppressed-card ...` warning for each owner, maintainer, or bot run that cannot be approved and does not emit a card.
   Warnings include the safety or uncertainty reason and any approval status/message.
   When you do approve a card, the hub still applies the same gate: CI/action-file changes are held, and non-default bases or `pull_request_target` posture are surfaced as warnings.
   It also approves only `action_required` workflow runs bound to the target PR: populated `workflow_run.pull_requests` must name exactly that PR, while fork-originated empty associations must match the PR head SHA plus head branch.
   For the exact per-run approval contract, see the [Security notes](../README.md#security-notes).
-- **Conflicting ci-noop fork PRs.** This is a scheduled-scan cleanup exception, not a dispatch behavior.
-  When stale pending-contributor cleanup is enabled, a cross-repo PR in the `needs-ci-approval` ci-noop route can follow the stale rebase-nudge lifecycle only when a trusted rebase nudge is proven and GitHub currently reports it as `CONFLICTING`.
-  The scan reads mergeability again immediately before it posts a reminder or closes the PR, so non-conflicting, `UNKNOWN`, or unreadable targets stay out of that lifecycle.
-  A normal `ci-approval` item or dispatch does not create this exception.
-  See [Pending-contributor cleanup](../README.md#security-notes) for the full cleanup and clear-only contract.
+- **Pending contributor cleanup.** This is a scheduled-scan behavior, not a dispatch behavior. It applies only to a provable captain `/request-changes` review. Conflicts, CI routing, and historical rebase nudges do not create a reminder or close path. See [Pending-contributor cleanup](../README.md#security-notes) for the full fail-open contract.
 - **Issues.** To push issue triage, dispatch with `kind:"issue-triage"` from an `issues` trigger and include `updated_at` from the issue's `updated_at` event field when you want activity sorting and automatic issue-card triage caching.
   The hub also cards issues from the backstop when `card_issues: true`, skipping owner, maintainer, and bot-authored issues in the scan-built worklist.
 - **Third-party alternative.** If you prefer, `peter-evans/repository-dispatch` does the same dispatch as an action; the `gh api` form above keeps you dependency-free.

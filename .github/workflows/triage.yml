@@ -435,9 +435,27 @@ jobs:
             echo "head_ok=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - id: source-policy
+        name: Recheck source permission before model admission
+        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.verify_head.outputs.head_ok != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue source-policy reconciliation
+        if: ${{ steps.source-policy.outputs.admitted == 'false' && (steps.source-policy.outputs.mode == 'fork-reject' || steps.source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       - id: source-evidence
         name: Build bounded exact-revision target source evidence
-        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.verify_head.outputs.head_ok != 'false'
+        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.verify_head.outputs.head_ok != 'false' && steps.source-policy.outputs.admitted == 'true'
         run: |
           set -euo pipefail
           revision="$(git -C target-src rev-parse HEAD)"
@@ -448,7 +466,7 @@ jobs:
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
       - id: readonly
-        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.verify_head.outputs.head_ok != 'false'
+        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.verify_head.outputs.head_ok != 'false' && steps.source-policy.outputs.admitted == 'true'
         env:
           HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
         run: |
@@ -461,7 +479,7 @@ jobs:
 
       - id: event-freshness
         name: Verify queued target context before durable claim
-        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true'
+        if: steps.gate.outputs.enabled == 'true' && steps.resolve.outputs.skip != 'true' && steps.source-policy.outputs.admitted == 'true'
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           CARD_TOKEN: ${{ github.token }}
@@ -500,95 +518,8 @@ jobs:
             fi
           fi
 
-      - id: event-claim
-        name: Claim the exact triage revision before spend
-        if: steps.event-freshness.outputs.fresh == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ steps.resolve.outputs.repo }}
-          NUMBER: ${{ steps.resolve.outputs.number }}
-          ISSUE: ${{ steps.resolve.outputs.issue }}
-          KIND: ${{ steps.resolve.outputs.kind }}
-          REVISION: ${{ steps.resolve.outputs.revision }}
-          HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
-          REPO_SLUG: ${{ github.repository }}
-          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
-          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
-        run: |
-          set -euo pipefail
-          if [ "$KIND" = "issue-triage" ]; then action="triage.issue"; else action="triage.pr"; fi
-          if [ "$HAS_READONLY_TOKEN" = "true" ]; then action="${action}.search"; else action="${action}.local"; fi
-          echo "action=$action" >> "$GITHUB_OUTPUT"
-          claim_context=()
-          if [ "$KIND" = "pr-review" ]; then
-            claim_context=(--review-context "$REVIEW_CONTEXT")
-            if [ -n "$RECOVERY_CONTEXT" ]; then
-              claim_context+=(--recovery-context "$RECOVERY_CONTEXT")
-            fi
-          fi
-          python scripts/agent_claim.py \
-            --action "$action" --owner "$OWNER" --repo "$REPO" \
-            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
-            "${claim_context[@]}" --repo-slug "$REPO_SLUG"
-
-      - name: Record triage admission stage
-        if: always() && steps.event-claim.outputs.event_key != ''
-        run: |
-          status="skipped"; code="admission.duplicate"
-          if [ "${{ steps.event-claim.outputs.admitted }}" = "true" ]; then status="ok"; code="admission.admitted"; fi
-          python scripts/agent_runtime.py stage \
-            --action "${{ steps.event-claim.outputs.action }}" \
-            --source-sha "${{ github.sha }}" \
-            --event-key "${{ steps.event-claim.outputs.event_key }}" \
-            --stage admitted --status "$status" --code "$code"
-
-      - id: admission-denial-consumer
-        name: Record an exact-revision admission denial on the card
-        if: ${{ always() && steps.event-claim.outputs.event_key != '' && steps.event-claim.outputs.admitted == 'false' && steps.trusted-src.outputs.path != '' }}
-        working-directory: ${{ steps.trusted-src.outputs.path }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
-          WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
-          ISSUE: ${{ steps.resolve.outputs.issue }}
-          REVISION: ${{ steps.resolve.outputs.revision }}
-          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
-          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
-          TRUSTED_HOME: ${{ runner.temp }}/wheelhouse-gh-home
-          GH_REPO: ${{ github.repository }}
-          GH_PROMPT_DISABLED: "1"
-          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          PATH: ${{ steps.trusted-src.outputs.safe_path }}
-          BASH_ENV: ""
-          ENV: ""
-          LD_PRELOAD: ""
-          LD_LIBRARY_PATH: ""
-          PYTHONHOME: ""
-          PYTHONPATH: ""
-        run: |
-          set -euo pipefail
-          mkdir -p "$TRUSTED_HOME"
-          env -i \
-            PATH="$TRUSTED_PATH" \
-            PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONNOUSERSITE=1 \
-            HOME="$TRUSTED_HOME" \
-            GH_TOKEN="$GH_TOKEN" \
-            WHEELHOUSE_FLEET_TOKEN="$WHEELHOUSE_FLEET_TOKEN" \
-            WHEELHOUSE_AUTOMERGE_HAS_TOKEN="$WHEELHOUSE_AUTOMERGE_HAS_TOKEN" \
-            GH_REPO="$GH_REPO" \
-            GH_PROMPT_DISABLED="$GH_PROMPT_DISABLED" \
-            GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
-            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
-            "$TRUSTED_PYTHON" scripts/render_card.py triage-fail \
-              --issue "$ISSUE" \
-              --revision "$REVISION" \
-              --message "Auto triage did not run because exact-revision admission was denied (admission.duplicate)." \
-              --queued-only
-
       - id: prepare
-        if: steps.event-claim.outputs.admitted == 'true'
+        if: steps.event-freshness.outputs.fresh == 'true'
         env:
           FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
           NUMBER: ${{ steps.resolve.outputs.number }}
@@ -965,11 +896,143 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - id: search-tool
-        if: ${{ steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' && steps.readonly.outputs.enabled == 'true' }}
+        if: ${{ steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' && steps.readonly.outputs.enabled == 'true' }}
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           TARGET_REPO: ${{ steps.resolve.outputs.slug }}
         run: echo "repos=$(python scripts/nl_readonly_search.py scope)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the pinned Codex sandboxed adapter worker
+        if: ${{ steps.event-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
+        env:
+          CODEX_PREFIX: ${{ runner.temp }}/wheelhouse-codex
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          case "$(uname -m)" in
+            x86_64) platform="linux-x64" ;;
+            aarch64|arm64) platform="linux-arm64" ;;
+            *) echo "::error::unsupported Codex runner architecture"; exit 1 ;;
+          esac
+          platform_package="@openai/codex@0.144.0-${platform}"
+          tarball_dir="${RUNNER_TEMP}/wheelhouse-codex-tarballs"
+          mkdir -p "$tarball_dir"
+          tarball="$tarball_dir/$(npm pack --silent --pack-destination "$tarball_dir" @openai/codex@0.144.0)"
+          platform_tarball="$tarball_dir/$(npm pack --silent --pack-destination "$tarball_dir" "$platform_package")"
+          python scripts/agent_runtime.py verify-package --package @openai/codex@0.144.0 --platform "$platform" --platform-package "$platform_package" --tarball "$tarball" --platform-tarball "$platform_tarball"
+          npm install --offline --ignore-scripts --omit=optional --no-audit --no-fund --prefix "$CODEX_PREFIX" "$tarball"
+          platform_dir="$CODEX_PREFIX/node_modules/@openai/codex-${platform}"
+          mkdir -p "$platform_dir"
+          tar -xzf "$platform_tarball" --strip-components=1 -C "$platform_dir"
+          echo "$CODEX_PREFIX/node_modules/.bin" >> "$GITHUB_PATH"
+          "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
+          python scripts/agent_runtime.py verify-pins
+
+      - id: task-source-policy
+        name: Recheck source permission at task admission
+        if: ${{ steps.event-freshness.outputs.fresh == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue task-admission source-policy reconciliation
+        if: ${{ steps.task-source-policy.outputs.admitted == 'false' && (steps.task-source-policy.outputs.mode == 'fork-reject' || steps.task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - id: event-claim
+        name: Claim the exact triage revision before spend
+        if: steps.task-source-policy.outputs.admitted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.resolve.outputs.repo }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+          ISSUE: ${{ steps.resolve.outputs.issue }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
+          HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
+          REPO_SLUG: ${{ github.repository }}
+          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = "issue-triage" ]; then action="triage.issue"; else action="triage.pr"; fi
+          if [ "$HAS_READONLY_TOKEN" = "true" ]; then action="${action}.search"; else action="${action}.local"; fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          claim_context=()
+          if [ "$KIND" = "pr-review" ]; then
+            claim_context=(--review-context "$REVIEW_CONTEXT")
+            if [ -n "$RECOVERY_CONTEXT" ]; then
+              claim_context+=(--recovery-context "$RECOVERY_CONTEXT")
+            fi
+          fi
+          python scripts/agent_claim.py \
+            --action "$action" --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            "${claim_context[@]}" --repo-slug "$REPO_SLUG"
+
+      - name: Record triage admission stage
+        if: always() && steps.event-claim.outputs.event_key != ''
+        run: |
+          status="skipped"; code="admission.duplicate"
+          if [ "${{ steps.event-claim.outputs.admitted }}" = "true" ]; then status="ok"; code="admission.admitted"; fi
+          python scripts/agent_runtime.py stage \
+            --action "${{ steps.event-claim.outputs.action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ steps.event-claim.outputs.event_key }}" \
+            --stage admitted --status "$status" --code "$code"
+
+      - id: admission-denial-consumer
+        name: Record an exact-revision admission denial on the card
+        if: ${{ always() && steps.event-claim.outputs.event_key != '' && steps.event-claim.outputs.admitted == 'false' && steps.trusted-src.outputs.path != '' }}
+        working-directory: ${{ steps.trusted-src.outputs.path }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          ISSUE: ${{ steps.resolve.outputs.issue }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
+          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
+          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          TRUSTED_HOME: ${{ runner.temp }}/wheelhouse-gh-home
+          GH_REPO: ${{ github.repository }}
+          GH_PROMPT_DISABLED: "1"
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          PYTHONHOME: ""
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "$TRUSTED_HOME"
+          env -i \
+            PATH="$TRUSTED_PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            HOME="$TRUSTED_HOME" \
+            GH_TOKEN="$GH_TOKEN" \
+            WHEELHOUSE_FLEET_TOKEN="$WHEELHOUSE_FLEET_TOKEN" \
+            WHEELHOUSE_AUTOMERGE_HAS_TOKEN="$WHEELHOUSE_AUTOMERGE_HAS_TOKEN" \
+            GH_REPO="$GH_REPO" \
+            GH_PROMPT_DISABLED="$GH_PROMPT_DISABLED" \
+            GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            "$TRUSTED_PYTHON" scripts/render_card.py triage-fail \
+              --issue "$ISSUE" \
+              --revision "$REVISION" \
+              --message "Auto triage did not run because exact-revision admission was denied (admission.duplicate)." \
+              --queued-only
 
       - id: claude-task
         name: Build the immutable Claude triage AgentTask
@@ -1030,33 +1093,6 @@ jobs:
           bundle: ${{ steps.claude-task.outputs.bundle }}
           invocation-id: triage
           allowed-repos: ${{ steps.search-tool.outputs.repos || '[]' }}
-
-      - name: Prepare the pinned Codex sandboxed adapter worker
-        if: ${{ steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'codex' }}
-        env:
-          CODEX_PREFIX: ${{ runner.temp }}/wheelhouse-codex
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bubblewrap
-          case "$(uname -m)" in
-            x86_64) platform="linux-x64" ;;
-            aarch64|arm64) platform="linux-arm64" ;;
-            *) echo "::error::unsupported Codex runner architecture"; exit 1 ;;
-          esac
-          platform_package="@openai/codex@0.144.0-${platform}"
-          tarball_dir="${RUNNER_TEMP}/wheelhouse-codex-tarballs"
-          mkdir -p "$tarball_dir"
-          tarball="$tarball_dir/$(npm pack --silent --pack-destination "$tarball_dir" @openai/codex@0.144.0)"
-          platform_tarball="$tarball_dir/$(npm pack --silent --pack-destination "$tarball_dir" "$platform_package")"
-          python scripts/agent_runtime.py verify-package --package @openai/codex@0.144.0 --platform "$platform" --platform-package "$platform_package" --tarball "$tarball" --platform-tarball "$platform_tarball"
-          npm install --offline --ignore-scripts --omit=optional --no-audit --no-fund --prefix "$CODEX_PREFIX" "$tarball"
-          platform_dir="$CODEX_PREFIX/node_modules/@openai/codex-${platform}"
-          mkdir -p "$platform_dir"
-          tar -xzf "$platform_tarball" --strip-components=1 -C "$platform_dir"
-          echo "$CODEX_PREFIX/node_modules/.bin" >> "$GITHUB_PATH"
-          "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
-          python scripts/agent_runtime.py verify-pins
 
       - id: agent-runtime-task
         name: Build the immutable triage AgentTask
@@ -1242,31 +1278,6 @@ jobs:
           TARGET_REPO: ${{ steps.resolve.outputs.repo }}
         run: python scripts/agent_runtime.py auth-status --action triage.schema-repair --repo "$TARGET_REPO"
 
-      - id: repair-claim
-        name: Claim the exact schema-repair revision before spend
-        if: ${{ always() && steps.repair-prep.outputs.repair_needed == 'true' && steps.repair-gate.outputs.enabled == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ steps.resolve.outputs.repo }}
-          NUMBER: ${{ steps.resolve.outputs.number }}
-          ISSUE: ${{ steps.resolve.outputs.issue }}
-          REVISION: ${{ steps.resolve.outputs.revision }}
-          KIND: ${{ steps.resolve.outputs.kind }}
-          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
-          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
-          REPO_SLUG: ${{ github.repository }}
-        run: |
-          context=()
-          if [ "$KIND" = "pr-review" ]; then
-            context=(--review-context "$REVIEW_CONTEXT")
-            if [ -n "$RECOVERY_CONTEXT" ]; then context+=(--recovery-context "$RECOVERY_CONTEXT"); fi
-          fi
-          python scripts/agent_claim.py \
-            --action triage.schema-repair --owner "$OWNER" --repo "$REPO" \
-            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
-            "${context[@]}" --repo-slug "$REPO_SLUG"
-
       - name: Prepare the pinned Codex worker for schema repair
         if: ${{ always() && steps.repair-gate.outputs.enabled == 'true' && steps.repair-gate.outputs.mode == 'codex' && steps.gate.outputs.mode != 'codex' }}
         env:
@@ -1293,6 +1304,49 @@ jobs:
           echo "$CODEX_PREFIX/node_modules/.bin" >> "$GITHUB_PATH"
           "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
           python scripts/agent_runtime.py verify-pins
+
+      - id: repair-source-policy
+        name: Recheck source permission at schema-repair admission
+        if: ${{ always() && steps.repair-prep.outputs.repair_needed == 'true' && steps.repair-gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue schema-repair source-policy reconciliation
+        if: ${{ steps.repair-source-policy.outputs.admitted == 'false' && (steps.repair-source-policy.outputs.mode == 'fork-reject' || steps.repair-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - id: repair-claim
+        name: Claim the exact schema-repair revision before spend
+        if: ${{ always() && steps.repair-source-policy.outputs.admitted == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.resolve.outputs.repo }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+          ISSUE: ${{ steps.resolve.outputs.issue }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          REVIEW_CONTEXT: ${{ steps.resolve.outputs.review_context }}
+          RECOVERY_CONTEXT: ${{ steps.resolve.outputs.recovery_context }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          context=()
+          if [ "$KIND" = "pr-review" ]; then
+            context=(--review-context "$REVIEW_CONTEXT")
+            if [ -n "$RECOVERY_CONTEXT" ]; then context+=(--recovery-context "$RECOVERY_CONTEXT"); fi
+          fi
+          python scripts/agent_claim.py \
+            --action triage.schema-repair --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            "${context[@]}" --repo-slug "$REPO_SLUG"
 
       - id: agent-runtime-repair-task
         name: Build the immutable schema-repair AgentTask
@@ -1945,9 +1999,21 @@ jobs:
           TARGET_REPO: ${{ needs.triage.outputs.repo }}
         run: python scripts/agent_runtime.py auth-status --action "${{ needs.triage.outputs.event_action }}" --repo "$TARGET_REPO"
 
+      - id: repair-source-policy
+        name: Recheck source permission at correction task admission
+        if: ${{ steps.repair-prep.outputs.repair_needed == 'true' && steps.repair-gate.outputs.enabled == 'true' && steps.repair-gate.outputs.mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ needs.triage.outputs.repo }}
+          TARGET_NUMBER: ${{ needs.triage.outputs.number }}
+          KIND: ${{ needs.triage.outputs.kind }}
+          HEAD_SHA: ${{ needs.triage.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: repair-claim
         name: Claim the exact schema-repair revision before spend
-        if: ${{ steps.repair-prep.outputs.repair_needed == 'true' && steps.repair-gate.outputs.enabled == 'true' }}
+        if: ${{ steps.repair-source-policy.outputs.admitted == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
@@ -1993,6 +2059,12 @@ jobs:
             --expected-source-sha "${{ github.sha }}" \
             --handoff-sha256 "$HANDOFF_SHA256" \
             --action "$ACTION" --repo "$REPO"
+
+      - name: Queue correction task-admission source-policy reconciliation
+        if: ${{ steps.repair-source-policy.outputs.admitted == 'false' && (steps.repair-source-policy.outputs.mode == 'fork-reject' || steps.repair-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - name: Record schema-repair task-build failure stage
         if: ${{ always() && steps.repair-claim.outputs.admitted == 'true' && steps.claude-repair-task.outcome == 'failure' }}

@@ -1010,6 +1010,8 @@ def test_load_llm_result_tolerant():
 def patch_core(**attrs):
     """Monkeypatch attributes on ad.core for the duration of the block, no
     network required. Restores the originals afterwards even on failure."""
+    if "gh_rest" in attrs and "gh_graphql_pr" not in attrs:
+        attrs["gh_graphql_pr"] = lambda *_args: editable_source_pr()
     saved = {name: getattr(ad.core, name) for name in attrs}
     for name, value in attrs.items():
         setattr(ad.core, name, value)
@@ -1166,7 +1168,13 @@ def open_pr(
     user = {"login": login}
     if user_type is not None:
         user["type"] = user_type
-    pr = {"merged": False, "state": "open", "head": {"sha": head_sha}, "user": user}
+    pr = {
+        "merged": False,
+        "state": "open",
+        "head": {"sha": head_sha, "repo": {"full_name": "owner-login/target-repo"}},
+        "base": {"repo": {"full_name": "owner-login/target-repo"}},
+        "user": user,
+    }
     if changed_files is not None:
         pr["changed_files"] = changed_files
     if commits is not None:
@@ -1174,6 +1182,21 @@ def open_pr(
     if html_url is not None:
         pr["html_url"] = html_url
     return pr
+
+
+def editable_source_pr(head_sha="abc123"):
+    return {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": head_sha,
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/fork",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
 
 
 def posts(calls):
@@ -1871,6 +1894,217 @@ def test_workflow_merge_gated_files_helper_is_workflows_only():
     )
 
 
+def test_manual_merge_does_not_bypass_rejected_source_policy():
+    pr = open_pr()
+    pr["head"]["repo"] = {"full_name": "contributor/target-repo"}
+    source = {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "abc123",
+        "maintainerCanModify": False,
+        "headRepository": {
+            "nameWithOwner": "contributor/target-repo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=lambda *_args: source,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
+    check(
+        "merge: exact source-policy reject blocks a stale manual card",
+        terminal == "none" and "contribution requirement" in message,
+    )
+    check("merge: rejected source sends no merge request", merge_puts(calls) == [])
+
+
+def test_manual_merge_rechecks_source_policy_after_workflow_inspection():
+    pr = open_pr()
+    pr["head"]["repo"] = {"full_name": "contributor/target-repo"}
+    source = {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "abc123",
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/target-repo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    source_reads = []
+
+    def read_source(*_args):
+        source_reads.append(len(source_reads) + 1)
+        current = dict(source)
+        current["maintainerCanModify"] = len(source_reads) == 1
+        return current
+
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=read_source,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
+    check(
+        "merge: source policy is rebound after workflow inspection",
+        source_reads == [1, 2]
+        and terminal == "none"
+        and "contribution requirement" in message,
+    )
+    check("merge: final source-policy reject sends no merge request", merge_puts(calls) == [])
+
+
+def test_decline_rechecks_source_policy_immediately_before_close():
+    pr = open_pr()
+    source = {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "abc123",
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/target-repo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    source_reads = []
+
+    def read_source(*_args):
+        source_reads.append(len(source_reads) + 1)
+        current = dict(source)
+        current["maintainerCanModify"] = len(source_reads) == 1
+        return current
+
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(gh_rest=fake, gh_graphql_pr=read_source):
+        out = run_execute(
+            {
+                "GITHUB_REPOSITORY_OWNER": "owner-login",
+                "DECISION": "decline",
+                "FREE_TEXT": "This does not fit the project.",
+                "TARGET_REPO": "target-repo",
+                "TARGET_NUMBER": "5",
+                "HEAD_SHA": "abc123",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "abc123",
+            }
+        )
+    check(
+        "decline: source policy is rebound immediately before close",
+        source_reads == [1, 2]
+        and out.get("terminal_state") == "retryable"
+        and out.get("source_policy_mode") == ad.core.PUSHABILITY_FORK_REJECT,
+    )
+    check(
+        "decline: final source-policy rejection prevents every target mutation",
+        not any(call["method"] in ("POST", "PATCH", "PUT") for call in calls),
+    )
+
+
+def test_comment_and_review_recheck_source_policy_at_mutation_boundary():
+    source = editable_source_pr()
+
+    for decision, text in (
+        ("comment", "Please add coverage."),
+        ("request-changes", "Please add coverage."),
+    ):
+        source_reads = []
+
+        def read_source(*_args):
+            source_reads.append(len(source_reads) + 1)
+            current = dict(source)
+            current["maintainerCanModify"] = len(source_reads) == 1
+            return current
+
+        fake, calls = fake_gh_rest(open_pr())
+        with patch_core(gh_rest=fake, gh_graphql_pr=read_source):
+            out = run_execute(
+                {
+                    "GITHUB_REPOSITORY_OWNER": "owner-login",
+                    "DECISION": decision,
+                    "FREE_TEXT": text,
+                    "TARGET_REPO": "target-repo",
+                    "TARGET_NUMBER": "5",
+                    "HEAD_SHA": "abc123",
+                    "KIND": "pr-review",
+                    "TARGET_REVISION": "abc123",
+                }
+            )
+        check(
+            "%s: source policy is rebound at the mutation boundary" % decision,
+            source_reads == [1, 2]
+            and out.get("terminal_state") == "retryable"
+            and out.get("source_policy_mode") == ad.core.PUSHABILITY_FORK_REJECT,
+        )
+        check(
+            "%s: final source-policy rejection prevents target mutation" % decision,
+            not any(call["method"] in ("POST", "PATCH", "PUT") for call in calls),
+        )
+
+
+def test_request_changes_rechecks_source_policy_before_cleanup_arming():
+    source = editable_source_pr()
+    source_reads = []
+
+    def read_source(*_args):
+        source_reads.append(len(source_reads) + 1)
+        current = dict(source)
+        current["maintainerCanModify"] = len(source_reads) < 3
+        return current
+
+    fake, calls = fake_gh_rest(open_pr())
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=read_source,
+        load_config=lambda: cleanup_cfg(),
+    ):
+        out = run_execute(
+            {
+                "GITHUB_REPOSITORY_OWNER": "owner-login",
+                "DECISION": "request-changes",
+                "FREE_TEXT": "Please add coverage.",
+                "TARGET_REPO": "target-repo",
+                "TARGET_NUMBER": "5",
+                "HEAD_SHA": "abc123",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "abc123",
+            }
+        )
+    check(
+        "request-changes arming: review remains posted after permission revocation",
+        len([call for call in posts(calls) if call["path"].endswith("/reviews")])
+        == 1,
+    )
+    check(
+        "request-changes arming: revoked source blocks marker and label writes",
+        not any(
+            call["method"] == "POST"
+            and (
+                call["path"].endswith("/issues/5/comments")
+                or call["path"].endswith("/issues/5/labels")
+            )
+            for call in calls
+        ),
+    )
+    check(
+        "request-changes arming: denial queues source-policy reconciliation",
+        source_reads == [1, 2, 3]
+        and out.get("source_policy_mode") == ad.core.PUSHABILITY_FORK_REJECT
+        and out.get("terminal_state") == "none",
+    )
+
+
 def test_auto_merge_receives_sha_from_successful_merge_response():
     merge_sha = "d" * 40
     fake, _ = fake_gh_rest(open_pr(), merge_response={"sha": merge_sha})
@@ -2244,6 +2478,7 @@ def test_merge_conflict_is_recoverable_not_durable_blocked():
         "projection_freshness": "",
         "projection_head_sha": "",
         "projection_complete": False,
+        "pushability": "",
         "render_version": rc.CARD_RENDER_VERSION,
     }
     refreshed_item = {
@@ -2262,6 +2497,7 @@ def test_merge_conflict_is_recoverable_not_durable_blocked():
         "url": "https://github.com/owner/target-repo/pull/79",
         "summary": "compliance=pass tests=green",
         "recommendation": "Merge it.",
+        "pushability": "",
     }
     check(
         "recoverable-conflict: new head is material_changed for normal refresh",
@@ -2839,7 +3075,11 @@ def test_accept_request_changes_execute_posts_review():
         )
     )
     fake, calls = fake_gh_rest(open_pr(head_sha="abc"))
-    with patch_core(gh_rest=fake, get_owner=lambda: "acme"):
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=lambda *_args: editable_source_pr("abc"),
+        get_owner=lambda: "acme",
+    ):
         out = run_execute(
             {
                 "DECISION": parsed["decision"],
@@ -3302,7 +3542,11 @@ def test_decline_prose_contract_and_real_action_path():
     )
 
     fake, calls = fake_gh_rest(open_pr(head_sha="deadbeefcafe"))
-    with patch_core(gh_rest=fake, get_owner=lambda: "kunchenguid"):
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=lambda *_args: editable_source_pr("deadbeefcafe"),
+        get_owner=lambda: "kunchenguid",
+    ):
         outcome = run_execute(
             {
                 "DECISION": routed["decision"],
@@ -3401,6 +3645,11 @@ def main():
     test_workflow_merge_gate_retry_after_rebase_merges()
     test_workflow_merge_gate_logs_blocked_result()
     test_workflow_merge_gated_files_helper_is_workflows_only()
+    test_manual_merge_does_not_bypass_rejected_source_policy()
+    test_manual_merge_rechecks_source_policy_after_workflow_inspection()
+    test_decline_rechecks_source_policy_immediately_before_close()
+    test_comment_and_review_recheck_source_policy_at_mutation_boundary()
+    test_request_changes_rechecks_source_policy_before_cleanup_arming()
     test_auto_merge_receives_sha_from_successful_merge_response()
     test_auto_merge_rejects_a_changed_expected_base()
     test_auto_merge_rechecks_final_mergeability_without_changing_manual_merge()

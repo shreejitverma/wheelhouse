@@ -370,16 +370,13 @@ card_issues: true
 
 # Stale pending-contributor cleanup. DEFAULT OFF when this key is absent; Kun's
 # own Wheelhouse opts in here.
-# The PR-only MVP arms cleanup only after deterministic asks: `/request-changes`
-# reviews and merge-conflict rebase nudges.
-# A provable legacy nudge that predates cleanup arming also enters the same
-# reminder-then-close lifecycle.
-# The normal CI-approval lane remains excluded.
-# Its only cleanup exception is a cross-repo ci-noop PR with both a provable
-# rebase nudge and a current authoritative `CONFLICTING` mergeability result.
-# It reminds once after 10 days and closes after 14 days only if the reminder was
-# already posted and the target timeline shows no qualifying contributor comment,
-# review, review comment, edit, or head push after the ask.
+# The PR-only MVP arms cleanup only after a deterministic captain
+# `/request-changes` review. Historical rebase-nudge records are silently
+# disarmed and never enter a reminder or close lifecycle. The normal CI-approval
+# lane remains excluded. It reminds once after 10 days and closes after 14 days
+# only if the reminder was already posted and the target timeline shows no
+# qualifying contributor comment, review, review comment, edit, or head push
+# after the ask.
 # Missing review timestamps are re-read by review ID when possible; an
 # unprovable timestamp or update skips cleanup.
 # Maintainer and bot activity do not reset the clock.
@@ -406,16 +403,9 @@ pending_contributor_cleanup_targets: ["pr"]
 # Unknown fork status fails closed to a manual CI-approval card for contributors
 # or a `suppressed-card` warning for excluded authors.
 # If the approval call verifies no matching run is awaiting approval, scan normally
-# emits no card and reconcile consumes any stale CI-approval card.
-# One narrow contributor-fork exception preserves conflict feedback without a
-# new bucket or card: when that safe approval result is `noop` AND mergeability
-# conclusively settles to `CONFLICTING`, the scan posts the ordinary one-per-head
-# rebase nudge before it drops the PR from the worklist. It does not nudge an
-# actually approved run, an UNKNOWN or missing mergeability value, or a failed
-# settlement, and it does not write the structured pending-contributor cleanup
-# state. A failed
-# settlement marks the repo scan unhealthy, preserving existing cards.
-# Everything uncertain fails closed to a contributor card or excluded-author
+# emits no card and reconcile consumes any stale CI-approval card. Mergeability
+# is display-only for readiness, so no CI path contacts a contributor about a
+# conflict. Everything uncertain fails closed to a contributor card or excluded-author
 # `suppressed-card`. The scan-backstop log records one notice or warning for
 # every auto-approve path outcome, including no-pending runs, approval failures
 # that route back to a card, and suppressed-card cases.

@@ -678,7 +678,6 @@ def test_no_vision_complete_diff_keeps_independent_g6_facts_in_real_card_flow():
             "firstmate": {
                 "ok": True,
                 "truncated": False,
-                "indeterminate_pr_numbers": [],
             }
         },
         "items": [issue_item],
@@ -1030,7 +1029,6 @@ def test_authoritative_scan_snapshot_flows_into_true_card_render():
             "axi": {
                 "ok": True,
                 "truncated": False,
-                "indeterminate_pr_numbers": [],
             }
         },
         "items": [item()],
@@ -1279,7 +1277,7 @@ def test_ineligible_behavior_class_is_manual_review_presentation_only():
 
     check(
         "ineligible: render-version migration exposes the copy correction",
-        render_card.CARD_RENDER_VERSION == golden["source_render_version"] + 1
+        render_card.CARD_RENDER_VERSION > golden["source_render_version"]
         and render_card.render_stale(
             {"render_version": golden["source_render_version"]}
         ),

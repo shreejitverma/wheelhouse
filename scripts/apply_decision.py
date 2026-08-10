@@ -437,7 +437,7 @@ def cmd_parse():
     if not state:
         set_output("decision", "")  # not a decision card
         return
-    if state.get("held") or state.get("lifecycle_state") == "awaiting-scheduled-confirmation" or "reconcile_absence" in state:
+    if state.get("held") or state.get("maintainer_edits_policy") or state.get("lifecycle_state") == "awaiting-scheduled-confirmation" or "reconcile_absence" in state:
         # HELD or scheduled-confirmation card (see render_card.py "Held cards"): its placeholder body
         # has no checkboxes to tick, but this is defense in depth against a
         # slash-command or a hand-crafted checkbox line reaching a card that
@@ -531,6 +531,55 @@ def _close_target(slug, number):
         method="PATCH",
         fields={"state": "closed"},
     )
+
+
+def _live_pr_source_policy(owner, repo, number):
+    try:
+        pr = core.gh_graphql_pr(owner, repo, int(number))
+        return core.derive_pushability(pr)
+    except Exception as error:
+        return {
+            "mode": core.PUSHABILITY_UNVERIFIED,
+            "reason": str(error)[:300] or "source permission evidence is unavailable",
+            "source": {},
+        }
+
+
+def cmd_source_policy():
+    body = os.environ.get("ISSUE_BODY", "")
+    state = core.parse_state_block(body) or {}
+    kind = os.environ.get("KIND", "") or str(state.get("kind") or "")
+    repo = os.environ.get("TARGET_REPO", "") or str(state.get("repo") or "")
+    number = os.environ.get("TARGET_NUMBER", "") or state.get("number")
+    if not state and not (kind or repo or number):
+        admitted, mode, reason = True, "not-applicable", ""
+    elif kind == "issue-triage":
+        admitted, mode, reason = True, "not-applicable", ""
+    elif kind not in {"pr-review", "ci-approval"} or not repo or not number:
+        admitted, mode, reason = False, core.PUSHABILITY_UNVERIFIED, "invalid PR card identity"
+    else:
+        policy = _live_pr_source_policy(core.get_owner(), repo, number)
+        mode = str(policy.get("mode") or core.PUSHABILITY_UNVERIFIED)
+        expected_head = str(
+            os.environ.get("HEAD_SHA", "") or state.get("head_sha") or ""
+        )
+        observed_head = str((policy.get("source") or {}).get("head_sha") or "")
+        admitted = mode in {
+            core.PUSHABILITY_SAME_REPO,
+            core.PUSHABILITY_PERSONAL_FORK_EDITABLE,
+        } and (not expected_head or observed_head == expected_head)
+        reason = str(policy.get("reason") or "")[:300]
+        if mode in {
+            core.PUSHABILITY_SAME_REPO,
+            core.PUSHABILITY_PERSONAL_FORK_EDITABLE,
+        } and expected_head and observed_head != expected_head:
+            mode = core.PUSHABILITY_UNVERIFIED
+            reason = "source revision changed during permission verification"
+    set_output("admitted", "true" if admitted else "false")
+    set_output("mode", mode)
+    set_output("reason", reason)
+    if len(sys.argv) > 2 and sys.argv[2] == "--require-admitted" and not admitted:
+        raise SystemExit("source permission policy denied model admission: %s" % (reason or mode))
 
 
 def _live_target_revision(owner, repo, number, kind):
@@ -971,6 +1020,59 @@ def _merge_pr_precondition(
     return None
 
 
+def _manual_merge_pushability_gate(owner, repo, number, pr):
+    """Re-bind cross-repository source policy before every manual merge.
+
+    The scan's policy card is only a snapshot. A stale actionable card must not
+    be able to merge a personal fork after its source permission became a
+    deterministic reject, nor guess through unreadable permission evidence.
+    Same-repository REST coordinates are sufficient for Phase 0 because no
+    source-fork permission is involved.
+    """
+    head = pr.get("head") if isinstance(pr, dict) else None
+    if not isinstance(head, dict) or "repo" not in head:
+        return (
+            "HOLD: could not verify the current source-branch policy. The card "
+            "remains retryable; do not merge until a complete source read is available.",
+            "none",
+        )
+    source_repo = head.get("repo")
+    if not isinstance(source_repo, dict):
+        # GitHub's explicit null source is a possible deleted fork, but the
+        # GraphQL reread is still the only authoritative reject proof.
+        source_name = ""
+    else:
+        source_name = str(source_repo.get("full_name") or "").strip()
+    if source_name.casefold() == ("%s/%s" % (owner, repo)).casefold():
+        return None
+    try:
+        source_pr = core.gh_graphql_pr(owner, repo, number)
+        policy = core.derive_pushability(source_pr)
+    except Exception as error:
+        return (
+            "HOLD: could not verify the current source-branch policy (%s). The "
+            "card remains retryable; no merge was attempted."
+            % str(error)[:160],
+            "none",
+        )
+    mode = policy.get("mode")
+    if mode == core.PUSHABILITY_FORK_REJECT:
+        return (
+            "HOLD: this fork no longer meets the maintainer-edits contribution "
+            "requirement (%s). No merge was attempted; the policy transaction "
+            "will post its notice and close the PR after an audit card is verified."
+            % str(policy.get("reason") or "source branch cannot be updated")[:180],
+            "none",
+        )
+    if mode != core.PUSHABILITY_PERSONAL_FORK_EDITABLE:
+        return (
+            "HOLD: source-branch permission evidence is incomplete. The card "
+            "remains retryable; no merge was attempted.",
+            "none",
+        )
+    return None
+
+
 def do_merge(
     owner,
     repo,
@@ -1002,6 +1104,9 @@ def do_merge(
     )
     if precondition:
         return outcome(*precondition)
+    source_gate = _manual_merge_pushability_gate(owner, repo, number, pr)
+    if source_gate:
+        return outcome(*source_gate)
     # Option B: never attempt API merge of a workflow-touching PR. FLEET_TOKEN
     # intentionally has no Workflows write; pre-detect and leave the card open
     # and clearly blocked with manual UI-merge guidance instead of a doomed 403.
@@ -1042,6 +1147,9 @@ def do_merge(
     )
     if precondition:
         return outcome(*precondition)
+    source_gate = _manual_merge_pushability_gate(owner, repo, number, pr)
+    if source_gate:
+        return outcome(*source_gate)
     try:
         fields = {"merge_method": method}
         if head_sha:
@@ -1074,9 +1182,9 @@ def do_merge(
             # scan/reconcile refresh path. Generic non-conflict failures stay
             # durable "error" (#447 / a8b0989).
             return outcome(
-                "Merge of %s#%s failed because the PR has a merge conflict. "
-                "The contributor must rebase or merge the base branch, resolve "
-                "the conflict, and push before this can be merged. (%s)"
+                "Merge of %s#%s found a merge conflict. In-place conflict "
+                "resolution is not enabled yet; the captain must resolve it manually "
+                "without asking the contributor to rebase, then retry the merge. (%s)"
                 % (repo, number, detail),
                 "none",
             )
@@ -1099,10 +1207,39 @@ def do_approve_ci(owner, repo, number):
     return (message, "resolved")
 
 
-def do_close(owner, repo, number, reason=None):
+def _source_policy_mutation_hold(owner, repo, number, expected_pr_head):
+    if not expected_pr_head:
+        return None
+    source_policy = _live_pr_source_policy(owner, repo, number)
+    source_mode = str(source_policy.get("mode") or core.PUSHABILITY_UNVERIFIED)
+    source_head = str((source_policy.get("source") or {}).get("head_sha") or "")
+    if source_mode in {
+        core.PUSHABILITY_SAME_REPO,
+        core.PUSHABILITY_PERSONAL_FORK_EDITABLE,
+    } and source_head == expected_pr_head:
+        return None
+    if source_head != expected_pr_head:
+        source_mode = core.PUSHABILITY_UNVERIFIED
+    set_output("source_policy_mode", source_mode)
+    return (
+        "HOLD: source permission policy must be reconciled for %s#%s. "
+        "No target action was taken." % (repo, number),
+        "retryable",
+    )
+
+
+def do_close(owner, repo, number, reason=None, expected_pr_head=""):
     slug = "%s/%s" % (owner, repo)
     if reason:
+        hold = _source_policy_mutation_hold(
+            owner, repo, number, expected_pr_head
+        )
+        if hold:
+            return hold
         _comment_target(slug, number, _target_safe_action_text(reason))
+    hold = _source_policy_mutation_hold(owner, repo, number, expected_pr_head)
+    if hold:
+        return hold
     try:
         _close_target(slug, number)
     except RuntimeError as e:
@@ -1111,8 +1248,11 @@ def do_close(owner, repo, number, reason=None):
     return ("Closed %s#%s%s." % (repo, number, suffix), "resolved")
 
 
-def do_comment(owner, repo, number, text):
+def do_comment(owner, repo, number, text, expected_pr_head=""):
     slug = "%s/%s" % (owner, repo)
+    hold = _source_policy_mutation_hold(owner, repo, number, expected_pr_head)
+    if hold:
+        return hold
     try:
         _comment_target(slug, number, _target_safe_action_text(text))
     except RuntimeError as e:
@@ -1161,6 +1301,9 @@ def do_request_changes(owner, repo, number, head_sha, text):
                 "rejects self-review)." % (repo, number),
                 "error",
             )
+        hold = _source_policy_mutation_hold(owner, repo, number, head_sha)
+        if hold:
+            return hold
         review = core.gh_rest(
             "/repos/%s/pulls/%s/reviews" % (slug, number),
             method="POST",
@@ -1211,6 +1354,13 @@ def do_request_changes(owner, repo, number, head_sha, text):
             author,
             asked_by=owner,
             source_id=review_id,
+        )
+    except core.PendingSourcePolicyError as e:
+        set_output("source_policy_mode", e.mode)
+        return (
+            "Requested changes on %s#%s and left the card open. Stale cleanup was not armed because source permission policy must be reconciled."
+            % (repo, number),
+            "none",
         )
     except Exception as e:
         return (
@@ -1270,18 +1420,68 @@ def cmd_execute():
         set_output("terminal_state", "retryable")
         set_output("success", "false")
         return
+    if kind in {"pr-review", "ci-approval"} and decision in {
+        "close",
+        "decline",
+        "comment",
+        "request-changes",
+    }:
+        source_policy = _live_pr_source_policy(owner, repo, number)
+        source_mode = str(
+            source_policy.get("mode") or core.PUSHABILITY_UNVERIFIED
+        )
+        source_head = str(
+            (source_policy.get("source") or {}).get("head_sha") or ""
+        )
+        if source_mode not in {
+            core.PUSHABILITY_SAME_REPO,
+            core.PUSHABILITY_PERSONAL_FORK_EDITABLE,
+        } or source_head != target_revision:
+            if source_head != target_revision:
+                source_mode = core.PUSHABILITY_UNVERIFIED
+            set_output(
+                "result_message",
+                "HOLD: source permission policy must be reconciled for %s#%s. No target action was taken."
+                % (repo, number),
+            )
+            set_output("terminal_state", "retryable")
+            set_output("success", "false")
+            set_output("source_policy_mode", source_mode)
+            return
     if decision == "merge":
         message, terminal = do_merge(owner, repo, number, head_sha)
     elif decision == "approve-ci":
         message, terminal = do_approve_ci(owner, repo, number)
     elif decision == "close":
-        message, terminal = do_close(owner, repo, number, reason=free_text or None)
+        message, terminal = do_close(
+            owner,
+            repo,
+            number,
+            reason=free_text or None,
+            expected_pr_head=target_revision
+            if kind in {"pr-review", "ci-approval"}
+            else "",
+        )
     elif decision == "decline":
         message, terminal = do_close(
-            owner, repo, number, reason=free_text or "Declining for now."
+            owner,
+            repo,
+            number,
+            reason=free_text or "Declining for now.",
+            expected_pr_head=target_revision
+            if kind in {"pr-review", "ci-approval"}
+            else "",
         )
     elif decision == "comment":
-        message, terminal = do_comment(owner, repo, number, free_text)
+        message, terminal = do_comment(
+            owner,
+            repo,
+            number,
+            free_text,
+            expected_pr_head=target_revision
+            if kind in {"pr-review", "ci-approval"}
+            else "",
+        )
     elif decision == "request-changes":
         message, terminal = do_request_changes(owner, repo, number, head_sha, free_text)
     elif decision == "hold":
@@ -1327,6 +1527,7 @@ def cmd_nl_eligible():
     is_card = (
         state is not None
         and not state.get("held")
+        and not state.get("maintainer_edits_policy")
         and state.get("lifecycle_state") != "awaiting-scheduled-confirmation"
         and "reconcile_absence" not in state
     )
@@ -2248,13 +2449,15 @@ def cmd_clear_checkbox():
 def main():
     usage = (
         "usage: apply_decision.py "
-        "parse|execute|clear-checkbox|nl-eligible|nl-prompt|nl-repair-prep|nl-route"
+        "parse|source-policy|execute|clear-checkbox|nl-eligible|nl-prompt|nl-repair-prep|nl-route"
     )
     if len(sys.argv) < 2:
         sys.exit(usage)
     cmd = sys.argv[1]
     if cmd == "parse":
         cmd_parse()
+    elif cmd == "source-policy":
+        cmd_source_policy()
     elif cmd == "execute":
         cmd_execute()
     elif cmd == "clear-checkbox":

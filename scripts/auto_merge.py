@@ -1427,28 +1427,12 @@ def collect_card_criteria(scan, cards):
         else:
             criteria = result["criteria"]
             repo_ok, repo_reason = _repo_result_ok(scan, repo)
-            indeterminate = item.get("number") in set(
-                (
-                    ((scan.get("repos") or {}).get(repo) or {}).get(
-                        "indeterminate_pr_numbers"
-                    )
-                    or []
-                )
-            )
-            if repo_ok and not indeterminate:
+            if repo_ok:
                 scan_status = criteria_schema.STATUS_MET
-                scan_evidence = "repo scan is ok, complete, and mergeability settled"
+                scan_evidence = "repo scan is ok and complete"
             else:
-                scan_status = (
-                    criteria_schema.STATUS_UNAVAILABLE
-                    if not repo_ok
-                    else criteria_schema.STATUS_UNMET
-                )
-                scan_evidence = (
-                    repo_reason
-                    if not repo_ok
-                    else "mergeability is indeterminate this scan"
-                )
+                scan_status = criteria_schema.STATUS_UNAVAILABLE
+                scan_evidence = repo_reason
             for row in criteria:
                 if row.get("id") == "scan_complete":
                     row["status"] = scan_status
@@ -1939,11 +1923,8 @@ def preclaim_candidates(scan, cards):
         repo = str(item.get("repo") or "")
         number = str(item.get("number") or "")
         repo_ok, repo_reason = _repo_result_ok(scan, repo)
-        indeterminate = item.get("number") in set(
-            (((scan.get("repos") or {}).get(repo) or {}).get("indeterminate_pr_numbers") or [])
-        )
-        if not repo_ok or indeterminate:
-            reason = repo_reason if not repo_ok else "mergeability indeterminate"
+        if not repo_ok:
+            reason = repo_reason
             print(
                 "::warning::wheelhouse automerge preclaim_denied %s#%s "
                 "criterion=scan_complete card_writes=0 reason=%s"
@@ -2584,14 +2565,6 @@ def act_on_scan(scan, cards):
         if not ok_repo:
             _warn(repo, number, ok_reason)
             holds.append({"repo": repo, "number": number, "hold_reason": ok_reason})
-            continue
-        indeterminate = ((scan.get("repos") or {}).get(repo) or {}).get(
-            "indeterminate_pr_numbers"
-        ) or []
-        if item["number"] in indeterminate:
-            reason = "mergeability indeterminate this scan (frozen)"
-            _warn(repo, number, reason)
-            holds.append({"repo": repo, "number": number, "hold_reason": reason})
             continue
         card_entry = index.get((repo, number))
         # Fail CLOSED on any unexpected error evaluating or acting on one

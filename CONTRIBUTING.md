@@ -24,6 +24,14 @@ Wheelhouse dogfoods the same contribution gate it applies to the rest of the fle
 A PR opened directly on GitHub (without the no-mistakes signature in its body) fails the **"PR must be raised via no-mistakes"** check and cannot be merged.
 Automated authors are exempt: PRs from `github-actions[bot]`, `dependabot[bot]`, and `release-please[bot]` skip the gate.
 
+## Pull requests from forks
+
+If you open a pull request from a fork, use a personal fork and enable **Allow edits from maintainers** in the pull request sidebar. This permission is required for the planned captain-initiated path that will resolve a small conflict on that same branch without asking you to rebase. That assisted path is not enabled in Phase 0; until it ships, the captain handles conflicts manually. The planned path will not rewrite your existing commits, and checks will run on the same PR.
+
+GitHub does not allow organization-owned forks to grant this permission. Pull requests from a fork that cannot be updated by maintainers are closed with an explanation. You can enable the setting and reopen the PR, or send a replacement from a personal fork.
+
+If GitHub shows **Allow edits and access to secrets by maintainers**, read GitHub's warning before enabling it. That setting has the security implications GitHub documents for fork workflows. Do not enable it if you do not accept those implications. In that case, this contribution policy cannot accept the fork PR.
+
 ## Local validation
 
 There is no build step.
@@ -57,6 +65,7 @@ python tests/test_card_refresh.py
 python tests/test_card_reuse.py
 python tests/test_reconcile.py
 python tests/test_merge_conflict.py
+python tests/test_maintainer_edits_policy.py
 python tests/test_pending_contributor_cleanup.py
 python tests/test_ci_autoapprove.py
 python tests/test_target_observation.py

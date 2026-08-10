@@ -385,7 +385,8 @@ def pr_node(number, status_rollup, draft=False, base_ref="main", cross_repo=True
         "headRefOid": "sha%d" % number,
         "baseRefName": base_ref,
         "baseRefOid": "base-%s" % base_ref,
-        "headRepository": {"name": "demo-fork", "owner": {"login": "forker"}},
+        "maintainerCanModify": True,
+        "headRepository": {"name": "demo-fork", "nameWithOwner": "forker/demo-fork", "isFork": True, "owner": {"login": "forker", "__typename": "User"}},
         "baseRepository": {"name": "demo", "owner": {"login": "owner"}},
         "labels": {"nodes": []},
         "closingIssuesReferences": {"nodes": []},
@@ -652,14 +653,16 @@ def test_same_repo_no_ci_routes_to_review_needed_not_ci_approval():
 
 def test_unknown_fork_status_keeps_ci_card_without_auto_approval():
     result, items, calls = run_build_repo([needs_ci_pr(cross_repo="missing")])
-    warning = items[0].get("warning") if items else ""
+    policy = items[0].get("maintainer_edits_policy") if items else {}
     check(
-        "route: unknown fork status keeps a ci-approval card",
-        len(items) == 1 and items[0]["kind"] == "ci-approval",
+        "route: unknown fork status keeps an inert source-permission card",
+        len(items) == 1
+        and items[0]["kind"] == "pr-review"
+        and policy.get("mode") == core.PUSHABILITY_UNVERIFIED,
     )
     check(
-        "route: unknown fork status warns instead of guessing",
-        "could not determine" in (warning or ""),
+        "route: unknown fork status is explicitly retryable instead of guessed",
+        items and items[0]["bucket"] == "source-permission-unverified",
     )
     check("route: unknown fork status is NOT auto-approved", calls["approve"] == [])
     check("route: unknown fork status skips posture", calls["posture"] == 0)
@@ -1103,6 +1106,7 @@ def run_approve_ci(
     strict=False,
     repo_posture=None,
     expected_head_sha=None,
+    source_pr=None,
 ):
     approval_results = list(approval_results or [])
     run_details = run_details or {}
@@ -1113,6 +1117,19 @@ def run_approve_ci(
         "changed_files": 0,
     }
     safety_verdict = safety_verdict or SAFE_VERDICT
+    source_pr = source_pr or {
+        "number": 1,
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": str((pr_payload.get("head") or {}).get("sha") or ""),
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/r",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
 
     def fake_run(cmd, capture_output=True, text=True):
         calls.setdefault("commands", []).append(cmd)
@@ -1148,9 +1165,15 @@ def run_approve_ci(
     def fake_posture(slug):
         return CLEAN_POSTURE if repo_posture is None else repo_posture
 
-    save = (core.subprocess.run, core.ci_safety, core.repo_pr_target_posture)
+    save = (
+        core.subprocess.run,
+        core.ci_safety,
+        core.repo_pr_target_posture,
+        core.gh_graphql_pr,
+    )
     core.subprocess.run = fake_run
     core.repo_pr_target_posture = fake_posture
+    core.gh_graphql_pr = lambda *_args: source_pr
     if stub_safety:
         core.ci_safety = lambda slug, pr, posture, changed_files=None: safety_verdict
     try:
@@ -1164,7 +1187,49 @@ def run_approve_ci(
         )
         return status, message, calls
     finally:
-        core.subprocess.run, core.ci_safety, core.repo_pr_target_posture = save
+        (
+            core.subprocess.run,
+            core.ci_safety,
+            core.repo_pr_target_posture,
+            core.gh_graphql_pr,
+        ) = save
+
+
+def test_approve_ci_rechecks_source_permission_before_write():
+    rejected = {
+        "number": 1,
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "sha1",
+        "maintainerCanModify": False,
+        "headRepository": {
+            "nameWithOwner": "contributor/r",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "databaseId": 11,
+                        "workflowDatabaseId": 22,
+                        "workflowName": "CI",
+                        "headSha": "sha1",
+                        "headBranch": "feature",
+                    }
+                ]
+            ),
+            stderr="",
+        ),
+        source_pr=rejected,
+    )
+    check("approve_ci: revoked source permission blocks approval", status == "error")
+    check("approve_ci: source-policy denial is observable", "source permission policy blocked" in message)
+    check("approve_ci: revoked source permission performs no write", calls["approved"] == [])
 
 
 def test_approve_ci_expected_head_mismatch_stops_before_run_discovery():
@@ -1881,6 +1946,7 @@ def main():
     test_carded_approve_exception_is_logged()
     test_carded_unsafe_verdict_is_logged_without_approve_status()
     test_carded_disabled_auto_approve_is_logged()
+    test_approve_ci_rechecks_source_permission_before_write()
     test_approve_ci_expected_head_mismatch_stops_before_run_discovery()
     test_approve_ci_run_list_failure_returns_error()
     test_approve_ci_invalid_run_list_returns_error()

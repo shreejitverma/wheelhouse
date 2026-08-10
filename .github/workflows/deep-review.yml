@@ -274,7 +274,24 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-      # The ONLY gate: the model credential must be present. No config flag.
+      - id: source-policy
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Defer to source-policy reconciliation
+        if: steps.source-policy.outputs.admitted != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run scan-backstop.yml
+          exit 1
+
+      # The ONLY model gate: the model credential must be present. No config flag.
       - id: gate
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -358,12 +375,29 @@ jobs:
             echo "head_ok=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - id: final-source-policy
+        if: steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue final deep-review source-policy reconciliation
+        if: ${{ steps.final-source-policy.outputs.admitted == 'false' && (steps.final-source-policy.outputs.mode == 'fork-reject' || steps.final-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       # Optional read-only model search. READONLY_TOKEN is a public-read token
       # that may be safely handed to Claude for context gathering. If the secret
       # is absent, the prompt and Claude tool list stay in the production no-search
       # mode.
       - id: readonly
-        if: steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false'
+        if: steps.final-source-policy.outputs.admitted == 'true'
         env:
           HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
         run: |
@@ -376,7 +410,7 @@ jobs:
 
       - id: event-claim
         name: Claim the exact deep-review trigger before spend
-        if: steps.gate.outputs.enabled == 'true'
+        if: steps.final-source-policy.outputs.admitted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           OWNER: ${{ github.repository_owner }}
@@ -574,9 +608,21 @@ jobs:
           TARGET_REPO: ${{ steps.resolve.outputs.slug }}
         run: echo "repos=$(python scripts/nl_readonly_search.py scope)" >> "$GITHUB_OUTPUT"
 
+      - id: task-source-policy
+        name: Recheck source permission at Claude task admission
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: claude-task
         name: Build the immutable Claude deep-review AgentTask
-        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' }}
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.task-source-policy.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.resolve.outputs.repo }}
@@ -598,6 +644,12 @@ jobs:
             --wheelhouse-revision "$WHEELHOUSE_REVISION" --target-file target.txt \
             --repository-dir target-src --repository-commit "$repository_commit" \
             --event-key "$EVENT_KEY"
+
+      - name: Queue Claude task-admission source-policy reconciliation
+        if: ${{ steps.task-source-policy.outputs.admitted == 'false' && (steps.task-source-policy.outputs.mode == 'fork-reject' || steps.task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - name: Record deep-review task-build failure stage
         if: ${{ always() && steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' && steps.claude-task.outcome == 'failure' }}
@@ -645,9 +697,21 @@ jobs:
           "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
           python scripts/agent_runtime.py verify-pins
 
+      - id: codex-task-source-policy
+        name: Recheck source permission at Codex task admission
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: agent-runtime-task
         name: Build the immutable deep-review AgentTask
-        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.codex-task-source-policy.outputs.admitted == 'true' && steps.gate.outputs.mode == 'codex' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.resolve.outputs.repo }}
@@ -681,6 +745,12 @@ jobs:
             --repository-dir target-src \
             --repository-commit "$repository_commit" \
             --event-key "$EVENT_KEY"
+
+      - name: Queue Codex task-admission source-policy reconciliation
+        if: ${{ steps.codex-task-source-policy.outputs.admitted == 'false' && (steps.codex-task-source-policy.outputs.mode == 'fork-reject' || steps.codex-task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - id: agent-runtime
         name: Run deep review through the Codex app-server contract

@@ -44,6 +44,7 @@ jobs:
       kind: ${{ steps.decide.outputs.kind }}
       head_sha: ${{ steps.decide.outputs.head_sha }}
       target_revision: ${{ steps.decide.outputs.target_revision }}
+      source_policy_admitted: ${{ steps.source-policy.outputs.admitted }}
       nl_proceed: ${{ steps.nl-gate.outputs.proceed }}
       nl_runtime_mode: ${{ steps.nl-gate.outputs.runtime_mode }}
       nl_action: ${{ steps.nl-gate.outputs.action }}
@@ -172,6 +173,20 @@ jobs:
           CHECKBOXES_OLD: ${{ steps.checkboxes-old.outputs.json }}
         run: python scripts/apply_decision.py parse
 
+      - id: source-policy
+        if: ${{ steps.gate.outputs.authorized == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue source-policy reconciliation
+        if: ${{ steps.source-policy.outputs.admitted == 'false' && (steps.source-policy.outputs.mode == 'fork-reject' || steps.source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       - id: decision-label-recovery
         if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issues' && github.event.action == 'labeled' && (steps.decide.outputs.decision != '' || steps.decide.outputs.investigate != '') }}
         env:
@@ -195,7 +210,7 @@ jobs:
       # intent or answers a question - the deterministic steps below do any
       # acting, so every guard still applies.
       - id: nl-gate
-        if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issue_comment' && steps.decide.outputs.decision == '' }}
+        if: ${{ steps.gate.outputs.authorized == 'true' && steps.source-policy.outputs.admitted == 'true' && github.event_name == 'issue_comment' && steps.decide.outputs.decision == '' }}
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -264,9 +279,48 @@ jobs:
             --event-key "$event_key" --stage denied --status skipped \
             --code admission.denied
 
+      - id: nl-preclaim-freshness
+        name: Verify target revision before natural-language admission
+        if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          SLUG: ${{ github.repository_owner }}/${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          EXPECTED_REVISION: ${{ steps.nl-gate.outputs.revision }}
+        run: |
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: nl-final-source-policy
+        if: steps.nl-preclaim-freshness.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          HEAD_SHA: ${{ steps.nl-gate.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue final natural-language source-policy reconciliation
+        if: ${{ steps.nl-final-source-policy.outputs.admitted == 'false' && (steps.nl-final-source-policy.outputs.mode == 'fork-reject' || steps.nl-final-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       - id: nl-claim
         name: Claim the exact natural-language event before spend
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: steps.nl-final-source-policy.outputs.admitted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTION: ${{ steps.nl-gate.outputs.action }}
@@ -446,9 +500,21 @@ jobs:
           TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
         run: echo "repos=$(python scripts/nl_readonly_search.py scope)" >> "$GITHUB_OUTPUT"
 
+      - id: nl-task-source-policy
+        name: Recheck source permission at Claude task admission
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          HEAD_SHA: ${{ steps.nl-gate.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: nl-claude-task
         name: Build the immutable Claude natural-language AgentTask
-        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' }}
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-task-source-policy.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.nl-gate.outputs.repo }}
@@ -468,6 +534,12 @@ jobs:
             --number "$NUMBER" --kind "$KIND" --revision "$REVISION" \
             --wheelhouse-revision "$WHEELHOUSE_REVISION" --target-file target.txt \
             --event-key "$EVENT_KEY"
+
+      - name: Queue Claude task-admission source-policy reconciliation
+        if: ${{ steps.nl-task-source-policy.outputs.admitted == 'false' && (steps.nl-task-source-policy.outputs.mode == 'fork-reject' || steps.nl-task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - name: Record natural-language task-build failure stage
         if: ${{ always() && steps.nl-claim.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' && steps.nl-claude-task.outcome == 'failure' }}
@@ -515,9 +587,21 @@ jobs:
           "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
           python scripts/agent_runtime.py verify-pins
 
+      - id: nl-codex-task-source-policy
+        name: Recheck source permission at Codex task admission
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          HEAD_SHA: ${{ steps.nl-gate.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: nl-agent-runtime-task
         name: Build the immutable natural-language decision AgentTask
-        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-codex-task-source-policy.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.nl-gate.outputs.repo }}
@@ -548,6 +632,12 @@ jobs:
             --wheelhouse-revision "$WHEELHOUSE_REVISION" \
             --target-file target.txt \
             --event-key "$EVENT_KEY"
+
+      - name: Queue Codex task-admission source-policy reconciliation
+        if: ${{ steps.nl-codex-task-source-policy.outputs.admitted == 'false' && (steps.nl-codex-task-source-policy.outputs.mode == 'fork-reject' || steps.nl-codex-task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - id: nl-agent-runtime
         name: Map natural-language intent through the Codex app-server contract
@@ -758,7 +848,7 @@ jobs:
 
       # --- Act on the target (shared by every entry point) -------------------
       - id: current-card
-        if: ${{ steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action' }}
+        if: ${{ steps.source-policy.outputs.admitted == 'true' && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
@@ -924,6 +1014,12 @@ jobs:
             HEAD_SHA="$HEAD_SHA" \
             TARGET_REVISION="$TARGET_REVISION" \
             "$TRUSTED_PYTHON" scripts/apply_decision.py execute
+
+      - name: Queue final source-policy reconciliation
+        if: ${{ steps.execute.outputs.source_policy_mode == 'fork-reject' || steps.execute.outputs.source_policy_mode == 'pushability-unverified' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       # --- Finalize the card (this repo, default token; never re-triggers) ----
       - id: nl-action-consumer
@@ -1198,9 +1294,21 @@ jobs:
             --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
             --event-id "comment:$COMMENT_ID" --repo-slug "$REPO_SLUG"
 
+      - id: nl-repair-source-policy
+        name: Recheck source permission at schema-repair task admission
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' && steps.nl-repair-gate.outputs.mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ needs.handle.outputs.nl_repo }}
+          TARGET_NUMBER: ${{ needs.handle.outputs.nl_number }}
+          KIND: ${{ needs.handle.outputs.nl_kind }}
+          HEAD_SHA: ${{ needs.handle.outputs.nl_revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: nl-claude-repair-task
         name: Build the immutable Claude NL schema-repair AgentTask
-        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' && steps.nl-repair-gate.outputs.mode == 'claude' }}
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' && steps.nl-repair-source-policy.outputs.admitted == 'true' && steps.nl-repair-gate.outputs.mode == 'claude' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ needs.handle.outputs.nl_repo }}
@@ -1224,6 +1332,12 @@ jobs:
             --revision "$REVISION" \
             --wheelhouse-revision "$WHEELHOUSE_REVISION" \
             --event-key "$EVENT_KEY"
+
+      - name: Queue schema-repair task-admission source-policy reconciliation
+        if: ${{ steps.nl-repair-source-policy.outputs.admitted == 'false' && (steps.nl-repair-source-policy.outputs.mode == 'fork-reject' || steps.nl-repair-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - id: nl-claude-repair-model
         name: Prepare one Claude NL schema repair for the caller-bound model job
@@ -1513,6 +1627,12 @@ jobs:
             TARGET_REVISION="$TARGET_REVISION" \
             "$TRUSTED_PYTHON" scripts/apply_decision.py execute
 
+      - name: Queue final source-policy reconciliation
+        if: ${{ steps.execute.outputs.source_policy_mode == 'fork-reject' || steps.execute.outputs.source_policy_mode == 'pushability-unverified' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       - id: nl-action-consumer
         name: Comment result on card
         if: ${{ always() && steps.route.outputs.mode == 'action' && steps.current-card.outputs.allowed == 'true' && steps.execute.outcome == 'success' }}
@@ -1676,7 +1796,7 @@ jobs:
 
   investigate-dispatch:
     needs: handle
-    if: ${{ needs.handle.outputs.authorized == 'true' && needs.handle.outputs.investigate != '' && (needs.handle.outputs.decision_label_recovery_required != 'true' || needs.handle.outputs.decision_label_recovery_admitted == 'true') }}
+    if: ${{ needs.handle.outputs.authorized == 'true' && needs.handle.outputs.source_policy_admitted == 'true' && needs.handle.outputs.investigate != '' && (needs.handle.outputs.decision_label_recovery_required != 'true' || needs.handle.outputs.decision_label_recovery_admitted == 'true') }}
     permissions:
       contents: read
       issues: write

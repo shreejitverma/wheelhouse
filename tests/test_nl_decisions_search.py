@@ -758,6 +758,54 @@ def test_nl_prompt_instructs_fully_qualified_refs():
     )
 
 
+def test_source_policy_is_revalidated_at_model_admission():
+    steps = handle_steps()
+    preclaim = step_by_id(steps, "nl-preclaim-freshness")
+    policy = step_by_id(steps, "nl-final-source-policy")
+    claim = step_by_id(steps, "nl-claim")
+    task = step_by_id(steps, "nl-claude-task")
+    indexes = {
+        step_id: step_index(steps, lambda step, wanted=step_id: step.get("id") == wanted)
+        for step_id in (
+            "nl-preclaim-freshness",
+            "nl-final-source-policy",
+            "nl-claim",
+            "nl-claude-task",
+        )
+    }
+    check(
+        "source policy: live revision and permission precede claim and task",
+        None not in indexes.values()
+        and indexes["nl-preclaim-freshness"]
+        < indexes["nl-final-source-policy"]
+        < indexes["nl-claim"]
+        < indexes["nl-claude-task"],
+    )
+    check(
+        "source policy: final permission read uses only the fleet credential",
+        policy is not None
+        and (policy.get("env") or {}).get("GH_TOKEN")
+        == "${{ secrets.FLEET_TOKEN }}"
+        and (policy.get("env") or {}).get("HEAD_SHA")
+        == "${{ steps.nl-gate.outputs.revision }}",
+    )
+    check(
+        "source policy: no event claim is admitted after a denied final read",
+        claim is not None
+        and str(claim.get("if", ""))
+        == "steps.nl-final-source-policy.outputs.admitted == 'true'",
+    )
+    check(
+        "source policy: freshness is exact-target evidence",
+        preclaim is not None
+        and (preclaim.get("env") or {}).get("EXPECTED_REVISION")
+        == "${{ steps.nl-gate.outputs.revision }}"
+        and (preclaim.get("env") or {}).get("GH_TOKEN")
+        == "${{ secrets.FLEET_TOKEN }}",
+    )
+    check("source policy: Claude task remains present", task is not None)
+
+
 def test_nl_route_qualifies_answer_with_deterministic_state_not_model_text():
     state = {"repo": "no-mistakes", "number": 137, "kind": "pr-review"}
     out = ad.route_decision(
@@ -816,6 +864,7 @@ def main():
     test_error_terminal_state_labels_as_blocked()
     test_retryable_terminal_keeps_card_actionable()
     test_nl_prompt_instructs_fully_qualified_refs()
+    test_source_policy_is_revalidated_at_model_admission()
     test_nl_route_qualifies_answer_with_deterministic_state_not_model_text()
     print()
     if _failures:

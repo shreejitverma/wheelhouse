@@ -158,8 +158,12 @@ def main():
             next_id += 1
             comments.append(row)
             return dict(row)
-        comment_id = int(args[-1].rsplit("/", 1)[-1])
-        return dict(next(row for row in comments if row["id"] == comment_id))
+        comment_id = int(next(value for value in args if "/issues/comments/" in value).rsplit("/", 1)[-1])
+        row = next(row for row in comments if row["id"] == comment_id)
+        if "PATCH" in args:
+            body_arg = next(value for value in args if value.startswith("body="))
+            row["body"] = body_arg[5:]
+        return dict(row)
 
     saved = agent_claim.gh_json
     agent_claim.gh_json = fake_gh

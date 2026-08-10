@@ -980,6 +980,7 @@ def test_cli_triage_apply_repair_end_to_end():
 def test_triage_yml_repair_wiring():
     triage_source = read(".github", "workflows", "triage.yml")
     doc = yaml.safe_load(triage_source)
+    triage_steps = doc["jobs"]["triage"]["steps"]
     prepare_job = doc["jobs"]["triage-repair-prepare"]
     prepare_steps = prepare_job["steps"]
     consume_job = doc["jobs"]["triage-claude-consume"]
@@ -1000,6 +1001,23 @@ def test_triage_yml_repair_wiring():
                 return i
         return None
 
+    source_policy_i = idx(triage_steps, lambda s: s.get("id") == "task-source-policy")
+    event_claim_i = idx(triage_steps, lambda s: s.get("id") == "event-claim")
+    claude_task_i = idx(triage_steps, lambda s: s.get("id") == "claude-task")
+    codex_task_i = idx(triage_steps, lambda s: s.get("id") == "agent-runtime-task")
+    legacy_repair_policy_i = idx(
+        triage_steps, lambda s: s.get("id") == "repair-source-policy"
+    )
+    legacy_repair_claim_i = idx(
+        triage_steps, lambda s: s.get("id") == "repair-claim"
+    )
+    legacy_repair_task_i = idx(
+        triage_steps, lambda s: s.get("id") == "agent-runtime-repair-task"
+    )
+    repair_policy_i = idx(
+        prepare_steps, lambda s: s.get("id") == "repair-source-policy"
+    )
+    repair_claim_i = idx(prepare_steps, lambda s: s.get("id") == "repair-claim")
     handoff_i = idx(
         prepare_steps,
         lambda s: s.get("name") == "Download the primary model handoff",
@@ -1018,6 +1036,44 @@ def test_triage_yml_repair_wiring():
 
     check("yaml: repair-prep step exists", prep_i is not None)
     check("yaml: Claude repair model boundary exists", rep_i is not None)
+    check(
+        "yaml: primary admission checks source permission before claim and task",
+        None
+        not in (
+            source_policy_i,
+            event_claim_i,
+            claude_task_i,
+            codex_task_i,
+        )
+        and source_policy_i < event_claim_i < claude_task_i
+        and event_claim_i < codex_task_i
+        and triage_steps[event_claim_i].get("if")
+        == "steps.task-source-policy.outputs.admitted == 'true'"
+        and "steps.event-claim.outputs.admitted == 'true'"
+        in str(triage_steps[claude_task_i].get("if", ""))
+        and "steps.event-claim.outputs.admitted == 'true'"
+        in str(triage_steps[codex_task_i].get("if", "")),
+    )
+    check(
+        "yaml: both repair admissions check source permission before claiming",
+        None
+        not in (
+            legacy_repair_policy_i,
+            legacy_repair_claim_i,
+            legacy_repair_task_i,
+            repair_policy_i,
+            repair_claim_i,
+            task_i,
+        )
+        and legacy_repair_policy_i
+        < legacy_repair_claim_i
+        < legacy_repair_task_i
+        and repair_policy_i < repair_claim_i < task_i
+        and "steps.repair-claim.outputs.admitted == 'true'"
+        in str(triage_steps[legacy_repair_task_i].get("if", ""))
+        and "steps.repair-claim.outputs.admitted == 'true'"
+        in str(prepare_steps[task_i].get("if", "")),
+    )
     check("yaml: repair-result receiver exists", received_i is not None)
     check(
         "yaml: correction eligibility follows the verified handoff and result receipt",
@@ -1088,12 +1144,18 @@ def test_triage_yml_repair_wiring():
         prepare_steps[rep_i].get("with", {}).get("allowed-repos")
         == "${{ steps.claude-repair-task.outputs.allowed_repos || '[]' }}",
     )
+    source_policy_i = idx(
+        prepare_steps, lambda s: s.get("id") == "repair-source-policy"
+    )
     claim_i = idx(prepare_steps, lambda s: s.get("id") == "repair-claim")
     claim_run = str(prepare_steps[claim_i].get("run", ""))
     check(
         "yaml: the correction keeps the exact triage.schema-repair claim identity",
         claim_i is not None
-        and prep_i < claim_i < task_i
+        and source_policy_i is not None
+        and prep_i < source_policy_i < claim_i < task_i
+        and prepare_steps[claim_i].get("if")
+        == "${{ steps.repair-source-policy.outputs.admitted == 'true' }}"
         and "--action triage.schema-repair" in claim_run,
     )
 

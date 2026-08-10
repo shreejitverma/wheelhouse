@@ -769,6 +769,40 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
     )
 
 
+def test_source_policy_is_revalidated_at_model_admission():
+    doc = load_yaml(".github", "workflows", "deep-review.yml")
+    steps = steps_of(doc, "deep-review")
+    ids = ("verify_head", "final-source-policy", "event-claim", "claude-task")
+    indexes = {
+        step_id: step_index(steps, lambda step, wanted=step_id: step.get("id") == wanted)
+        for step_id in ids
+    }
+    policy = next((step for step in steps if step.get("id") == "final-source-policy"), None)
+    claim = next((step for step in steps if step.get("id") == "event-claim"), None)
+    check(
+        "source policy: checkout head and permission precede claim and task",
+        None not in indexes.values()
+        and indexes["verify_head"]
+        < indexes["final-source-policy"]
+        < indexes["event-claim"]
+        < indexes["claude-task"],
+    )
+    check(
+        "source policy: final permission read binds the resolved revision",
+        policy is not None
+        and (policy.get("env") or {}).get("GH_TOKEN")
+        == "${{ secrets.FLEET_TOKEN }}"
+        and (policy.get("env") or {}).get("HEAD_SHA")
+        == "${{ steps.resolve.outputs.revision }}",
+    )
+    check(
+        "source policy: denied final evidence cannot claim model spend",
+        claim is not None
+        and str(claim.get("if", ""))
+        == "steps.final-source-policy.outputs.admitted == 'true'",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # investigate trigger wiring in the decision handler
 # --------------------------------------------------------------------------- #
@@ -911,6 +945,7 @@ def main():
     test_code_grounded_checkout_and_tool_isolation()
     test_prompt_treats_card_body_as_untrusted_data()
     test_workflow_dispatch_uses_immutable_target_inputs()
+    test_source_policy_is_revalidated_at_model_admission()
     test_handler_investigate_wiring()
     print()
     if _failures:

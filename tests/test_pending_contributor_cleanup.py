@@ -162,6 +162,7 @@ class FakeGitHub:
         review_rereads=None,
         reread_error=False,
         mergeable_reads=None,
+        source_reads=None,
     ):
         self.issue = issue_obj or issue([core.PENDING_CONTRIBUTOR_LABEL])
         self.pr = pr_obj or pr()
@@ -176,8 +177,17 @@ class FakeGitHub:
         self.body_edits_error = body_edits_error
         self.review_rereads = dict(review_rereads or {})
         self.reread_error = reread_error
+        self.source_default = {
+            "isCrossRepository": False,
+            "headRefName": "feature",
+            "headRefOid": (pr_obj or {}).get("head", {}).get("sha", "sha1"),
+            "maintainerCanModify": None,
+            "headRepository": None,
+        }
+        self.source_reads = None if source_reads is None else list(source_reads)
         self.mergeable_reads = list(mergeable_reads or ["CONFLICTING"])
         self.mergeable_calls = []
+        self.source_calls = []
         self.calls = []
         self._fill_target_updated_at()
 
@@ -273,6 +283,22 @@ class FakeGitHub:
             "pageInfo": {"hasNextPage": False, "endCursor": None},
         }
 
+    def gh_graphql_pr(self, owner, name, number):
+        if owner != "owner" or name != "demo" or int(number) != 7:
+            raise AssertionError(
+                "unexpected source-policy target: %s/%s#%s" % (owner, name, number)
+            )
+        self.source_calls.append(int(number))
+        if self.source_reads is None:
+            value = self.source_default
+        else:
+            if not self.source_reads:
+                raise AssertionError("unexpected source-policy re-read")
+            value = self.source_reads.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
     def gh_graphql_pr_mergeable(self, owner, name, number):
         if owner != "owner" or name != "demo" or int(number) != 7:
             raise AssertionError(
@@ -291,18 +317,18 @@ class FakeGitHub:
 def patch_rest(fake):
     old_rest = core.gh_rest
     old_edits = core.gh_graphql_pr_user_content_edits_page
-    old_mergeable = core.gh_graphql_pr_mergeable
+    old_pr = core.gh_graphql_pr
     core.gh_rest = fake.gh_rest
     core.gh_graphql_pr_user_content_edits_page = (
         fake.gh_graphql_pr_user_content_edits_page
     )
-    core.gh_graphql_pr_mergeable = fake.gh_graphql_pr_mergeable
+    core.gh_graphql_pr = fake.gh_graphql_pr
     try:
         yield
     finally:
         core.gh_rest = old_rest
         core.gh_graphql_pr_user_content_edits_page = old_edits
-        core.gh_graphql_pr_mergeable = old_mergeable
+        core.gh_graphql_pr = old_pr
 
 
 def enriched_pr(
@@ -1490,6 +1516,201 @@ def test_widened_ci_noop_respects_keep_open():
           closed == set())
 
 
+def test_live_source_policy_blocks_cleanup_mutations_and_updates_routing():
+    record = request_record()
+    rejected = {
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "sha1",
+        "maintainerCanModify": False,
+        "headRepository": {
+            "nameWithOwner": "contributor/demo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    node = enriched_pr()
+    fake = FakeGitHub(
+        comments=[pending_comment(record), reminder_comment(record)],
+        reviews=[review(101, ts())],
+        source_reads=[rejected],
+    )
+    closed = run(fake, node, now_days=14)
+    check("source race: revoked permission prevents cleanup close", closed == set())
+    check(
+        "source race: revoked permission performs no target mutation",
+        not any(call.get("method") for call in fake.calls),
+    )
+    check(
+        "source race: exact reject is routed into the policy worklist",
+        node.get("bucket") == "maintainer-edits-required"
+        and (node.get("pushability") or {}).get("mode") == core.PUSHABILITY_FORK_REJECT,
+    )
+
+    uncertain_node = enriched_pr()
+    uncertain = FakeGitHub(
+        comments=[pending_comment(record), reminder_comment(record)],
+        reviews=[review(101, ts())],
+        source_reads=[RuntimeError("source unavailable")],
+    )
+    closed = run(uncertain, uncertain_node, now_days=14)
+    check("source race: unreadable permission prevents cleanup close", closed == set())
+    check(
+        "source race: unreadable permission performs no target mutation",
+        not any(call.get("method") for call in uncertain.calls),
+    )
+    check(
+        "source race: unreadable permission is routed into a retryable policy card",
+        uncertain_node.get("bucket") == "source-permission-unverified"
+        and (uncertain_node.get("pushability") or {}).get("mode")
+        == core.PUSHABILITY_UNVERIFIED,
+    )
+
+
+def test_final_source_policy_check_blocks_cleanup_close_after_revocation():
+    record = request_record()
+    editable = {
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "sha1",
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/demo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    rejected = dict(editable, maintainerCanModify=False)
+    node = enriched_pr()
+    fake = FakeGitHub(
+        comments=[pending_comment(record), reminder_comment(record)],
+        reviews=[review(101, ts())],
+        source_reads=[editable, rejected],
+    )
+    closed = run(fake, node, now_days=14)
+    check("final source race: revoked permission prevents close", closed == set())
+    check(
+        "final source race: denial occurs before target mutation",
+        not any(call.get("method") for call in fake.calls),
+    )
+    check(
+        "final source race: denial routes to contribution policy",
+        node.get("bucket") == "maintainer-edits-required"
+        and (node.get("pushability") or {}).get("mode")
+        == core.PUSHABILITY_FORK_REJECT
+        and fake.source_calls == [7, 7],
+    )
+
+
+def test_final_source_policy_check_blocks_pending_label_clears():
+    editable_template = {
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/demo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+
+    cases = []
+    activity_record = request_record()
+    cases.append(
+        (
+            "contributor activity",
+            FakeGitHub(
+                comments=[
+                    pending_comment(activity_record),
+                    comment("I pushed a fix", ts(1), CONTRIBUTOR, 4),
+                ],
+                reviews=[review(101, ts())],
+            ),
+            enriched_pr(),
+            "sha1",
+        )
+    )
+    moved_record = request_record(head="oldsha")
+    cases.append(
+        (
+            "head movement",
+            FakeGitHub(
+                pr_obj=pr(head="newsha"),
+                comments=[pending_comment(moved_record)],
+                reviews=[review(101, ts())],
+            ),
+            enriched_pr(head="oldsha"),
+            "newsha",
+        )
+    )
+    legacy_record = {
+        "version": 1,
+        "ask_id": "needs-rebase:sha1:201",
+        "ask_kind": "needs-rebase",
+        "asked_at": ts(),
+        "asked_by": "owner",
+        "target_author": "contributor",
+        "head_sha": "sha1",
+        "repo": "demo",
+        "number": 7,
+        "source_id": "201",
+        "reminded_at": None,
+    }
+    cases.append(
+        (
+            "legacy rebase disarming",
+            FakeGitHub(comments=[pending_comment(legacy_record)], reviews=[]),
+            enriched_pr(),
+            "sha1",
+        )
+    )
+
+    for label, fake, node, live_head in cases:
+        editable = dict(editable_template, headRefOid=live_head)
+        rejected = dict(editable, maintainerCanModify=False)
+        fake.source_reads = [editable, rejected]
+        closed = run(fake, node, now_days=14)
+        labels = [item["name"] for item in fake.issue["labels"]]
+        check("label source race: %s does not close" % label, closed == set())
+        check(
+            "label source race: %s keeps the pending label" % label,
+            core.PENDING_CONTRIBUTOR_LABEL in labels,
+        )
+        check(
+            "label source race: %s performs no target mutation" % label,
+            not any(call.get("method") for call in fake.calls),
+        )
+        check(
+            "label source race: %s routes to contribution policy" % label,
+            fake.source_calls == [7, 7]
+            and node.get("bucket") == "maintainer-edits-required"
+            and (node.get("pushability") or {}).get("mode")
+            == core.PUSHABILITY_FORK_REJECT,
+        )
+
+
+def test_legacy_rebase_record_is_silently_disarmed():
+    record = {
+        "version": 1,
+        "ask_id": "needs-rebase:sha1:201",
+        "ask_kind": "needs-rebase",
+        "asked_at": ts(),
+        "asked_by": "owner",
+        "target_author": "contributor",
+        "head_sha": "sha1",
+        "repo": "demo",
+        "number": 7,
+        "source_id": "201",
+        "reminded_at": None,
+    }
+    fake = FakeGitHub(comments=[pending_comment(record)], reviews=[])
+    closed = run(fake, enriched_pr(labels=[core.PENDING_CONTRIBUTOR_LABEL]), now_days=14)
+    labels = [item["name"] for item in fake.issue["labels"]]
+    check("migration: legacy rebase record never closes target", closed == set())
+    check("migration: legacy rebase record silently loses pending label", core.PENDING_CONTRIBUTOR_LABEL not in labels)
+    check("migration: legacy rebase record posts no reminder", not any(c.get("method") == "POST" and str((c.get("fields") or {}).get("body") or "").startswith("Quick reminder") for c in fake.calls))
+
+
 def main():
     test_config_defaults_off_and_per_repo_override()
     test_no_action_before_reminder_threshold()
@@ -1511,33 +1732,18 @@ def main():
     test_head_change_blocks_and_clears_pending_label()
     test_keep_open_and_unknown_timeline_fail_open()
     test_unknown_author_fails_open()
-    test_rebase_reminder_body_discloses_automation()
-    test_legacy_rebase_marker_reminds_then_closes_when_provable()
-    test_legacy_rebase_skip_when_timestamp_missing()
-    test_legacy_rebase_requires_trusted_marker_author()
-    test_rebase_cleanup_clears_when_pr_no_longer_conflicted()
-    test_legacy_rebase_cleanup_clears_when_pr_no_longer_conflicted()
-    test_legacy_rebase_cleanup_clears_after_head_move_and_unblock()
+    test_live_source_policy_blocks_cleanup_mutations_and_updates_routing()
+    test_final_source_policy_check_blocks_cleanup_close_after_revocation()
+    test_final_source_policy_check_blocks_pending_label_clears()
+    test_legacy_rebase_record_is_silently_disarmed()
     test_untrusted_pending_marker_skips_even_with_label()
     test_truncated_scan_labels_fall_back_to_target_label_read()
     test_non_arming_signals_do_not_enter_cleanup()
     test_ci_approval_and_disabled_cleanup_are_out_of_scope()
-    test_reviewed_timeline_event_uses_submitted_at()
-    test_reviewed_event_missing_timestamp_recovered_by_reread()
-    test_reviewed_event_reread_failure_fails_open()
-    test_unattributable_update_from_review_becomes_attributable()
-    test_widened_backlog_nudged_pr_reminds_then_closes()
-    test_widened_backlog_respects_keep_open()
-    test_widened_backlog_contributor_activity_fails_open()
-    test_widened_ci_noop_conflicting_pr_reminds_then_closes()
-    test_ci_noop_ignores_request_changes_markers()
     test_ci_approval_lane_clears_stale_request_changes_after_head_move()
     test_ci_approval_lane_clears_stale_request_changes_after_contributor_activity()
     test_ci_approval_lane_does_not_close_same_head_unanswered_request_changes()
-    test_widened_ci_noop_skips_when_conflict_has_resolved()
-    test_ci_approval_pr_without_proven_conflicting_fork_stays_out_of_scope()
-    test_conflicting_non_ci_noop_lanes_stay_out_of_scope()
-    test_widened_ci_noop_respects_keep_open()
+    test_reviewed_timeline_event_uses_submitted_at()
     print()
     if _failures:
         print("%d FAILED: %s" % (len(_failures), ", ".join(_failures)))

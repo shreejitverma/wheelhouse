@@ -63,6 +63,7 @@ def body_state(
         "projection_freshness": "",
         "projection_head_sha": "",
         "projection_complete": False,
+        "pushability": "",
         "updated_at": updated_at,
         "activity_reflected_at": activity_reflected_at,
     }
@@ -87,6 +88,7 @@ def work_item(**overrides):
         "summary": "compliance=pass tests=green",
         "recommendation": "Merge - compliance and tests are green.",
         "priority": "med",
+        "pushability": "",
     }
     item.update(overrides)
     return item
@@ -364,7 +366,6 @@ def scan_payload(
     open_issue_numbers=None,
     ok=True,
     truncated=False,
-    indeterminate_pr_numbers=None,
     ci_wait_pr_numbers=None,
     ci_wait_refresh_items=None,
 ):
@@ -377,9 +378,6 @@ def scan_payload(
                 "open_issue_numbers": []
                 if open_issue_numbers is None
                 else open_issue_numbers,
-                "indeterminate_pr_numbers": []
-                if indeterminate_pr_numbers is None
-                else indeterminate_pr_numbers,
                 "ci_wait_pr_numbers": []
                 if ci_wait_pr_numbers is None
                 else ci_wait_pr_numbers,
@@ -758,6 +756,52 @@ def test_refresh_uses_current_labels_before_upsert():
     check("reconcile: processing current card is not closed", calls["close"] == [])
 
 
+def test_locked_card_transitions_to_inert_source_policy_audit():
+    policy = {
+        "version": 1,
+        "mode": reconcile.core.PUSHABILITY_FORK_REJECT,
+        "head_sha": "oldsha",
+        "source": {
+            "is_fork": True,
+            "owner_type": "User",
+            "maintainer_can_modify": False,
+        },
+        "phase": "notice-posted",
+        "target_comment_id": 99,
+    }
+    item = work_item(
+        bucket="maintainer-edits-required",
+        pushability=reconcile.core.PUSHABILITY_FORK_REJECT,
+        maintainer_edits_policy=policy,
+    )
+    state = dict(reconcile.core.parse_state_block(body_state()))
+    state[reconcile.render_card.MAINTAINER_EDITS_POLICY_FIELD] = policy
+    snapshot = card(
+        labels(
+            "blocked",
+            "repo:wheelhouse",
+            "kind:pr-review",
+            "priority:med",
+            "target:wheelhouse-42",
+        )
+    )
+    snapshot["body"] = "<!-- wheelhouse-state: %s -->" % json.dumps(
+        state, separators=(",", ":")
+    )
+    calls = run_reconcile(scan_payload(items=[item]), [snapshot])
+    writes = calls["upsert"]
+    check(
+        "policy: locked card is routed through guarded inert transition",
+        len(writes) == 1
+        and writes[0]["existing"] == snapshot
+        and writes[0]["expected_existing"] == snapshot,
+    )
+    check(
+        "policy: locked card bypasses ordinary triage maintenance",
+        calls["triage_rows"] == [],
+    )
+
+
 def test_open_target_that_left_worklist_records_first_absence():
     calls = run_reconcile(
         scan_payload(items=[]),
@@ -925,33 +969,6 @@ def test_reconcile_run_number_requires_trusted_actions_identity():
     )
 
 
-def test_indeterminate_pr_card_is_frozen():
-    # #111 invariant: an open PR whose mergeability was unreadable this scan
-    # (UNKNOWN did not settle) is reported in `indeterminate_pr_numbers` and emits
-    # no worklist item. Its existing card must be FROZEN - neither closed/consumed
-    # nor refreshed - so an UNKNOWN reading can never flip worklist membership or
-    # mint/close a card. This is the same mergeable-UNKNOWN oscillation that
-    # minted 10 duplicate cards for lavish-axi#111.
-    calls = run_reconcile(
-        scan_payload(items=[], indeterminate_pr_numbers=[42]),
-        [
-            card(
-                labels(
-                    "needs-decision",
-                    "repo:wheelhouse",
-                    "kind:pr-review",
-                    "priority:med",
-                    "target:wheelhouse-42",
-                )
-            )
-        ],
-    )
-    check("reconcile-freeze: indeterminate card is NOT closed", calls["close"] == [])
-    check(
-        "reconcile-freeze: indeterminate card is NOT refreshed", calls["upsert"] == []
-    )
-
-
 def _pr_review_card():
     return card(
         labels(
@@ -969,7 +986,7 @@ def test_ci_wait_card_is_frozen_not_consumed():
     # approved checks are still running) emits NO worklist item while it awaits
     # terminal checks. Its existing pr-review card must be FROZEN - never consumed
     # merely because its target is mid-approval/CI-wait. Same fail-safe family as
-    # the indeterminate freeze. (No refresh item here -> pure freeze, no upsert.)
+    # a distinct CI-wait freeze. (No refresh item here -> pure freeze, no upsert.)
     calls = run_reconcile(
         scan_payload(items=[], ci_wait_pr_numbers=[42]),
         [_pr_review_card()],
@@ -1321,7 +1338,6 @@ def test_axi96_ci_wait_then_terminal_scan_surfaces_card_with_criteria():
                 "ok": True,
                 "open_pr_numbers": [96],
                 "open_issue_numbers": [],
-                "indeterminate_pr_numbers": [],
                 "ci_wait_pr_numbers": [96],
                 "ci_wait_refresh_items": [waiting_refresh],
                 "truncated": False,
@@ -1356,7 +1372,6 @@ def test_axi96_ci_wait_then_terminal_scan_surfaces_card_with_criteria():
                 "ok": True,
                 "open_pr_numbers": [96],
                 "open_issue_numbers": [],
-                "indeterminate_pr_numbers": [],
                 "ci_wait_pr_numbers": [],
                 "ci_wait_refresh_items": [],
                 "truncated": False,
@@ -2144,11 +2159,6 @@ def test_intervening_runs_break_absence_adjacency():
     cases = [
         ("failed", scan_payload(items=[], ok=False), "schedule"),
         ("truncated", scan_payload(items=[], truncated=True), "schedule"),
-        (
-            "UNKNOWN",
-            scan_payload(items=[], indeterminate_pr_numbers=[42]),
-            "schedule",
-        ),
         ("CI-wait", scan_payload(items=[], ci_wait_pr_numbers=[42]), "schedule"),
     ]
     for name, intervening, event_name in cases:
@@ -2408,10 +2418,10 @@ def main():
     test_upsert_rejects_change_after_reconcile_validation()
     test_rejected_nested_refresh_does_not_bypass_triage_snapshot_guard()
     test_refresh_uses_current_labels_before_upsert()
+    test_locked_card_transitions_to_inert_source_policy_audit()
     test_open_target_that_left_worklist_records_first_absence()
     test_render_stale_confirming_card_migrates_without_target_observation()
     test_reconcile_run_number_requires_trusted_actions_identity()
-    test_indeterminate_pr_card_is_frozen()
     test_ci_wait_card_is_frozen_not_consumed()
     test_ci_wait_refresh_kills_stale_head_masquerade()
     test_ci_wait_refresh_never_creates_a_card()

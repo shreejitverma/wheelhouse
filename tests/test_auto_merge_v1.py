@@ -3287,7 +3287,7 @@ def test_complete_diff_triage_persists_independent_facts_without_vision():
 
 
 # --------------------------------------------------------------------------- #
-# repo-state freeze invariants (ok:false / truncated / indeterminate)
+# repo-state freeze invariants (ok:false / truncated)
 # --------------------------------------------------------------------------- #
 def _run_with_scan(world, items, cards, repos_scan):
     world.repos_scan = repos_scan
@@ -3298,10 +3298,6 @@ def test_scan_freeze_invariants():
     for label, scan in (
         ("ok:false", {"fmt": {"ok": False}}),
         ("truncated", {"fmt": {"ok": True, "truncated": True}}),
-        (
-            "indeterminate",
-            {"fmt": {"ok": True, "indeterminate_pr_numbers": [5]}},
-        ),
     ):
         w, items, cards = default_world(head="fz" * 20)
         payload, _ = _run_with_scan(w, items, cards, scan)

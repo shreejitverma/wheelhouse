@@ -181,7 +181,7 @@ def test_render_qualifies_only_target_derived_deterministic_surfaces():
     stale_state["render_version"] = rc.CARD_RENDER_VERSION - 1
     check(
         "render-v15: version-behind cards enter the established migration path",
-        rc.CARD_RENDER_VERSION == 16
+        rc.CARD_RENDER_VERSION == 17
         and rc.render_stale(stale_state)
         and rc.refresh_needed(warning_card, stale_state, ["needs-decision"]),
     )
@@ -323,6 +323,31 @@ def test_non_material_change_is_not_a_trigger():
     check(
         "activity_reflected_at not in MATERIAL_FIELDS",
         "activity_reflected_at" not in rc.MATERIAL_FIELDS,
+    )
+
+
+def test_merge_state_display_refresh_is_non_material():
+    conflicting = item(mergeable="CONFLICTING")
+    state = state_of(conflicting)
+    ready = item(mergeable="MERGEABLE")
+    check(
+        "merge state: fresh display cache is stable",
+        state.get(rc.MERGE_STATE_DISPLAY_FIELD) == "conflicting"
+        and not rc.merge_state_display_stale(conflicting, state),
+    )
+    check(
+        "merge state: same-head transition triggers display refresh",
+        rc.merge_state_display_stale(ready, state)
+        and rc.refresh_needed(ready, state, labels=["needs-decision"]),
+    )
+    check(
+        "merge state: display transition is not material routing state",
+        not rc.material_changed(ready, state)
+        and rc.MERGE_STATE_DISPLAY_FIELD not in rc.MATERIAL_FIELDS,
+    )
+    check(
+        "merge state: refreshed card shows current informational state",
+        "- Merge state: `mergeable` (informational)" in rc.render(ready)["body"],
     )
 
 
@@ -1709,6 +1734,7 @@ def main():
     test_render_preserves_options_order_in_state_block()
     test_render_filters_non_checkbox_custom_options()
     test_non_material_change_is_not_a_trigger()
+    test_merge_state_display_refresh_is_non_material()
     test_exact_title_drift_and_long_title_truncation()
     test_issue_updated_at_trigger_is_strict_and_kind_scoped()
     test_title_only_refresh_preserves_advisory_without_spend_or_comment()
