@@ -126,18 +126,27 @@ jobs:
         run: |
           set -euo pipefail
           tool_dir="$RUNNER_TEMP/wheelhouse-tools"
-          mkdir -p "$tool_dir"
+          trusted_tool_dir="$RUNNER_TEMP/wheelhouse-trusted-tools"
+          mkdir -p "$tool_dir" "$trusted_tool_dir"
           cp "$HANDOFF/runtime/nl_readonly_search.py" "$tool_dir/wheelhouse-search"
-          chmod 500 "$tool_dir" "$tool_dir/wheelhouse-search"
+          cp "$HANDOFF/runtime/nl_readonly_search.py" "$trusted_tool_dir/nl_readonly_search.py"
+          cp "$HANDOFF/runtime/public_clone_provenance.py" "$trusted_tool_dir/wheelhouse-provenance-verify"
+          chmod 400 "$trusted_tool_dir/nl_readonly_search.py"
+          chmod 500 "$tool_dir" "$tool_dir/wheelhouse-search" "$trusted_tool_dir" "$trusted_tool_dir/wheelhouse-provenance-verify"
           echo "$tool_dir" >> "$GITHUB_PATH"
           echo "WHEELHOUSE_SEARCH_ALLOWED_REPOS=$ALLOWED_REPOS" >> "$GITHUB_ENV"
           case "$ACTION" in
             nl-decision.search|triage.pr.search)
               echo "WHEELHOUSE_SEARCH_ACTION=$ACTION" >> "$GITHUB_ENV"
-              provenance_state="/run/wheelhouse-public-clone-$(python -c 'import secrets; print(secrets.token_hex(16))')"
-              sudo -n "$tool_dir/wheelhouse-search" provenance-init-root \
-                "$HANDOFF/bundle/task.json" "$provenance_state"
-              echo "WHEELHOUSE_PUBLIC_CLONE_STATE=$provenance_state" >> "$GITHUB_ENV"
+              # In-turn clone attempts append an UNTRUSTED claim log here. The
+              # model's Bash runs inside the pinned action's bubblewrap
+              # subprocess isolation (--unshare-user --cap-drop ALL), so no
+              # privileged write is possible or attempted during its turn; the
+              # trusted post-turn step below re-clones each claim and derives
+              # every recorded provenance fact from its own observation.
+              claims="$RUNNER_TEMP/wheelhouse-public-clone-claims.json"
+              rm -f "$claims"
+              echo "WHEELHOUSE_PUBLIC_CLONE_CLAIMS=$claims" >> "$GITHUB_ENV"
               ;;
           esac
 
@@ -459,32 +468,19 @@ jobs:
         if: ${{ always() && steps.hydrate.outputs.action == 'triage.pr.search' }}
         run: |
           set -euo pipefail
-          provenance_output="$RUNNER_TEMP/wheelhouse-model-output"
-          case "$provenance_output" in
-            "$RUNNER_TEMP"/*) ;;
-            *) exit 1 ;;
-          esac
-          rm -rf -- "$provenance_output"
-          install -d -m 700 "$provenance_output"
-          provenance_tmp="$provenance_output/.public-clone-provenance.json.tmp"
-          sudo -n "$RUNNER_TEMP/wheelhouse-tools/wheelhouse-search" provenance-export-root \
+          "$RUNNER_TEMP/wheelhouse-trusted-tools/wheelhouse-provenance-verify" \
             "$RUNNER_TEMP/wheelhouse-handoff/bundle/task.json" \
-            "$WHEELHOUSE_PUBLIC_CLONE_STATE" > "$provenance_tmp"
-          if [ -s "$provenance_tmp" ]; then
-            mv "$provenance_tmp" "$provenance_output/public-clone-provenance.json"
-          else
-            rm -f "$provenance_tmp" "$provenance_output/public-clone-provenance.json"
-          fi
+            "${WHEELHOUSE_PUBLIC_CLONE_CLAIMS:-}"
 
       - name: Remove bounded public clones
         if: ${{ always() && (steps.hydrate.outputs.action == 'nl-decision.search' || steps.hydrate.outputs.action == 'triage.pr.search') }}
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/wheelhouse-tools/wheelhouse-search" cleanup
-          if [[ "${WHEELHOUSE_PUBLIC_CLONE_STATE:-}" =~ ^/run/wheelhouse-public-clone-[0-9a-f]{32}$ ]]; then
-            sudo -n "$RUNNER_TEMP/wheelhouse-tools/wheelhouse-search" \
-              provenance-cleanup-root "$WHEELHOUSE_PUBLIC_CLONE_STATE"
-          fi
+          claims="${WHEELHOUSE_PUBLIC_CLONE_CLAIMS:-}"
+          case "$claims" in
+            "$RUNNER_TEMP"/*) rm -f "$claims" ;;
+          esac
 
       - id: capture
         if: ${{ always() && steps.source.outputs.match == 'true' && (steps.hydrate.outcome != 'success' || steps.hydrate.outputs.adapter == 'claude-action-compat') }}

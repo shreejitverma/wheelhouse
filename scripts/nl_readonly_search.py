@@ -53,8 +53,11 @@ SENSITIVE_ENV_RE = re.compile(
 PUBLIC_CLONE_DIR = "wheelhouse-public-clones"
 PUBLIC_CLONE_ACTIONS = frozenset({"nl-decision.search", "triage.pr.search"})
 PUBLIC_CLONE_PROVENANCE_VERSION = 1
+PUBLIC_CLONE_CLAIM_VERSION = 1
+PUBLIC_CLONE_VERIFY_DIR = "wheelhouse-public-clone-verify"
 MAX_PUBLIC_CLONE_ATTEMPTS = 8
 MAX_PUBLIC_CLONE_PROVENANCE_BYTES = 262144
+MAX_PUBLIC_CLONE_CLAIM_BYTES = 65536
 MAX_PUBLIC_URL_CHARS = 2048
 MAX_PUBLIC_REF_CHARS = 255
 PUBLIC_CLONE_TIMEOUT_SECONDS = 90
@@ -794,18 +797,6 @@ def public_clone_context_from_task(task):
     }
 
 
-def _load_public_clone_context(value):
-    if isinstance(value, dict):
-        return value
-    if not value:
-        return None
-    with open(value, encoding="utf-8") as handle:
-        context = json.load(handle)
-    if not isinstance(context, dict):
-        raise ValueError("public clone provenance context is invalid")
-    return context
-
-
 def _write_public_clone_records(path, records):
     if not path:
         return
@@ -827,53 +818,87 @@ def _write_public_clone_records(path, records):
             os.unlink(temporary)
 
 
-def _record_public_clone_attempt(
-    context,
-    path,
-    *,
-    status,
-    url,
-    requested_ref,
-    commit=None,
-    manifest=None,
-    failure=None,
-    state_dir=None,
-):
-    record = {
-        "version": PUBLIC_CLONE_PROVENANCE_VERSION,
-        "context": None,
+def _public_clone_claim(*, status, url, requested_ref, commit=None, failure=None):
+    """One UNTRUSTED in-turn attempt claim.
+
+    The broker shares a uid (and a `Write` tool) with the model, so nothing it
+    writes during the model's turn can be trusted on its own. A successful claim
+    is only a worklist entry naming what to re-clone; failed claims yield only
+    trusted failure records from re-validated source values. See "Nothing in a
+    model turn may require privilege" in AGENTS.md.
+    """
+    return {
+        "version": PUBLIC_CLONE_CLAIM_VERSION,
         "status": status,
         "source": {
             "url": url,
             "requestedRef": requested_ref,
             "resolvedCommit": commit,
         },
-        "manifest": manifest,
         "failure": failure,
     }
-    if state_dir:
-        result = subprocess.run(
-            ["sudo", "-n", os.path.abspath(__file__), "provenance-record-root", state_dir],
-            input=json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n",
-            capture_output=True,
-            text=True,
-            timeout=10,
+
+
+def _write_public_clone_claims(path, claims):
+    if len(claims) > MAX_PUBLIC_CLONE_ATTEMPTS:
+        raise ValueError("public clone claims exceed the attempt limit")
+    encoded = (
+        json.dumps(claims, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_PUBLIC_CLONE_CLAIM_BYTES:
+        raise ValueError("public clone claims exceed the byte limit")
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".public-clone-claims-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _record_public_clone_attempt(
+    claims_path,
+    *,
+    status,
+    url,
+    requested_ref,
+    commit=None,
+    failure=None,
+):
+    if not claims_path:
+        return
+    claim = _public_clone_claim(
+        status=status,
+        url=url,
+        requested_ref=requested_ref,
+        commit=commit,
+        failure=failure,
+    )
+    claims = []
+    if os.path.isfile(claims_path) and not os.path.islink(claims_path):
+        if os.path.getsize(claims_path) > MAX_PUBLIC_CLONE_CLAIM_BYTES:
+            raise ValueError("public clone claims exceed the byte limit")
+        with open(claims_path, encoding="utf-8") as handle:
+            claims = json.load(handle)
+        if not isinstance(claims, list):
+            raise ValueError("public clone claim log is invalid")
+    claims.append(claim)
+    _write_public_clone_claims(claims_path, claims)
+
+
+def _record_public_clone_attempt_best_effort(claims_path, **claim):
+    try:
+        _record_public_clone_attempt(claims_path, **claim)
+    except Exception as error:
+        print(
+            "wheelhouse-search: public clone claim not recorded: %s"
+            % type(error).__name__,
+            file=sys.stderr,
         )
-        if result.returncode != 0:
-            raise ValueError("trusted public clone provenance recording failed")
-        return
-    context = _load_public_clone_context(context)
-    if context is None or not path:
-        return
-    record["context"] = context
-    records = []
-    if os.path.isfile(path) and not os.path.islink(path):
-        with open(path, encoding="utf-8") as handle:
-            records = json.load(handle)
-        if not isinstance(records, list):
-            raise ValueError("public clone provenance log is invalid")
-    records.append(record)
-    _write_public_clone_records(path, records)
 
 
 def validate_public_clone_provenance(records, task):
@@ -954,77 +979,181 @@ def export_public_clone_provenance(task_path, provenance_path, output_path):
     return True
 
 
-_ROOT_STATE_RE = re.compile(r"^/run/wheelhouse-public-clone-[0-9a-f]{32}$")
+def parse_public_clone_claims(claims_path):
+    """Read the UNTRUSTED in-turn claim log; fail closed on anything malformed."""
+    if (
+        not claims_path
+        or os.path.islink(claims_path)
+        or not os.path.isfile(claims_path)
+    ):
+        return []
+    if os.path.getsize(claims_path) > MAX_PUBLIC_CLONE_CLAIM_BYTES:
+        raise ValueError("public clone claims exceed the byte limit")
+    with open(claims_path, encoding="utf-8") as handle:
+        claims = json.load(handle)
+    if not isinstance(claims, list) or len(claims) > MAX_PUBLIC_CLONE_ATTEMPTS:
+        raise ValueError("public clone claim log is invalid")
+    for claim in claims:
+        if (
+            not isinstance(claim, dict)
+            or set(claim) != {"version", "status", "source", "failure"}
+            or claim.get("version") != PUBLIC_CLONE_CLAIM_VERSION
+            or claim.get("status") not in {"succeeded", "failed"}
+        ):
+            raise ValueError("public clone claim is invalid")
+        source = claim.get("source")
+        if (
+            not isinstance(source, dict)
+            or set(source) != {"url", "requestedRef", "resolvedCommit"}
+            or not isinstance(source.get("url"), str)
+            or not source["url"]
+            or len(source["url"]) > MAX_PUBLIC_URL_CHARS
+        ):
+            raise ValueError("public clone claim source is invalid")
+        requested_ref = source.get("requestedRef")
+        if requested_ref is not None and (
+            not isinstance(requested_ref, str)
+            or len(requested_ref) > MAX_PUBLIC_REF_CHARS
+        ):
+            raise ValueError("public clone claim ref is invalid")
+        commit = source.get("resolvedCommit")
+        if claim["status"] == "succeeded":
+            if claim.get("failure") is not None or not re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit or ""
+            ):
+                raise ValueError("public clone claim commit is invalid")
+        elif (
+            commit is not None
+            or not isinstance(claim.get("failure"), str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", claim["failure"])
+        ):
+            raise ValueError("public clone claim failure is invalid")
+    return claims
 
 
-def _root_state_path(value, require_exists=True):
-    if os.geteuid() != 0 or not isinstance(value, str) or not _ROOT_STATE_RE.fullmatch(value):
-        raise ValueError("trusted public clone state boundary is invalid")
-    if require_exists:
-        info = os.lstat(value)
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
-            raise ValueError("trusted public clone state boundary is invalid")
-    return value
+def _public_clone_verify_root():
+    base = os.environ.get("RUNNER_TEMP", "").strip() or tempfile.gettempdir()
+    return os.path.join(
+        os.path.realpath(base), PUBLIC_CLONE_VERIFY_DIR, PUBLIC_CLONE_DIR
+    )
 
 
-def init_root_public_clone_provenance(task_path, state_dir):
-    state_dir = _root_state_path(state_dir, require_exists=False)
-    if os.path.lexists(state_dir):
-        raise ValueError("trusted public clone state already exists")
-    with open(task_path, "rb") as handle:
-        task_bytes = handle.read(16 * 1024 * 1024 + 1)
-    if len(task_bytes) > 16 * 1024 * 1024:
-        raise ValueError("public clone task exceeds the byte limit")
-    task = json.loads(task_bytes)
-    public_clone_context_from_task(task)
-    os.mkdir(state_dir, 0o700)
-    task_copy = os.path.join(state_dir, "task.json")
-    with open(task_copy, "xb") as handle:
-        handle.write(task_bytes)
-    os.chmod(task_copy, 0o400)
+def _observe_public_clone_claim(source, *, runner, resolver, clone_root):
+    """Re-clone one claimed source HERE and return the trusted observation.
+
+    Returns None when this run cannot reproduce the claimed commit, so an
+    unverifiable claim can never contribute a `succeeded` record.
+    """
+    request = {"op": "public_clone", "url": source["url"]}
+    if source["requestedRef"] is not None:
+        request["ref"] = source["requestedRef"]
+    try:
+        observed = json.loads(
+            _public_clone_request(
+                request,
+                runner=runner,
+                resolver=resolver,
+                clone_root=clone_root,
+                claims_path=None,
+            )
+        )
+    except Exception:
+        return None
+    if observed.get("commit") != source["resolvedCommit"]:
+        return None
+    return observed
 
 
-def record_root_public_clone_provenance(state_dir, raw_record):
-    state_dir = _root_state_path(state_dir)
-    if len(raw_record.encode("utf-8")) > MAX_PUBLIC_CLONE_PROVENANCE_BYTES:
-        raise ValueError("public clone provenance exceeds the byte limit")
-    with open(os.path.join(state_dir, "task.json"), encoding="utf-8") as handle:
-        task = json.load(handle)
-    record = json.loads(raw_record)
-    if not isinstance(record, dict):
-        raise ValueError("public clone provenance record is invalid")
-    record["context"] = public_clone_context_from_task(task)
-    attempts = os.path.join(state_dir, "attempts.json")
-    records = []
-    if os.path.isfile(attempts) and not os.path.islink(attempts):
-        with open(attempts, encoding="utf-8") as handle:
-            records = json.load(handle)
-    records.append(record)
-    validate_public_clone_provenance(records, task)
-    _write_public_clone_records(attempts, records)
+def _trusted_failed_clone_source(source, *, resolver):
+    canonical_url = ""
+    requested_ref = None
+    try:
+        canonical_url, _ = validate_public_git_url(source.get("url"), resolver=resolver)
+    except Exception:
+        pass
+    try:
+        requested_ref = _safe_public_ref(source.get("requestedRef"))
+    except Exception:
+        pass
+    return {
+        "url": canonical_url,
+        "requestedRef": requested_ref,
+        "resolvedCommit": None,
+    }
 
 
-def export_root_public_clone_provenance(task_path, state_dir):
-    state_dir = _root_state_path(state_dir)
-    attempts = os.path.join(state_dir, "attempts.json")
-    if not os.path.isfile(attempts) or os.path.islink(attempts):
-        return False
+def verify_public_clone_claims(
+    task_path,
+    claims_path,
+    output_path,
+    *,
+    runner=run_public_git,
+    resolver=socket.getaddrinfo,
+    clone_root=None,
+):
+    """Derive the TRUSTED provenance records from the untrusted claim log.
+
+    This runs only in the trusted post-turn context, after the sandboxed model
+    step has exited, so nothing the model can reach produces a recorded fact.
+    Every `succeeded` record's resolved commit, manifest, and SHA-256
+    observations come from THIS run's own clone; the claim only names what to
+    re-clone, and its URL is re-validated by the ordinary request path. Failed
+    claims are not cloned and can yield only re-validated source values plus a
+    trusted failure token. A succeeded claim whose commit cannot be reproduced
+    here is demoted under the same trusted failure-record contract.
+    """
     with open(task_path, encoding="utf-8") as handle:
-        expected_task = json.load(handle)
-    with open(os.path.join(state_dir, "task.json"), encoding="utf-8") as handle:
-        state_task = json.load(handle)
-    if expected_task != state_task:
-        raise ValueError("public clone task binding mismatch")
-    with open(attempts, encoding="utf-8") as handle:
-        records = json.load(handle)
-    validate_public_clone_provenance(records, expected_task)
-    sys.stdout.write(json.dumps(records, sort_keys=True, separators=(",", ":")) + "\n")
+        task = json.load(handle)
+    context = public_clone_context_from_task(task)
+    claims = parse_public_clone_claims(claims_path)
+    if not claims:
+        return False
+    if len(claims) != 1:
+        raise ValueError("public clone verification requires exactly one claim")
+    root = clone_root or _public_clone_verify_root()
+    records = []
+    try:
+        for claim in claims:
+            source = claim["source"]
+            observed = (
+                _observe_public_clone_claim(
+                    source, runner=runner, resolver=resolver, clone_root=root
+                )
+                if claim["status"] == "succeeded"
+                else None
+            )
+            records.append(
+                {
+                    "version": PUBLIC_CLONE_PROVENANCE_VERSION,
+                    "context": context,
+                    "status": "succeeded" if observed else "failed",
+                    "source": (
+                        {
+                            "url": observed["url"],
+                            "requestedRef": _safe_public_ref(
+                                source["requestedRef"]
+                            ),
+                            "resolvedCommit": observed["commit"],
+                        }
+                        if observed
+                        else _trusted_failed_clone_source(source, resolver=resolver)
+                    ),
+                    "manifest": observed["manifest"] if observed else None,
+                    "failure": None
+                    if observed
+                    else (
+                        "Unobserved"
+                        if claim["status"] == "failed"
+                        else "Unreproducible"
+                    ),
+                }
+            )
+    finally:
+        cleanup_public_clones(root)
+        shutil.rmtree(os.path.dirname(root), ignore_errors=True)
+    validate_public_clone_provenance(records, task)
+    _write_public_clone_records(output_path, records)
     return True
-
-
-def cleanup_root_public_clone_provenance(state_dir):
-    state_dir = _root_state_path(state_dir)
-    shutil.rmtree(state_dir)
 
 
 def _public_clone_request(
@@ -1032,9 +1161,7 @@ def _public_clone_request(
     runner=run_public_git,
     resolver=socket.getaddrinfo,
     clone_root=None,
-    provenance_context=None,
-    provenance_file=None,
-    provenance_state=None,
+    claims_path=None,
 ):
     root = _public_clone_root(clone_root)
     try:
@@ -1082,21 +1209,17 @@ def _public_clone_request(
             "location": source,
             "manifest": manifest,
         }
-        _record_public_clone_attempt(
-            provenance_context,
-            provenance_file,
+        _record_public_clone_attempt_best_effort(
+            claims_path,
             status="succeeded",
             url=canonical_url,
             requested_ref=ref,
             commit=commit,
-            manifest=manifest,
-            state_dir=provenance_state,
         )
         return _cap(json.dumps(result, sort_keys=True, indent=2) + "\n")
     except Exception as error:
-        _record_public_clone_attempt(
-            provenance_context,
-            provenance_file,
+        _record_public_clone_attempt_best_effort(
+            claims_path,
             status="failed",
             url=str(req.get("url") or "")[:MAX_PUBLIC_URL_CHARS],
             requested_ref=(
@@ -1105,7 +1228,6 @@ def _public_clone_request(
                 else None
             ),
             failure=type(error).__name__,
-            state_dir=provenance_state,
         )
         cleanup_public_clones(root)
         raise
@@ -1175,9 +1297,7 @@ def handle_request(
     resolver=socket.getaddrinfo,
     clone_root=None,
     action="",
-    provenance_context=None,
-    provenance_file=None,
-    provenance_state=None,
+    claims_path=None,
 ):
     if not isinstance(req, dict):
         raise ValueError("request must be a JSON object")
@@ -1217,9 +1337,7 @@ def handle_request(
             runner=public_runner,
             resolver=resolver,
             clone_root=clone_root,
-            provenance_context=provenance_context,
-            provenance_file=provenance_file,
-            provenance_state=provenance_state,
+            claims_path=claims_path,
         )
     if not allowed:
         raise ValueError("no repositories are allowed for search")
@@ -1351,7 +1469,7 @@ def cmd_run():
             _read_request(),
             _env_allowed_repos(),
             action=os.environ.get("WHEELHOUSE_SEARCH_ACTION", ""),
-            provenance_state=os.environ.get("WHEELHOUSE_PUBLIC_CLONE_STATE", ""),
+            claims_path=os.environ.get("WHEELHOUSE_PUBLIC_CLONE_CLAIMS", ""),
         )
     except Exception as exc:
         print("wheelhouse-search error: %s" % exc, file=sys.stderr)
@@ -1362,19 +1480,6 @@ def cmd_run():
 
 
 def main():
-    if len(sys.argv) == 4 and sys.argv[1] == "provenance-init-root":
-        init_root_public_clone_provenance(sys.argv[2], sys.argv[3])
-        return
-    if len(sys.argv) == 3 and sys.argv[1] == "provenance-record-root":
-        raw_record = sys.stdin.read(MAX_PUBLIC_CLONE_PROVENANCE_BYTES + 1)
-        record_root_public_clone_provenance(sys.argv[2], raw_record)
-        return
-    if len(sys.argv) == 4 and sys.argv[1] == "provenance-export-root":
-        export_root_public_clone_provenance(sys.argv[2], sys.argv[3])
-        return
-    if len(sys.argv) == 3 and sys.argv[1] == "provenance-cleanup-root":
-        cleanup_root_public_clone_provenance(sys.argv[2])
-        return
     if len(sys.argv) == 2 and sys.argv[1] == "install":
         cmd_install()
         return

@@ -105,6 +105,7 @@ def _copy_runtime(destination: Path) -> None:
         shutil.copyfile(ROOT / name, target)
     shutil.copytree(ROOT / "schemas", package / "schemas")
     shutil.copyfile(ROOT.parent / "scripts" / "nl_readonly_search.py", destination / "runtime" / "nl_readonly_search.py")
+    shutil.copyfile(ROOT.parent / "scripts" / "public_clone_provenance.py", destination / "runtime" / "public_clone_provenance.py")
 
 
 def _verify_bundle(task: dict[str, Any], bundle: Path) -> None:

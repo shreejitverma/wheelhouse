@@ -49,10 +49,16 @@ addresses before it starts Git. Git receives an explicit credential-free
 environment with a fresh home and configuration, prompting and credential
 helpers disabled, and no model, GitHub, cloud, or runner credentials inherited.
 The shallow data-only clone is retained outside the target workspace only for
-the model step, then a trusted `always()` step removes it. The broker records
-the exact URL, requested ref, resolved commit, bounded manifest, and exact-file
-SHA-256 observations in root-owned transient state. The model cannot replace
-that state, and a trusted post-model step exports it before cleanup.
+the model step, then a trusted `always()` step removes it. The model's turn is
+unprivileged by construction: the pinned action runs its Bash inside bubblewrap
+with `--unshare-user --cap-drop ALL`, so the broker attempts no privilege
+escalation and records only an untrusted claim naming the URL, requested ref,
+and resolved commit. Before cleanup, a trusted post-model step re-clones each
+successful claim and derives the recorded commit, bounded manifest, and
+exact-file SHA-256 observations from its own observation. Failed claims are not
+cloned again: trusted code re-validates their source values and emits a fixed
+failure token. A successful claim whose commit that step cannot reproduce
+becomes a failure record, so a forged claim can never yield a `succeeded` one.
 
 The retained-tree file-count and byte limits are enforced after stock Git
 finishes cloning and after its `.git` administration is removed. Stock Git

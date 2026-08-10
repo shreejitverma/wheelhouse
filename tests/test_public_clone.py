@@ -4,11 +4,14 @@
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 from unittest.mock import patch
+
+import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -18,6 +21,7 @@ import nl_readonly_search as nls  # noqa: E402
 import render_card  # noqa: E402
 from agent_runtime.claude_bridge import ContractError, validate_schema  # noqa: E402
 from agent_runtime.task_builder import claude_declared_tools  # noqa: E402
+from fixtures.public_clone_pre_fix import inspect_with_escalation  # noqa: E402
 
 _failures = []
 PUBLIC_IP = "93.184.216.34"
@@ -128,8 +132,7 @@ def clone_request(
     url="https://git.example/team/repo.git",
     ref=None,
     action="nl-decision.search",
-    provenance_context=None,
-    provenance_file=None,
+    claims_file=None,
 ):
     request = {"op": "public_clone", "url": url}
     if ref is not None:
@@ -141,8 +144,27 @@ def clone_request(
         resolver=public_resolver,
         clone_root=root,
         action=action,
-        provenance_context=provenance_context,
-        provenance_file=provenance_file,
+        claims_path=claims_file,
+    )
+
+
+def verify_claims(task, claims_file, provenance_file, runner, parent):
+    """Run the trusted post-turn verifier the production capture step runs."""
+    task_path = os.path.join(
+        parent, "task-%s.json" % os.path.basename(provenance_file)
+    )
+    with open(task_path, "w", encoding="utf-8") as handle:
+        json.dump(task, handle)
+    verify_root = os.path.join(
+        parent, "verify-%s" % os.path.basename(provenance_file), nls.PUBLIC_CLONE_DIR
+    )
+    return nls.verify_public_clone_claims(
+        task_path,
+        claims_file,
+        provenance_file,
+        runner=runner,
+        resolver=public_resolver,
+        clone_root=verify_root,
     )
 
 
@@ -788,6 +810,482 @@ def test_source_review_correction_contracts():
         )
 
 
+def _privilege_shims(parent):
+    """A PATH front-loaded with recording stand-ins for every escalation tool.
+
+    The pinned action runs the model's Bash inside bubblewrap with
+    `--unshare-user --cap-drop ALL`, where no escalation can ever succeed, so a
+    broker that reaches for one during the model's turn is broken by
+    construction. These shims make any such attempt observable and failing,
+    exactly as the sandbox does.
+    """
+    shim_dir = os.path.join(parent, "privilege-shims")
+    os.makedirs(shim_dir, exist_ok=True)
+    log = os.path.join(parent, "escalation.log")
+    for name in ("sudo", "su", "doas", "pkexec"):
+        path = os.path.join(shim_dir, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "%s $*" >> "%s"\n'
+                'echo "%s: The \\"no new privileges\\" flag is set" >&2\n'
+                "exit 1\n" % ("%s", name, log, name)
+            )
+        os.chmod(path, 0o755)
+    return shim_dir, log
+
+
+def test_public_clone_before_after_sandbox_reproduction():
+    with tempfile.TemporaryDirectory() as parent:
+        shim_dir, log = _privilege_shims(parent)
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = shim_dir + os.pathsep + original_path
+        url = "https://forge.example/catalog/tool.git"
+        ref = "v1.0.0"
+        root = clone_root(parent)
+
+        def run_path(before):
+            runner = StockGit(retained_files={"README.md": "package source\n"})
+
+            def inspect():
+                return clone_request(
+                    runner,
+                    root,
+                    url=url,
+                    ref=ref,
+                    action="triage.pr.search",
+                    claims_file=None if before else os.path.join(parent, "claims.json"),
+                )
+
+            try:
+                if before:
+                    output = inspect_with_escalation(
+                        inspect,
+                        os.path.join(parent, "root-state"),
+                        url,
+                        ref,
+                    )
+                else:
+                    output = inspect()
+                return {
+                    "status": "inspection completed",
+                    "inspection": json.loads(output),
+                    "git_calls": runner.calls,
+                }
+            except ValueError as error:
+                return {
+                    "status": "failed",
+                    "error": str(error),
+                    "git_calls": runner.calls,
+                }
+
+        try:
+            before = run_path(True)
+            after = run_path(False)
+            operations = [
+                "clone" if "clone" in call["args"] else "rev-parse"
+                for call in after["git_calls"]
+            ]
+            check(
+                "sandbox A/B: pre-fix bookkeeping destroys a completed clone",
+                before["error"] == "trusted public clone provenance recording failed",
+            )
+            check(
+                "sandbox A/B: post-turn design returns a completed inspection",
+                after["status"] == "inspection completed"
+                and after["inspection"]["commit"] == COMMIT
+                and after["inspection"]["manifest"]["file_count"] == 1,
+            )
+            check(
+                "sandbox A/B: both paths perform identical successful Git operations",
+                before["git_calls"] == after["git_calls"]
+                and operations == ["clone", "rev-parse"],
+            )
+            check(
+                "sandbox A/B: only the frozen pre-fix path attempts escalation",
+                os.path.isfile(log),
+            )
+        finally:
+            os.environ["PATH"] = original_path
+
+
+def test_sandboxed_turn_never_escalates_privilege():
+    """Cards axi#130/#111 class: every public_clone failed with a bookkeeping
+    error because the broker recorded provenance through `sudo`, which the
+    model's sandbox can never grant. The turn must now stay unprivileged."""
+    with tempfile.TemporaryDirectory() as parent:
+        shim_dir, log = _privilege_shims(parent)
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = shim_dir + os.pathsep + original_path
+        try:
+            claims_file = os.path.join(parent, "claims.json")
+            result = json.loads(
+                clone_request(
+                    StockGit(retained_files={"README.md": "package source\n"}),
+                    clone_root(parent),
+                    url="https://forge.example/catalog/tool.git",
+                    ref="v1.0.0",
+                    action="triage.pr.search",
+                    claims_file=claims_file,
+                )
+            )
+            escalated = os.path.exists(log)
+            check(
+                "sandboxed turn: a successful clone completes with no escalation attempt",
+                not escalated
+                and result["commit"] == COMMIT
+                and os.path.isfile(os.path.join(result["location"], "README.md")),
+            )
+            check(
+                "sandboxed turn: the successful clone survives instead of being destroyed by bookkeeping",
+                json.load(open(claims_file, encoding="utf-8"))[0]["status"]
+                == "succeeded",
+            )
+
+            malformed_claims = os.path.join(parent, "malformed-claims.json")
+            with open(malformed_claims, "w", encoding="utf-8") as handle:
+                json.dump({"model": "controlled"}, handle)
+            malformed_result = json.loads(
+                clone_request(
+                    StockGit(retained_files={"README.md": "package source\n"}),
+                    clone_root(os.path.join(parent, "malformed-root")),
+                    url="https://forge.example/catalog/tool.git",
+                    ref="v1.0.0",
+                    action="triage.pr.search",
+                    claims_file=malformed_claims,
+                )
+            )
+            check(
+                "sandboxed turn: malformed untrusted bookkeeping cannot destroy a completed inspection",
+                malformed_result["commit"] == COMMIT
+                and os.path.isfile(
+                    os.path.join(malformed_result["location"], "README.md")
+                )
+                and json.load(open(malformed_claims, encoding="utf-8"))
+                == {"model": "controlled"},
+            )
+
+            unwritable = os.path.join(parent, "unwritable-dir")
+            os.makedirs(unwritable, exist_ok=True)
+            os.chmod(unwritable, 0o500)
+            try:
+                check(
+                    "sandboxed turn: a clone failure reports its own cause, never a provenance message",
+                    rejected(
+                        lambda: clone_request(
+                            StockGit(clone_returncode=1),
+                            clone_root(os.path.join(parent, "masked-root")),
+                            url="https://forge.example/catalog/tool.git",
+                            action="triage.pr.search",
+                            claims_file=os.path.join(unwritable, "claims.json"),
+                        ),
+                        "public Git operation failed",
+                    ),
+                )
+            finally:
+                os.chmod(unwritable, 0o700)
+            check(
+                "sandboxed turn: the failure path also makes no escalation attempt",
+                not os.path.exists(log),
+            )
+        finally:
+            os.environ["PATH"] = original_path
+
+
+def test_post_turn_verification_owns_every_recorded_fact():
+    with tempfile.TemporaryDirectory() as parent:
+        task = {
+            "metadata": {
+                "action": "triage.pr.search",
+                "idempotencyKey": "d" * 64,
+                "target": {
+                    "owner": "owner",
+                    "repo": "catalog",
+                    "number": 7,
+                    "kind": "pr-review",
+                    "revision": "a" * 40,
+                },
+                "sourceReview": None,
+            }
+        }
+        real_files = {"README.md": "package source\n", "src/cli.py": "print(1)\n"}
+
+        def write_claims(name, claims):
+            path = os.path.join(parent, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(claims, handle)
+            return path
+
+        def claim(status="succeeded", url=None, ref="v1.0.0", commit=COMMIT, failure=None):
+            return {
+                "version": 1,
+                "status": status,
+                "source": {
+                    "url": url or "https://forge.example/catalog/tool.git",
+                    "requestedRef": ref,
+                    "resolvedCommit": commit,
+                },
+                "failure": failure,
+            }
+
+        honest = os.path.join(parent, "honest.json")
+        verify_claims(
+            task, write_claims("c-honest.json", [claim()]), honest,
+            StockGit(retained_files=real_files), parent,
+        )
+        records = json.load(open(honest, encoding="utf-8"))
+        observed_paths = sorted(row["path"] for row in records[0]["manifest"]["observations"])
+        check(
+            "post-turn verification: the record's commit, manifest, and digests come from the verifier's own clone",
+            len(records) == 1
+            and records[0]["status"] == "succeeded"
+            and records[0]["source"]["resolvedCommit"] == COMMIT
+            and observed_paths == sorted(real_files)
+            and all(
+                row["sha256"]
+                == hashlib.sha256(real_files[row["path"]].encode("utf-8")).hexdigest()
+                for row in records[0]["manifest"]["observations"]
+            ),
+        )
+
+        failed = os.path.join(parent, "failed.json")
+        failed_runner = StockGit(retained_files=real_files)
+        verify_claims(
+            task,
+            write_claims(
+                "c-failed.json",
+                [
+                    claim(
+                        status="failed",
+                        url="HTTPS://Forge.Example/catalog/tool.git",
+                        ref="release/v1",
+                        commit=None,
+                        failure="AttackerChosen",
+                    )
+                ],
+            ),
+            failed,
+            failed_runner,
+            parent,
+        )
+        failed_records = json.load(open(failed, encoding="utf-8"))
+        check(
+            "post-turn verification: an in-turn failure becomes only a trusted re-validated failure record",
+            len(failed_records) == 1
+            and failed_records[0]["status"] == "failed"
+            and failed_records[0]["source"]
+            == {
+                "url": "https://forge.example/catalog/tool.git",
+                "requestedRef": "release/v1",
+                "resolvedCommit": None,
+            }
+            and failed_records[0]["manifest"] is None
+            and failed_records[0]["failure"] == "Unobserved"
+            and failed_runner.calls == [],
+        )
+
+        forged = os.path.join(parent, "forged.json")
+        forged_runner = StockGit(retained_files=real_files)
+        verify_claims(
+            task,
+            write_claims("c-forged.json", [claim(commit="f" * 40)]),
+            forged,
+            forged_runner,
+            parent,
+        )
+        forged_records = json.load(open(forged, encoding="utf-8"))
+        check(
+            "post-turn verification: a claimed commit this run cannot reproduce is demoted to a failure record",
+            len(forged_records) == 1
+            and forged_records[0]["status"] == "failed"
+            and forged_records[0]["manifest"] is None
+            and forged_records[0]["source"]["resolvedCommit"] is None
+            and forged_records[0]["failure"] == "Unreproducible"
+            and len(forged_runner.calls) == 2,
+        )
+
+        unreachable = os.path.join(parent, "unreachable.json")
+        task_path = os.path.join(parent, "task-ssrf.json")
+        with open(task_path, "w", encoding="utf-8") as handle:
+            json.dump(task, handle)
+        nls.verify_public_clone_claims(
+            task_path,
+            write_claims(
+                "c-ssrf.json", [claim(url="https://internal.example/secrets.git")]
+            ),
+            unreachable,
+            runner=StockGit(retained_files=real_files),
+            resolver=resolver_for("169.254.169.254"),
+            clone_root=os.path.join(parent, "ssrf-verify", nls.PUBLIC_CLONE_DIR),
+        )
+        unreachable_record = json.load(open(unreachable, encoding="utf-8"))[0]
+        check(
+            "post-turn verification: a model-authored claim URL is re-validated, so a private target cannot be recorded",
+            unreachable_record["status"] == "failed"
+            and unreachable_record["source"]["url"] == ""
+            and unreachable_record["failure"] == "Unreproducible",
+        )
+
+        empty = os.path.join(parent, "none.json")
+        check(
+            "post-turn verification: no claims writes no provenance at all",
+            nls.verify_public_clone_claims(
+                task_path,
+                os.path.join(parent, "absent.json"),
+                empty,
+                runner=StockGit(),
+                resolver=public_resolver,
+            )
+            is False
+            and not os.path.exists(empty),
+        )
+        broker_attempt = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(ROOT, "scripts", "nl_readonly_search.py"),
+                "provenance-verify",
+                task_path,
+                os.path.join(parent, "absent.json"),
+                empty,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        check(
+            "post-turn verification: the model-facing broker does not expose verification",
+            broker_attempt.returncode != 0 and not os.path.exists(empty),
+        )
+
+        multiple_runner = StockGit(retained_files=real_files)
+        check(
+            "post-turn verification: multiple untrusted claims fail before any clone",
+            rejected(
+                lambda: nls.verify_public_clone_claims(
+                    task_path,
+                    write_claims("c-multiple.json", [claim(), claim()]),
+                    os.path.join(parent, "multiple.json"),
+                    runner=multiple_runner,
+                    resolver=public_resolver,
+                    clone_root=os.path.join(parent, "multiple-verify", nls.PUBLIC_CLONE_DIR),
+                ),
+                "exactly one claim",
+            )
+            and multiple_runner.calls == [],
+        )
+
+        malformed = os.path.join(parent, "malformed-out.json")
+        for name, payload in (
+            ("not-a-list", {"status": "succeeded"}),
+            ("bad-version", [dict(claim(), version=2)]),
+            ("bad-status", [dict(claim(), status="maybe")]),
+            ("succeeded-without-commit", [claim(commit=None)]),
+            ("too-many", [claim() for _ in range(nls.MAX_PUBLIC_CLONE_ATTEMPTS + 1)]),
+        ):
+            check(
+                "post-turn verification: a malformed claim log fails closed with no provenance (%s)" % name,
+                rejected(
+                    lambda payload=payload, name=name: nls.verify_public_clone_claims(
+                        task_path,
+                        write_claims("c-%s.json" % name, payload),
+                        malformed,
+                        runner=StockGit(retained_files=real_files),
+                        resolver=public_resolver,
+                        clone_root=os.path.join(
+                            parent, "bad-%s" % name, nls.PUBLIC_CLONE_DIR
+                        ),
+                    )
+                )
+                and not os.path.exists(malformed),
+            )
+
+
+def test_workflow_capture_interface():
+    workflow = yaml.safe_load(read(".github", "workflows", "claude-model.yml"))
+    steps = workflow["jobs"]["model"]["steps"]
+    capture = next(
+        step
+        for step in steps
+        if step.get("name") == "Capture trusted public-clone provenance"
+    )
+    with tempfile.TemporaryDirectory() as parent:
+        trusted_tools = os.path.join(parent, "wheelhouse-trusted-tools")
+        handoff = os.path.join(parent, "wheelhouse-handoff", "bundle")
+        os.makedirs(trusted_tools)
+        os.makedirs(handoff)
+        for source, target in (
+            ("public_clone_provenance.py", "wheelhouse-provenance-verify"),
+            ("nl_readonly_search.py", "nl_readonly_search.py"),
+        ):
+            destination = os.path.join(trusted_tools, target)
+            shutil.copyfile(os.path.join(ROOT, "scripts", source), destination)
+            os.chmod(destination, 0o500 if target == "wheelhouse-provenance-verify" else 0o400)
+        task = {
+            "metadata": {
+                "action": "triage.pr.search",
+                "idempotencyKey": "d" * 64,
+                "target": {
+                    "owner": "owner",
+                    "repo": "catalog",
+                    "number": 7,
+                    "kind": "pr-review",
+                    "revision": "a" * 40,
+                },
+                "sourceReview": None,
+            }
+        }
+        with open(os.path.join(handoff, "task.json"), "w", encoding="utf-8") as handle:
+            json.dump(task, handle)
+        claims = os.path.join(parent, "claims.json")
+        with open(claims, "w", encoding="utf-8") as handle:
+            json.dump(
+                [
+                    {
+                        "version": 1,
+                        "status": "failed",
+                        "source": {
+                            "url": "https://forge.example/catalog/tool.git",
+                            "requestedRef": "v1.0.0",
+                            "resolvedCommit": None,
+                        },
+                        "failure": "CloneFailed",
+                    }
+                ],
+                handle,
+            )
+        output = os.path.join(parent, "wheelhouse-model-output")
+        planted = os.path.join(parent, "model-planted-output")
+        os.makedirs(planted)
+        with open(os.path.join(planted, "marker"), "w", encoding="utf-8") as handle:
+            handle.write("untrusted")
+        os.symlink(planted, output)
+        env = dict(os.environ)
+        env.update(
+            {
+                "RUNNER_TEMP": parent,
+                "WHEELHOUSE_PUBLIC_CLONE_CLAIMS": claims,
+            }
+        )
+        result = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", capture["run"]],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        provenance = os.path.join(output, "public-clone-provenance.json")
+        records = json.load(open(provenance, encoding="utf-8")) if os.path.isfile(provenance) else []
+        check(
+            "trusted provenance: the workflow capture executable rebuilds output and records verified failure",
+            result.returncode == 0
+            and not os.path.islink(output)
+            and os.path.isfile(os.path.join(planted, "marker"))
+            and records
+            and records[0]["status"] == "failed"
+            and records[0]["failure"] == "Unobserved"
+            and (os.stat(output).st_mode & 0o777) == 0o700,
+        )
+
+
 def test_initial_triage_independent_vision_source_review_contract():
     triage = read(".github", "workflows", "triage.yml")
     required_prompt_fragments = (
@@ -1070,6 +1568,7 @@ def test_initial_triage_independent_vision_source_review_contract():
         }
         context = nls.public_clone_context_from_task(task)
         provenance_file = os.path.join(parent, "provenance.json")
+        claims_file = os.path.join(parent, "claims.json")
         result = json.loads(
             clone_request(
                 StockGit(retained_files=representative_files),
@@ -1077,9 +1576,31 @@ def test_initial_triage_independent_vision_source_review_contract():
                 url="https://forge.example/catalog/tool.git",
                 ref="release/v1.2",
                 action="triage.pr.search",
-                provenance_context=context,
-                provenance_file=provenance_file,
+                claims_file=claims_file,
             )
+        )
+        check(
+            "in-turn claim: the model turn records only an untrusted worklist entry",
+            json.load(open(claims_file, encoding="utf-8"))
+            == [
+                {
+                    "version": 1,
+                    "status": "succeeded",
+                    "source": {
+                        "url": "https://forge.example/catalog/tool.git",
+                        "requestedRef": "release/v1.2",
+                        "resolvedCommit": COMMIT,
+                    },
+                    "failure": None,
+                }
+            ],
+        )
+        verify_claims(
+            task,
+            claims_file,
+            provenance_file,
+            StockGit(retained_files=representative_files),
+            parent,
         )
         expected_paths = sorted(representative_files)
         expected_observations = [
@@ -1448,20 +1969,30 @@ def test_initial_triage_independent_vision_source_review_contract():
             url="https://forge.example/catalog/tool.git",
             ref="release/v1.2",
             action="triage.pr.search",
-            provenance_context=context,
-            provenance_file=provenance_file,
+            claims_file=claims_file,
         )
-        ambiguous = render_card.enforce_triage_source_provenance(
-            candidate, provenance_file, external_vision_file, external_facts_file, **expected_binding
-        )
+        ambiguous_file = os.path.join(parent, "ambiguous.json")
+        ambiguous_runner = StockGit(retained_files=representative_files)
         check(
-            "fail closed: multiple same-turn clone observations are ambiguous",
-            "aligns_with_vision" not in ambiguous["automerge"],
+            "fail closed: multiple same-turn clone observations are rejected before verification",
+            rejected(
+                lambda: verify_claims(
+                    task,
+                    claims_file,
+                    ambiguous_file,
+                    ambiguous_runner,
+                    parent,
+                ),
+                "exactly one claim",
+            )
+            and ambiguous_runner.calls == []
+            and not os.path.exists(ambiguous_file),
         )
 
         failed_file = os.path.join(parent, "failed.json")
+        failed_claims = os.path.join(parent, "failed-claims.json")
         check(
-            "fixture: failed public clone is recorded",
+            "fixture: a failed public clone reports its OWN error, not a bookkeeping one",
             rejected(
                 lambda: clone_request(
                     StockGit(clone_returncode=1),
@@ -1469,11 +2000,17 @@ def test_initial_triage_independent_vision_source_review_contract():
                     url="https://forge.example/catalog/tool.git",
                     ref="release/v1.2",
                     action="triage.pr.search",
-                    provenance_context=context,
-                    provenance_file=failed_file,
+                    claims_file=failed_claims,
                 ),
                 "public Git operation failed",
             ),
+        )
+        verify_claims(
+            task,
+            failed_claims,
+            failed_file,
+            StockGit(clone_returncode=1),
+            parent,
         )
         failed = render_card.enforce_triage_source_provenance(
             candidate, failed_file, external_vision_file, external_facts_file, **expected_binding
@@ -1502,6 +2039,7 @@ def test_initial_triage_independent_vision_source_review_contract():
         )
 
     model = read(".github", "workflows", "claude-model.yml")
+    model_steps = yaml.safe_load(model)["jobs"]["model"]["steps"]
     triage_step = model[
         model.index("- id: triage_search") : model.index("- id: triage_local")
     ]
@@ -1524,7 +2062,6 @@ def test_initial_triage_independent_vision_source_review_contract():
     task_schema = read(
         "agent_runtime", "schemas", "v1alpha1", "agent-task.schema.json"
     )
-    result_action = read(".github", "actions", "claude-model-result", "action.yml")
     check(
         "trusted provenance: immutable task binds target, base, VISION, and source-review content identity",
         '"sourceReview"' in task_schema
@@ -1542,31 +2079,16 @@ def test_initial_triage_independent_vision_source_review_contract():
         and '--vision-sha "$VISION_SHA"' in triage
         and '--target-facts-file target-facts.json' in triage,
     )
+    step_names = [step.get("name") for step in model_steps]
+    capture_index = step_names.index("Capture trusted public-clone provenance")
+    cleanup_index = step_names.index("Remove bounded public clones")
+    provenance_capture = model_steps[capture_index]
     check(
-        "trusted provenance: broker record survives cleanup and crosses only the verified result artifact",
-        "provenance-init-root" in model
-        and "/run/wheelhouse-public-clone-" in model
-        and "sudo -n" in model
-        and "Capture trusted public-clone provenance" in model
-        and model.index("Capture trusted public-clone provenance")
-        < model.index("Remove bounded public clones")
-        and "export_public_clone_provenance" in model
-        and "public-clone-provenance" in result_action,
-    )
-    check(
-        "trusted provenance: production exposes only root-owned state and rejects model-writable record paths",
-        "WHEELHOUSE_PUBLIC_CLONE_STATE" in model
-        and "WHEELHOUSE_PUBLIC_CLONE_CONTEXT" not in model
-        and "WHEELHOUSE_PUBLIC_CLONE_PROVENANCE" not in model
-        and 'rm -rf -- "$provenance_output"' in model
-        and "provenance-record-root" in read("scripts", "nl_readonly_search.py")
-        and rejected(
-            lambda: nls.record_root_public_clone_provenance(
-                "/run/wheelhouse-public-clone-" + "0" * 32,
-                "{}",
-            ),
-            "state boundary",
-        ),
+        "trusted provenance: verification is a post-turn trusted step before cleanup",
+        capture_index < cleanup_index
+        and "always()" in provenance_capture["if"]
+        and "steps.hydrate.outputs.action == 'triage.pr.search'"
+        in provenance_capture["if"],
     )
     check(
         "trusted provenance: card projection receives every exact source-review binding",
@@ -1592,6 +2114,10 @@ def main():
     test_post_clone_limits_and_deterministic_cleanup()
     test_stock_git_output_is_bounded()
     test_operation_scope_documentation_and_same_turn_action()
+    test_public_clone_before_after_sandbox_reproduction()
+    test_sandboxed_turn_never_escalates_privilege()
+    test_post_turn_verification_owns_every_recorded_fact()
+    test_workflow_capture_interface()
     test_source_review_correction_contracts()
     test_initial_triage_independent_vision_source_review_contract()
     print()
