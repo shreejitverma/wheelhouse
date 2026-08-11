@@ -84,7 +84,7 @@ def claude_task(root: Path, action: str) -> dict:
 # model its full designed hard budget even after that overhead.
 MEASURED_MAX_SETUP_MS = 38_000
 
-# claude-action-compat serves the eight non-repair actions; the two
+# claude-action-compat serves the nine non-repair actions; the two
 # schema-repair actions run the claude-cli direct supervisor lane instead.
 ACTION_COMPAT_ACTIONS = sorted(
     action for action in ACTION_LIMITS if not action.endswith(".schema-repair")
@@ -102,13 +102,14 @@ UNCHANGED_SIBLING_TOTALS_MS = {
     "deep-review.search": 720_000,
     "nl-decision.local": 420_000,
     "nl-decision.search": 420_000,
+    "merge.resolve-conflicts": 420_000,
 }
 
 
 def main():
     check(
-        "limits: eight non-repair actions ride the claude-action-compat lane",
-        len(ACTION_COMPAT_ACTIONS) == 8 and len(REPAIR_ACTIONS) == 2,
+        "limits: nine non-repair actions ride the claude-action-compat lane",
+        len(ACTION_COMPAT_ACTIONS) == 9 and len(REPAIR_ACTIONS) == 2,
     )
     with tempfile.TemporaryDirectory() as tmp:
         for action in ACTION_COMPAT_ACTIONS:

@@ -181,6 +181,7 @@ NL_REPAIR_CANDIDATE_MAX_BYTES = 122880
 #   triage-issue-v1    worst   144,113 ->   196,608
 #   deep-review-text   worst   393,227 ->   458,752
 #   nl-decision-v1     worst   111,129 ->   131,072
+#   merge-resolve-v1   worst   462,962 ->   524,288
 SIZE_BUDGETS: dict[str, ActionSizeBudget] = {
     "triage.pr.local": ActionSizeBudget(
         "triage-pr-v1.schema.json", 1638400, TRIAGE_REPAIR_CANDIDATE_MAX_BYTES
@@ -213,6 +214,14 @@ SIZE_BUDGETS: dict[str, ActionSizeBudget] = {
     ),
     "nl-decision.schema-repair": ActionSizeBudget(
         "nl-decision-v1.schema.json", 131072, NL_REPAIR_CANDIDATE_MAX_BYTES
+    ),
+    # Captain-initiated assisted in-place merge. The model returns only a fixed
+    # per-hunk selection vocabulary plus bounded rationale text, so the whole
+    # contract is small; it has no correction/repair turn (a conflict
+    # resolution is not schema repair), so its retention bound only has to
+    # carry a failed candidate for diagnostics.
+    "merge.resolve-conflicts": ActionSizeBudget(
+        "merge-resolve-v1.schema.json", 524288, TRIAGE_REPAIR_CANDIDATE_MAX_BYTES
     ),
 }
 

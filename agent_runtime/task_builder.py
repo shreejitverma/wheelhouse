@@ -100,6 +100,9 @@ ACTION_LIMITS = {
         "nl-decision.local": (240_000, 270_000, 32, 80),
         "nl-decision.search": (240_000, 270_000, 32, 80),
         "nl-decision.schema-repair": (60_000, 75_000, 1, 0),
+        # Assisted in-place merge resolution: a bounded read-only turn over a
+        # small conflict payload. No search, no repair turn, no shell.
+        "merge.resolve-conflicts": (240_000, 270_000, 24, 60),
     }.items()
 }
 
@@ -959,6 +962,11 @@ def _schema_for(action: str, repair_kind: str) -> tuple[Path, str]:
             ACTION_SCHEMAS / "nl-decision-v1.schema.json",
             "wheelhouse/nl-decision/v1",
         )
+    if action == "merge.resolve-conflicts":
+        return (
+            ACTION_SCHEMAS / "merge-resolve-v1.schema.json",
+            "wheelhouse/merge-resolve/v1",
+        )
     raise ArtifactError("unsupported action output schema")
 
 
@@ -1280,6 +1288,8 @@ def _trust_segments(
             "bytes": prompt_bytes,
         }
     ]
+    # Inline prompt context gets a synthetic segment. Triage and merge conflict
+    # payloads are passed by reference and are represented by their input artifacts.
     if action.startswith("deep-review"):
         segments.append(
             {

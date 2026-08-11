@@ -23,6 +23,7 @@ ACTIONS = frozenset(
         "nl-decision.local",
         "nl-decision.search",
         "nl-decision.schema-repair",
+        "merge.resolve-conflicts",
     }
 )
 SCHEMA_REPAIR_ACTIONS = frozenset(

@@ -240,11 +240,22 @@ Only you can mint it (it's tied to your account).
 
 That is the only secret the deterministic machine needs.
 
-### Future assisted-merge credential (not enabled in Phase 0)
+### (Optional) Assisted-merge push credential
 
-Phase 0 does not read `ASSISTED_MERGE_PUSH_TOKEN` and never pushes a contributor fork. A later, separately reviewed captain-initiated conflict-resolution phase will require the repository owner to mint a short-lived classic PAT from their own account with only `public_repo` scope, rotate it, and store it as the `ASSISTED_MERGE_PUSH_TOKEN` Actions secret. Do not create a bot account for this.
+Skip this unless you enable `assisted_merge`. With it off - the shipped default, and this repository's own committed setting - nothing reads `ASSISTED_MERGE_PUSH_TOKEN` and no contributor branch is ever pushed.
 
-That future token is intentionally confined to one validated, non-force push to a contributor's existing branch. It must never reach a model, checkout, target workflow, git config or credential helper, command-line argument, or log.
+Captain-initiated assisted in-place merge pushes one resolution commit to the contributor's existing pull request branch. A fine-grained PAT cannot do that: `FLEET_TOKEN` is limited to selected repositories owned by one account, and a contributor's fork is neither. So the fork path needs a separate credential:
+
+1. GitHub ▸ **Settings** ▸ **Developer settings** ▸ **Personal access tokens** ▸ **Tokens (classic)** ▸ **Generate new token**.
+2. Scope: **`public_repo` only**. Not `repo`, not `workflow`, not Actions, not any administrative scope. (`public_repo` is sufficient only while every fleet repository is public; a private fleet would need classic `repo`, which is materially broader and is a fresh decision, not an inherited one.)
+3. Set a short expiry and rotate it.
+4. In **this** repo: **Settings** ▸ **Secrets and variables** ▸ **Actions** ▸ **New repository secret** ▸ name it exactly `ASSISTED_MERGE_PUSH_TOKEN`, paste the value.
+
+Mint it from your own account rather than creating a bot account: it minimizes what you have to maintain, and it is honest about who is responsible for the resolution.
+
+Same-repository branches are also eligible, but deliberately use the existing fine-grained `FLEET_TOKEN` with Contents write instead of this classic PAT. If the credential selected for either source mode is absent when an assist reaches the target-claim step, the assist fails closed with an operator message and nothing on the target changes.
+
+The selected token is confined to one validated update of the existing head ref, delivered through `GIT_ASKPASS` for that single git process. Immediately before that process, trusted code anonymously re-reads the source ref and requires the exact expected old SHA. The push itself is plain and non-force - never `--force` or `--force-with-lease` - so a non-fast-forward contributor movement is refused rather than overwritten. The token never reaches a model, a target checkout, a target workflow, a git config file or credential helper, a command-line argument, or a log; `tests/test_merge_assist.py` asserts the classic PAT appears in exactly one step of exactly one workflow.
 
 ### 4. (Optional) Add the Claude production token for agent-assisted features
 
@@ -392,7 +403,7 @@ An item is **consumed** when the handler closes its card after a successful reso
 A `/hold` or a non-retryable action error leaves the card open with the `blocked` label for manual follow-up.
 A workflow-touch or unable-to-verify workflow-history refusal from a direct owner merge decision also lands `blocked` (will not API-merge; merge by hand in the GitHub UI, or retry after a new head drops the workflow touch).
 A retryable merge refusal for a stale head leaves the card as `needs-decision` so you can retry after the card is current.
-A merge attempt that GitHub rejects because the PR has a merge conflict also leaves the card as `needs-decision`; Phase 0 requires the captain to resolve the conflict manually without asking the contributor to rebase, then retry the merge.
+A merge attempt that GitHub rejects because the PR has a merge conflict also leaves the card as `needs-decision`. With `assisted_merge` off, the captain resolves the conflict manually without asking the contributor to rebase, then retries the merge. With it on, that decision starts the captain-confirmed assisted in-place path described under [Security notes](#security-notes).
 For the "what changed most recently?" view, use the Issues list sorted by Recently updated, or bookmark `https://github.com/<owner>/<wheelhouse-repo>/issues?q=is%3Aissue%20is%3Aopen%20label%3Aneeds-decision%20sort%3Aupdated-desc`.
 Wheelhouse bumps a pure pending card's own updated time when the target PR or issue's GitHub `updatedAt` advances, so recently active targets rise to the top.
 That signal is target-level GitHub activity and may include owner, maintainer, or bot activity.
@@ -449,8 +460,14 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   PRs and issues authored by the repo owner, the configured `maintainer`, or bots are excluded from the scan-built worklist; bot detection uses GitHub's author type plus the `[bot]` login suffix, and missing author metadata fails open so a real contributor is not silently dropped.
   The explicit dispatch fast path trusts what your source workflow sends, so filter there too if you want it to match the scan.
   If an explicit dispatch creates a PR-review card for your own PR, `/request-changes` refuses to submit the review because GitHub rejects self-review.
-- **Merge-conflict readiness.** Mergeability is never a PR classification or routing input. A conflicted or `UNKNOWN` PR with green compliance and tests is merge-ready, while merge state remains visible context. Auto-merge still requires a fresh live clean state. Until the later captain-initiated assisted-resolution phase ships, a manual `/merge` conflict tells the captain to resolve it manually without asking the contributor to rebase.
-- **Fork source permission policy.** Before fork-CI approval, model dispatch, normal routing, or cleanup, Wheelhouse reads `maintainerCanModify`, source ownership, fork status, head ref, and head SHA. A personal fork with **Allow edits from maintainers** is eligible for a later captain-initiated in-place resolution path. An organization-owned fork, explicitly disabled permission, or a source proven to be a non-fork is given the policy notice and closed only after an inert default-token audit card exists. Incomplete source evidence remains a retryable inert card and never contacts or closes the contributor; unavailable or deleted-looking source metadata alone is incomplete evidence, not proof that permits closure. See [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests-from-forks).
+- **Merge-conflict readiness.** Mergeability is never a PR classification or routing input. A conflicted or `UNKNOWN` PR with green compliance and tests is merge-ready, while merge state remains visible context. Auto-merge still requires a fresh live clean state. With `assisted_merge` off (the shipped default), a manual `/merge` conflict tells the captain to resolve it manually without asking the contributor to rebase.
+- **Assisted in-place merge is captain-initiated and never authors code.** When `assisted_merge` is enabled, the captain's own `Merge it` decision on a conflicted same-repository or editable personal-fork PR starts `merge-assist.yml`, which resolves the conflict as a merge commit on the contributor's EXISTING pull request branch - no landing branch, no replacement PR, no force push, and no rewrite of their commits (they are the resolution commit's first parent, and the contributor is credited with a `Co-authored-by` trailer).
+  One bounded model turn only chooses, per conflicted hunk, one of four orderings of lines that ALREADY exist in the two merge parents; trusted code writes every byte and proves the result touched no file outside the conflict set. V1 permits zero novel source lines.
+  Anything risky escalates without model spend: any conflicted path in the auto-merge unconditional exclusion set, any non-text or non-both-modified conflict, more than the configured file/line caps or result-schema hunk capacity, a base advance that would put `.github/workflows/**` into the merge, or a conflict inventory that changed between preparing and resolving.
+  After proving the eligible source mode and push credential presence, a target-claim step isolated from the push credential re-reads the public source ref anonymously, uses `FLEET_TOKEN` to apply `wheelhouse:awaiting-captain-confirm` to the target PR, and verifies the exact label plus the unchanged head. A separate process receives only the selected credential - `ASSISTED_MERGE_PUSH_TOKEN` for an editable fork or `FLEET_TOKEN` for a same-repository branch - and performs one plain, non-force `git push`. If the credential, label, or verification is unavailable, it does not push. Wheelhouse scan-time auto-merge denies the label and the secondary bound awaiting-confirmation card record at preclaim and G7; incomplete or unreadable label evidence also denies.
+  Nothing merges from that workflow: the captain makes a second `Merge it` decision after the card refresh binds it to the resolution head. A mistimed pre-refresh decision stays non-terminal and refreshable. Confirmation depends on the live label and a complete live proof of the resolution commit's two-parent ancestry, not on the secondary card record successfully landing. A successful confirming merge removes the label on a best-effort basis. The label is advisory: it does not prevent GitHub-native auto-merge or a raw human merge. This residual is accepted because native auto-merge must be deliberately armed and a human merge against the visible label is deliberate; Wheelhouse's own uncontrolled scan-time path is blocked.
+  Kill switches: `assisted_merge` (global or per repo), removing `CLAUDE_CODE_OAUTH_TOKEN`, removing the selected push credential (`ASSISTED_MERGE_PUSH_TOKEN` for forks or `FLEET_TOKEN` for same-repository branches), and a per-PR `wheelhouse:no-assisted-merge` label on the target.
+- **Fork source permission policy.** Before fork-CI approval, model dispatch, normal routing, or cleanup, Wheelhouse reads `maintainerCanModify`, source ownership, fork status, head ref, and head SHA. A personal fork with **Allow edits from maintainers** is the only fork shape eligible for captain-initiated in-place resolution. An organization-owned fork, explicitly disabled permission, or a source proven to be a non-fork is given the policy notice and closed only after an inert default-token audit card exists. Incomplete source evidence remains a retryable inert card and never contacts or closes the contributor; unavailable or deleted-looking source metadata alone is incomplete evidence, not proof that permits closure. See [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests-from-forks).
 - **Token scope.** The default `GITHUB_TOKEN` only reaches this repo and is used for all card activity (so it can't recursively re-trigger the handler).
   Acting on your other repos uses `FLEET_TOKEN`, which is never printed and is only used in cross-repo scan, approval, execution, and read-only fetch steps.
   Scope it to just your fleet with Actions, Contents, Issues, and Pull requests read/write on the target repos.
@@ -563,7 +580,7 @@ Each CI-approval candidate the auto path handles also writes exactly one scan-lo
   Review the workflow changes and merge the target PR by hand in the GitHub UI (the card comment includes the PR URL), or after a new head drops the workflow touch clear the hold and retry `/merge` - the gate re-runs fresh and will merge a workflow-clean PR.
   A `/request-changes` refused for a moved head leaves the card pending; the next scan refreshes it to the new code automatically, then you can re-review and request changes again if needed.
   A `/request-changes` refused because it is your own PR is also working as intended - GitHub does not allow self-review, and scan-built queues normally filter those PRs out.
-  A `/merge` that finds a conflict remains retryable. Phase 0 tells the captain to resolve it manually without asking the contributor to rebase; a later captain-initiated in-place resolution phase will replace that fallback.
+  A `/merge` that finds a conflict remains retryable. With `assisted_merge` off, the captain resolves it manually without asking the contributor to rebase. With it on, the first merge decision starts assisted in-place resolution; after the resolution is pushed and the card refreshes, use `Merge it` again to confirm the final merge. See [Assisted in-place merge](#security-notes) for the fail-closed path and kill switches.
 - **Approve-CI cards appear for PRs that look safe.**
   Open the latest `scan-backstop` run logs and search for `wheelhouse auto-approve carded` or `wheelhouse auto-approve suppressed-card`.
   The line names the repo and PR, includes the safety or uncertainty reason, and includes the `approve_ci` status/message when Wheelhouse tried to approve but had to fail closed.
@@ -625,10 +642,12 @@ wheelhouse.config.yml          the one file you edit
   scan-backstop.yml            hourly scan -> create, safely reuse, refresh, activity-reflect, close cards, run target-side stale pending-contributor cleanup, and surface persistent scan failures
   triage.yml                   automatic lightweight PR/issue card triage -> read-only target pass -> publish held cards / edit card context
   deep-review.yml              always-on, code-grounded: Investigate box / label / manual issue run -> read-only target review -> workflow labels and posts Claude's verdict
+  merge-assist.yml             captain-initiated conflict resolution -> bounded read-only model turn -> one plain non-force push to the existing PR branch
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
 scripts/
   wheelhouse_core.py           resilient GraphQL scan/classify and exact-target adapters, source pushability policy, scan-health ledger, author filtering, dedup/overlap, request-changes cleanup, CI safety, auto-approval, read-only CI security summaries, ref qualification, and scan logs
   maintainer_edits_policy.py   ordered policy notice / exact re-read / close transaction for non-modifiable fork sources
+  merge_assist.py              captain-initiated merge: bind, mechanical merge, conflict admission, zero-novel-line resolution, confinement, one plain non-force push, card record
   target_observation.py        strict ReviewObservation v2, concrete v1 compatibility, approval-receipt, and projection-reference contracts
   decision_context.py          bounded neutral same-issue/reference/exact-shared-path advisory context
   assessment_admission.py      typed observation-bound PR assessment admission; context identity is provenance only
@@ -654,6 +673,7 @@ tests/test_card_refresh.py     offline unit test for refresh change detection, a
 tests/test_reconcile.py        offline unit test for reconcile routing, activity reflection, fixed-K soft-close hysteresis, race guards, and self-healing
 tests/test_card_reuse.py       offline end-to-end card soft-close, trusted reuse, ambiguity, and lifecycle serialization tests
 tests/test_merge_conflict.py   offline unit test for mergeability-independent readiness, source-permission policy routing, inert cards, and Phase 0 conflict copy
+tests/test_merge_assist.py     offline real-git test for assisted in-place resolution, escalation, zero-novel-line confinement, push credential isolation, and card records
 tests/test_maintainer_edits_policy.py offline target-order and fail-closed policy-close tests
 tests/test_pending_contributor_cleanup.py offline unit test for deterministic request-changes cleanup, silent legacy-rebase disarming, review-timestamp recovery, and fail-open target-activity proof
 tests/test_ci_autoapprove.py   offline unit test for CI safety, scan-time auto-approval, head-bound receipts, duplicate-run approval, and logging

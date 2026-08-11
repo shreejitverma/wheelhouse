@@ -197,6 +197,24 @@ AUTOMERGE_WORKFLOW_HOLD_MAX_PATHS = 5
 AUTOMERGE_WORKFLOW_HOLD_MAX_PATH_LENGTH = 240
 AUTOMERGE_WORKFLOW_HOLD_START = "<!-- wheelhouse-automerge-workflow-hold:start -->"
 AUTOMERGE_WORKFLOW_HOLD_END = "<!-- wheelhouse-automerge-workflow-hold:end -->"
+# Captain-initiated assisted in-place merge (scripts/merge_assist.py). Like the
+# manual-merge hold this is a NON-MATERIAL, versioned, revision-bound record: it
+# is display and audit state that binds an attempt to exact SHAs so a stale
+# intent can never be reused. It never authorizes a merge - the captain's own
+# second `Merge it` decision on the refreshed card is the confirmation, and
+# `do_merge`'s live re-reads and gates are unchanged.
+MERGE_ASSIST_FIELD = "merge_assist"
+MERGE_ASSIST_VERSION = 3
+MERGE_ASSIST_MODE = "in-place"
+MERGE_ASSIST_PHASE_AWAITING = "awaiting-confirmation"
+MERGE_ASSIST_PHASE_ESCALATED = "escalated"
+MERGE_ASSIST_PHASES = frozenset(
+    {MERGE_ASSIST_PHASE_AWAITING, MERGE_ASSIST_PHASE_ESCALATED}
+)
+MERGE_ASSIST_MAX_PATHS = 20
+MERGE_ASSIST_MAX_PATH_LENGTH = 240
+MERGE_ASSIST_START = "<!-- wheelhouse-merge-assist:start -->"
+MERGE_ASSIST_END = "<!-- wheelhouse-merge-assist:end -->"
 LIFECYCLE_CONFIRM_LABEL = "wheelhouse:confirming-target-state"
 MAINTAINER_EDITS_REQUIRED_LABEL = "wheelhouse:maintainer-edits-required"
 MAINTAINER_EDITS_CLOSING_LABEL = "wheelhouse:closing-target"
@@ -487,6 +505,11 @@ _AUTOMERGE_WORKFLOW_HOLD_SECTION_RE = re.compile(
     r"<!--\s*wheelhouse-automerge-workflow-hold:end\s*-->\n?",
     re.S,
 )
+_MERGE_ASSIST_SECTION_RE = re.compile(
+    r"\n?<!--\s*wheelhouse-merge-assist:start\s*-->.*?"
+    r"<!--\s*wheelhouse-merge-assist:end\s*-->\n?",
+    re.S,
+)
 
 # Sentinel for a material field absent from an old card's state block. It can
 # never equal a real value, so a card written before these fields were carried
@@ -609,6 +632,135 @@ def automerge_workflow_hold_status(state, head_sha):
     if not current_head or record["head_sha"] != current_head:
         return ("stale", None)
     return ("matching", record)
+
+
+def normalize_merge_assist(value):
+    """Return one exact bounded assisted-merge record, else None.
+
+    Fail-closed on every field. The record is audit and display state: it can
+    explain what a captain-initiated assist did to a pull request branch, but
+    it never authorizes a merge, a push, a target write, or model spend.
+    """
+    if not isinstance(value, dict):
+        return None
+    if value.get("version") != MERGE_ASSIST_VERSION:
+        return None
+    if value.get("mode") != MERGE_ASSIST_MODE:
+        return None
+    phase = value.get("phase")
+    if phase not in MERGE_ASSIST_PHASES:
+        return None
+    source_mode = value.get("source_mode")
+    if not isinstance(source_mode, str) or source_mode not in core.PUSHABILITY_MODES:
+        return None
+    shas = {}
+    for field, required in (
+        ("original_head_sha", True),
+        ("base_sha", phase == MERGE_ASSIST_PHASE_AWAITING),
+        ("resolution_head_sha", phase == MERGE_ASSIST_PHASE_AWAITING),
+    ):
+        raw = value.get(field)
+        if not isinstance(raw, str):
+            return None
+        raw = raw.strip()
+        if required and not re.fullmatch(r"[0-9a-f]{40}", raw):
+            return None
+        if raw and not re.fullmatch(r"[0-9a-f]{40}", raw):
+            return None
+        shas[field] = raw
+    paths = value.get("conflicted_paths")
+    if not isinstance(paths, list) or len(paths) > MERGE_ASSIST_MAX_PATHS:
+        return None
+    cleaned = []
+    for path in paths:
+        if not isinstance(path, str) or not path.strip():
+            return None
+        if len(path) > MERGE_ASSIST_MAX_PATH_LENGTH:
+            return None
+        cleaned.append(path)
+    reason = value.get("escalation_reason")
+    digest = value.get("resolution_digest")
+    confirmation_label_may_be_present = value.get(
+        "confirmation_label_may_be_present"
+    )
+    if not isinstance(confirmation_label_may_be_present, bool):
+        return None
+    push_outcome = value.get(
+        "push_outcome",
+        "pushed" if phase == MERGE_ASSIST_PHASE_AWAITING else "not-pushed",
+    )
+    if push_outcome not in {"not-pushed", "pushed", "uncertain"}:
+        return None
+    if phase == MERGE_ASSIST_PHASE_AWAITING and push_outcome != "pushed":
+        return None
+    if not isinstance(reason, str) or len(reason) > 400:
+        return None
+    if not isinstance(digest, str) or (
+        digest and not re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        return None
+    if phase == MERGE_ASSIST_PHASE_ESCALATED and not reason.strip():
+        return None
+    return {
+        "version": MERGE_ASSIST_VERSION,
+        "mode": MERGE_ASSIST_MODE,
+        "source_mode": source_mode,
+        "original_head_sha": shas["original_head_sha"],
+        "base_sha": shas["base_sha"],
+        "resolution_head_sha": shas["resolution_head_sha"],
+        "phase": phase,
+        "conflicted_paths": cleaned,
+        "escalation_reason": reason,
+        "resolution_digest": digest,
+        "confirmation_label_may_be_present": confirmation_label_may_be_present,
+        "push_outcome": push_outcome,
+    }
+
+
+def merge_assist_bound_heads(record):
+    """The exact head SHAs an assisted-merge record still describes.
+
+    A pushed record legitimately describes two adjacent revisions: the head the
+    captain decided on, and the resolution head that replaced it. Anything else
+    is a genuine contributor push and clears the record.
+    """
+    record = normalize_merge_assist(record)
+    if record is None:
+        return frozenset()
+    heads = {record["original_head_sha"]}
+    if record["resolution_head_sha"]:
+        heads.add(record["resolution_head_sha"])
+    return frozenset(head for head in heads if head)
+
+
+def merge_assist_status(state, head_sha):
+    """Return (status, trusted_record) for absent/matching/stale/malformed."""
+    state = state if isinstance(state, dict) else {}
+    if MERGE_ASSIST_FIELD not in state:
+        return ("absent", None)
+    record = normalize_merge_assist(state.get(MERGE_ASSIST_FIELD))
+    if record is None:
+        return ("malformed", None)
+    current = str(head_sha or "")
+    if not current or current not in merge_assist_bound_heads(record):
+        return ("stale", None)
+    return ("matching", record)
+
+
+def carry_merge_assist(item, prior_state):
+    """Preserve a still-binding assisted-merge record across a card refresh.
+
+    A record that does not bind the item's current head is dropped, so a new
+    contributor push naturally clears a stale assist from the card.
+    """
+    if not isinstance(item, dict):
+        return item
+    status, record = merge_assist_status(prior_state, item.get("head_sha", ""))
+    if status == "matching":
+        item[MERGE_ASSIST_FIELD] = record
+    else:
+        item.pop(MERGE_ASSIST_FIELD, None)
+    return item
 
 
 def workflow_hold_maintenance_needed(item, state, labels=None):
@@ -5728,6 +5880,125 @@ def _automerge_workflow_hold_section(record):
     ]
 
 
+def _merge_assist_section(record, controls_available=True):
+    record = normalize_merge_assist(record)
+    if record is None:
+        return []
+    paths = [
+        "- `%s`" % core._safe_inline(path) for path in record["conflicted_paths"]
+    ] or ["- _none_"]
+    if record["phase"] == MERGE_ASSIST_PHASE_AWAITING:
+        if controls_available:
+            guidance = (
+                "> A conflict was resolved in place on the contributor's own pull "
+                "request branch and pushed with an exact-old-SHA safeguard. Their "
+                "commits are unchanged (first parent). **Review the resolution and "
+                "the pull request's own checks, then tick `Merge it` again to "
+                "merge.** Nothing merges without that second decision."
+            )
+        else:
+            guidance = (
+                "> The resolution was pushed to the contributor's pull request. "
+                "This card will become confirmable after the next refresh binds "
+                "it to the resolution head."
+            )
+        return [
+            MERGE_ASSIST_START,
+            "### Assisted merge",
+            "",
+            "> [!IMPORTANT]",
+            guidance,
+            "",
+            "- Resolution commit: `%s`" % record["resolution_head_sha"],
+            "- First parent (contributor head): `%s`" % record["original_head_sha"],
+            "- Second parent (base branch): `%s`" % record["base_sha"],
+            "- Source permission: `%s`" % record["source_mode"],
+            "- Resolution digest: `%s`" % (record["resolution_digest"] or "n/a"),
+            "- Every resolved line is an exact line from one of the two merge "
+            "parents; no new source line was authored.",
+            "- Conflicted paths:",
+            *paths,
+            MERGE_ASSIST_END,
+        ]
+    if record["push_outcome"] == "uncertain":
+        escalation_guidance = (
+            "> Assisted in-place conflict resolution stopped after the push was "
+            "attempted. The resolution may or may not have been pushed, and the "
+            "`wheelhouse:awaiting-captain-confirm` label may still be present. "
+            "Inspect the pull request's current head before acting, and remove the "
+            "label if you resolve the conflict by hand. The contributor was not "
+            "contacted."
+        )
+    elif record["push_outcome"] == "pushed":
+        escalation_guidance = (
+            "> The resolution was pushed, but assisted in-place conflict resolution "
+            "stopped afterward. The `wheelhouse:awaiting-captain-confirm` label may "
+            "still be present; inspect the pull request's current head before acting. "
+            "The contributor was not contacted."
+        )
+    elif record["confirmation_label_may_be_present"]:
+        escalation_guidance = (
+            "> Assisted in-place conflict resolution stopped. No resolution was "
+            "pushed. The `wheelhouse:awaiting-captain-confirm` label may still "
+            "be present on the pull request; remove it if you resolve the conflict "
+            "by hand. The contributor was not contacted."
+        )
+    else:
+        escalation_guidance = (
+            "> Assisted in-place conflict resolution stopped before changing the "
+            "target. No resolution was pushed and the contributor was not contacted. "
+            "Resolve it yourself, or retry after the situation changes."
+        )
+    return [
+        MERGE_ASSIST_START,
+        "### Assisted merge",
+        "",
+        "> [!WARNING]",
+        escalation_guidance,
+        "",
+        "- Reason: %s" % core._safe_inline(record["escalation_reason"]),
+        "- Pull request head at the attempt: `%s`" % record["original_head_sha"],
+        "- Conflicted paths:",
+        *paths,
+        MERGE_ASSIST_END,
+    ]
+
+
+def body_with_merge_assist(body, record):
+    """Persist one trusted assisted-merge record plus its visible section.
+
+    Refuses unless the record still binds the card's own current head, so a
+    late-arriving result can never rewrite a card that already moved on.
+    """
+    normalized = normalize_merge_assist(record)
+    state = _unique_state_block(body)
+    if (
+        normalized is None
+        or state is None
+        or str(state.get("head_sha") or "") not in merge_assist_bound_heads(normalized)
+    ):
+        return body
+    section = "\n".join(
+        _merge_assist_section(
+            normalized,
+            controls_available=(
+                str(state.get("head_sha") or "")
+                == normalized.get("resolution_head_sha")
+            ),
+        )
+    )
+    without = _MERGE_ASSIST_SECTION_RE.sub("\n", body or "").strip()
+    marker = "\n%s" % DECISION_START
+    index = without.find(marker)
+    if index >= 0:
+        updated = without[:index].rstrip() + "\n\n" + section + "\n" + without[index:]
+    else:
+        updated = without.rstrip() + "\n\n" + section
+    new_state = dict(state)
+    new_state[MERGE_ASSIST_FIELD] = normalized
+    return _replace_state_block(updated, new_state)
+
+
 def body_with_automerge_workflow_hold(body, record):
     """Persist one trusted hold plus its bounded owner-visible section."""
     normalized = normalize_automerge_workflow_hold(record)
@@ -5969,6 +6240,15 @@ def render(
         or workflow_hold["head_sha"] != str(item.get("head_sha") or "")
     ):
         workflow_hold = None
+    # Non-material, revision-bound audit state carried across refreshes by
+    # `carry_merge_assist`. Never authority: the captain's own second decision
+    # is what merges, through the unchanged `do_merge` gates.
+    merge_assist = normalize_merge_assist(item.get(MERGE_ASSIST_FIELD))
+    if merge_assist and (
+        kind != "pr-review"
+        or str(item.get("head_sha") or "") not in merge_assist_bound_heads(merge_assist)
+    ):
+        merge_assist = None
 
     # The stored material set lets a refresh cheaply and deterministically decide
     # "did this materially change?". `updated_at` is non-material (never added to
@@ -6035,6 +6315,8 @@ def render(
         state["held"] = True
     if workflow_hold:
         state[AUTOMERGE_WORKFLOW_HOLD_FIELD] = workflow_hold
+    if merge_assist:
+        state[MERGE_ASSIST_FIELD] = merge_assist
     policy = maintainer_edits_policy_for_item(item)
     if policy:
         # Policy records are deterministic scanner facts, never a decision
@@ -6148,6 +6430,17 @@ def render(
     lines.append("")
     if kind == "pr-review" and not policy:
         lines.extend(_related_work_section(decision_context))
+        lines.append("")
+    if merge_assist:
+        lines.extend(
+            _merge_assist_section(
+                merge_assist,
+                controls_available=(
+                    str(item.get("head_sha") or "")
+                    == merge_assist.get("resolution_head_sha")
+                ),
+            )
+        )
         lines.append("")
     if workflow_hold:
         lines.extend(_automerge_workflow_hold_section(workflow_hold))
@@ -7644,6 +7937,50 @@ def edit_presentation_only_body(number, before, after):
         _gh(["issue", "edit", str(number), "--body-file", body_path])
     finally:
         os.unlink(body_path)
+
+
+def record_merge_assist(number, record):
+    """Commit one assisted-merge audit record onto a pure pending card.
+
+    Card-only, default-token, and denial-safe: it refuses a card that is not an
+    open, pure `needs-decision` card for the exact bound target/head, and it
+    goes through the authoritative pr-review projection writer so it cannot
+    bypass the v2 body contract. It never touches the target repository.
+    """
+    import projection_writer
+
+    normalized = normalize_merge_assist(record)
+    if normalized is None:
+        return "malformed"
+    card = get_card(number)
+    if not card or not issue_is_open(card):
+        return "card-unavailable"
+    labels = _label_names(card.get("labels"))
+    if "needs-decision" not in labels or labels & NON_REFRESHABLE_LABELS:
+        return "card-not-actionable"
+    state = _unique_state_block(card.get("body") or "")
+    if not isinstance(state, dict) or state.get("kind") != "pr-review":
+        return "card-not-actionable"
+    if str(state.get("head_sha") or "") not in merge_assist_bound_heads(normalized):
+        return "card-head-mismatch"
+    body = body_with_merge_assist(card.get("body") or "", normalized)
+    if body == card.get("body"):
+        return "unchanged"
+    outcome = projection_writer.commit_preplanned(
+        number,
+        card,
+        title=card.get("title", ""),
+        body=body,
+        managed_labels=_projection_managed_labels(card.get("labels")),
+        cause="decision-or-action",
+        observation_id=(
+            (state.get(REVIEW_OBSERVATION_FIELD) or {}).get("observation_id", "")
+        ),
+        context_id=(
+            (state.get(DECISION_CONTEXT_FIELD) or {}).get("context_id", "")
+        ),
+    )
+    return "committed" if outcome == "committed" else "deferred"
 
 
 def _edit_issue_body(number, body, remove_labels=None):

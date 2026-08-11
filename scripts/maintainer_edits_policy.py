@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Apply and record the maintainer-edits contribution policy.
 
-Phase 0 deliberately has no assisted merge or source-push credential. This CLI
-separates the policy transaction so the only target-side order is:
+This Phase 0 policy CLI remains separate from assisted merge and its source-push
+credential, so the only target-side order is:
 
   exact source proof -> policy notice -> default-token audit card ->
   exact source proof -> target close -> atomic terminal card record
 
-It never receives, reads, or needs ASSISTED_MERGE_PUSH_TOKEN. That credential
-is reserved for a later captain-initiated, assisted-conflict-resolution phase.
+It never receives, reads, or needs ASSISTED_MERGE_PUSH_TOKEN. The separately
+permissioned captain-initiated path owns that credential.
 """
 
 import json

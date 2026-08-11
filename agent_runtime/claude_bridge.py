@@ -182,6 +182,11 @@ def _result_text(terminal: dict[str, Any] | None) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
+# Actions whose model reply may legitimately wrap its JSON object in prose or a
+# fence, so the bounded extractor - not a bare json.loads - reads the candidate.
+JSON_EMBEDDED_ACTIONS = frozenset({"merge.resolve-conflicts"})
+
+
 def _delivered(action: str, terminal: dict[str, Any], delivered_file: str) -> Any:
     if claude_native_structured_output(action):
         if "structured_output" in terminal:
@@ -207,7 +212,7 @@ def _delivered(action: str, terminal: dict[str, Any], delivered_file: str) -> An
         raise ContractError("Claude action delivered no final result")
     if action.startswith("deep-review"):
         return {"text": text}
-    if action.startswith("triage."):
+    if action.startswith("triage.") or action in JSON_EMBEDDED_ACTIONS:
         value, reason = extract_json_object(text)
         if value is None:
             raise ContractError(reason)
@@ -283,7 +288,7 @@ def _repair_candidate(
     result_text = _result_text(terminal)
     if result_text:
         try:
-            if action.startswith("triage."):
+            if action.startswith("triage.") or action in JSON_EMBEDDED_ACTIONS:
                 value, _ = extract_json_object(result_text)
             else:
                 value = json.loads(result_text)

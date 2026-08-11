@@ -139,6 +139,8 @@ still appears where it's plain English, e.g. "triage the queue".)
   `auto_triage`, issue-triage on the INDEPENDENT `auto_triage_issues`, both also
   requiring `CLAUDE_CODE_OAUTH_TOKEN`; cache-keyed by source revision), `deep-review` (ALWAYS-ON, code-grounded;
   gated only on `CLAUDE_CODE_OAUTH_TOKEN` - no config flag),
+  `merge-assist` (captain-initiated assisted in-place conflict resolution - see
+  "Assisted in-place merge" in Sharp edges),
   `no-mistakes-required` (PR-to-`main` gate: the job `name:` MUST stay exactly
   `PR must be raised via no-mistakes` - it is the check name the fleet convention
   and this repo's own `wheelhouse.config.yml compliance_check` reference - and it
@@ -187,6 +189,9 @@ still appears where it's plain English, e.g. "triage the queue".)
   free-text comment to a structured result), `nl_readonly_search.py` (installs
   the optional `wheelhouse-search` wrapper for READONLY_TOKEN-backed LLM
   context),
+  `merge_assist.py` (the whole captain-initiated assisted in-place merge
+  transaction: bind, mechanical merge, admission, zero-novel-line resolution,
+  confinement, the one plain non-force push after an exact-head re-read, and the card record),
   `automerge_criteria.py` (stable criterion IDs/labels and fail-closed
   normalization shared by evaluator and renderer), `auto_merge.py`
   (complete read-only G0-G6 preclaim, exact-pass-only action claim, under-claim reevaluation, G7 act/audit, and default-token persistence/recovery of final-gate workflow holds),
@@ -894,13 +899,96 @@ still appears where it's plain English, e.g. "triage the queue".)
   See `tests/test_ci_autoapprove.py` for receipts/emission, `tests/test_target_observation.py` for contracts/planning, `tests/test_target_reconcile_transaction.py` for production-composed timed transitions, and `tests/test_reconcile.py` for refresh, freeze, and release coverage.
 - **Conflicts stay captain-owned.** Wheelhouse never asks a contributor to
   rebase, never sends a rebase reminder, and never closes for rebase inactivity.
-  Phase 0 leaves a manual `/merge` conflict retryable with captain-facing copy.
-  The later assisted flow is captain-initiated and must resolve in place on the
-  original PR branch; auto-merge remains clean-state-only.
+  With `assisted_merge` off (the shipped and this repo's committed default) a
+  manual `/merge` conflict stays retryable with captain-facing copy.
+  Auto-merge remains clean-state-only in every configuration.
+
+- **Assisted in-place merge is captain-initiated, zero-novel-line, and
+  push-confined** (`scripts/merge_assist.py`, `.github/workflows/merge-assist.yml`).
+  The captain's own `Merge it`/`/merge`/NL-merge decision on a conflicted PR
+  returns terminal `none` (card stays pure pending) plus an `assisted_merge`
+  output; `decision-handler.yml` then dispatches `merge-assist.yml` with
+  `github.token`, exactly like Investigate and for the same recursion-barrier
+  reason. The assist resolves the conflict as a merge commit on a
+  same-repository or editable personal fork's EXISTING PR head branch - never a
+  landing branch, a replacement PR, a force push, or a rewrite of their commits
+  (first parent is their head; a `Co-authored-by` trailer credits them from a
+  trusted numeric-id read).
+  Stage order, each failing closed: `bind` (exact live re-read, `derive_pushability`
+  must be `same-repository` or `personal-fork-editable`, base must be the default branch,
+  `apply_decision._workflow_merge_gate` must be clear, non-maintainer human
+  author, `wheelhouse:no-assisted-merge` absent, repo opted in) -> durable
+  `agent_claim` on `merge.resolve-conflicts` keyed by (target, card, head), so
+  there is exactly ONE assisted attempt per head -> `prepare` (credential-light
+  fetch of the BASE repo, which serves the head as `refs/pull/N/head`, so no
+  fork credential exists in that job; `git merge --no-ff --no-commit` with
+  `merge.conflictStyle=merge` and `core.hooksPath=/dev/null`) -> admission ->
+  one bounded model turn -> `apply` -> `push` -> `record`.
+  **The model never authors a line.** Its whole vocabulary is a per-hunk
+  selection from `SELECTIONS` (`ours`, `theirs`, `ours-then-theirs`,
+  `theirs-then-ours`) or `cannot_safely_resolve`; trusted code rebuilds each
+  file from the mechanical merge skeleton plus exact parent lines, then proves
+  no unmerged entry, no marker, no file outside the conflict set, and a clean
+  `git diff --cached --check`. The `merge-resolve-v1` schema has no field
+  through which text could arrive.
+  Admission escalates BEFORE spend on: `core._auto_merge_exclusions` hits, any
+  non-`UU` status, any mode outside `100644`/`100755`, differing stage modes,
+  binary/non-UTF-8/LFS content, an unparsable hunk, the per-repo file/line caps,
+  the result schema's hunk-row capacity, and a
+  merge-base-to-base advance that touches `.github/workflows/**` (neither token
+  has `workflow` scope). The resolve job independently reproduces the merge and
+  refuses unless the conflict inventory digest matches what the model saw.
+  **Push credential:** an editable personal fork uses
+  `ASSISTED_MERGE_PUSH_TOKEN` (the repository owner's own short-lived classic
+  `public_repo` PAT - deliberately NOT a bot account); a same-repository branch
+  uses the existing fine-grained `FLEET_TOKEN` with Contents write. After the
+  source mode and selected credential presence are validated, a target-claim
+  step isolated from the push credential reads the public source ref anonymously
+  and uses `FLEET_TOKEN` to apply and verify the confirmation label. A separate
+  process receives only the selected push credential and performs the final
+  plain, non-force `git push` through `GIT_ASKPASS`, never
+  argv/config/helper/log/model/artifact. Trusted code re-reads the remote ref and
+  requires the exact expected old SHA immediately beforehand; `--force` and
+  `--force-with-lease` are both forbidden. An absent secret fails before any target mutation with an operator
+  message. Before the push, the target PR receives
+  `wheelhouse:awaiting-captain-confirm`; the exact label and unchanged head are
+  verified before the clean resolution head can be pushed. Failure or unreadable
+  evidence denies the push. The GraphQL fork identity that grants eligibility
+  must match the independent REST repository/ref coordinates exactly before the
+  push target is admitted. Scan-time auto-merge denies both the target label
+  and a current bound awaiting-confirmation card record at preclaim and G7;
+  incomplete or unreadable label evidence also denies. The label is advisory:
+  it does not block GitHub-native auto-merge or a raw human merge. That residual
+  is accepted because native auto-merge must be deliberately armed and a human
+  merge against a visible label is deliberate; Wheelhouse's own uncontrolled
+  scan-time path is blocked.
+  Nothing merges from the workflow: the versioned NON-MATERIAL `merge_assist`
+  card record (`render_card.normalize_merge_assist`, bound to the decided head
+  and the resolution head, carried across refreshes by `carry_merge_assist` in
+  `card_projection.plan_card_projection`, written only through
+  `render_card.record_merge_assist` -> `projection_writer.commit_preplanned`)
+  renders a `### Assisted merge` section and the captain makes a SECOND
+  `Merge it` decision. Before the card refresh binds the resolution head, the
+  section is inert and a mistimed decision returns terminal `none`. Confirmation
+  authority comes from the live target label plus a complete live proof that the
+  current head is a two-parent merge commit whose first parent is the preceding
+  PR head and whose second parent is an ancestor of the live base. The card record
+  is secondary display and denial state, so a deferred or unavailable card write
+  cannot strand confirmation. Escalated records distinguish proven-not-pushed,
+  proven-pushed, and uncertain push outcomes so a state-file failure after the
+  push never produces a false captain-facing claim. A successful merge removes
+  the target label best-effort. Bounded
+  auto-proceed is deliberately NOT implemented and remains a separate captain
+  decision. Config is opt-in and fail-closed: `assisted_merge` (default off in
+  code AND in this repo's committed config),
+  `assisted_merge_max_conflict_files` (default 5), and
+  `assisted_merge_max_conflict_lines` (default 200), all per-repo overridable.
+  Covered by `tests/test_merge_assist.py`, which runs the resolution end to end
+  against a real local git repository.
 
 - **Fork source permission policy.** Bulk and exact reads derive a material
   `pushability` fact. A personal fork with `maintainerCanModify: true` is the
-  only fork candidate for the future in-place path. Organization-owned,
+  only fork candidate for the assisted in-place path. Organization-owned,
   explicitly non-editable, or proven non-fork sources are policy-rejected.
   Unavailable or deleted-looking source metadata remains unverified and can
   never authorize contact or closure. The ordered Phase 0 transaction is exact
@@ -909,9 +997,9 @@ still appears where it's plain English, e.g. "triage the queue".)
   terminal card record. Incomplete source facts are a retryable, inert
   `pushability-unverified` card - no CI approval, model work, contributor
   comment, or closure. `scripts/maintainer_edits_policy.py` owns the ordered
-  notice/close transaction; `CONTRIBUTING.md` owns the disclosure. Phase 0
-  must remain credential-free. README.md's "Future assisted-merge credential"
-  section owns the later phase's credential and confinement contract.
+  notice/close transaction; `CONTRIBUTING.md` owns the disclosure. The Phase 0
+  policy transaction must remain credential-free. README.md's "Assisted-merge
+  push credential" section owns the assisted path's credential and confinement contract.
 
 - **Scan-time fork-CI auto-approve (kill the routine "approve CI" click).** One
   shared `ci_safety(slug, pr, repo_posture)` verdict is the single security
@@ -1194,7 +1282,7 @@ All agent-assisted paths now share Agent Runtime Contract `wheelhouse.agent-runt
 The contract, action schemas, pinned Codex app-server protocol, capability negotiation, canonical tools, brokers, sandbox supervisor, adapters, consumers, and tests live under `agent_runtime/`, with the trusted CLI at `scripts/agent_runtime.py` and operator runbook at `docs/AGENT_RUNTIME.md`.
 Every model-facing byte bound - schema maxima vs `maxFinalBytes`, repair-candidate retention, prompt budgets, and the NL trusted-history inline budget - is owned by the one `agent_runtime/size_budget.py` table ("Size budgets" in `docs/AGENT_RUNTIME.md`, property-tested by `tests/test_size_budget.py`); never copy a size constant into a consumer.
 Claude is the named production primary.
-The two schema-repair actions resolve to the direct `claude-cli-pinned` profile, while the other eight actions remain on `claude-action-current-pinned`.
+The two schema-repair actions resolve to the direct `claude-cli-pinned` profile, while the other nine actions remain on `claude-action-current-pinned`.
 `agent_runtime/config.py` guards that exact split, and `temporary_rollback_profile` is the reviewed one-setting rollback for an explicit durable replay.
 In production, `nl-decision.schema-repair` is the only schema-repair TASK still built: the triage correction turn reuses the ORIGINAL triage action (built by `build_correction_task` under the unchanged `triage.schema-repair` claim identity), so `triage.schema-repair` remains configured, guarded, and deployable as the disabled codex inline evidence plus rollback surface without being selected by the claude lane.
 Codex CLI `0.144.0` app-server remains implemented and tested only as disabled non-target adapter evidence because the current ChatGPT Pro plus public-repository topology has no supported secure noninteractive subscription path.
@@ -1203,12 +1291,12 @@ Provider environment overrides are rejected; secret presence cannot select a pro
 OpenCode with Z.AI Coding Plan is a deferred disabled candidate only; no adapter, provider call, credential request, target, fallback, or provider-specific runtime-core policy is authorized in this phase.
 Fallback remains disabled.
 
-Every spend-capable event first creates a durable default-token card claim keyed by `agent_runtime.admission.normalized_event_identity`: issue triage binds action plus exact target revision; PR triage and its correction also bind the queue-authorized review-context digest and any checked-in one-use recovery digest; NL additionally binds the exact comment ID; and deep review binds its normalized trigger identity.
+Every spend-capable event first creates a durable default-token card claim keyed by `agent_runtime.admission.normalized_event_identity`: issue triage binds action plus exact target revision; PR triage and its correction also bind the queue-authorized review-context digest and any checked-in one-use recovery digest; NL additionally binds the exact comment ID; deep review binds its normalized trigger identity; and assisted conflict resolution binds the exact target, card, and PR head.
 Existing workflow concurrency serializes same-event claim creation, duplicate delivery exits before task construction, and consumers edit the claim rather than creating duplicate model-result comments.
 AgentTask `idempotencyKey` is the normalized event-key hash.
 Content-free `wheelhouse-agent-stage` records begin at admission and bind action, Wheelhouse source SHA, event-key hash, and execution ID when available; they never carry prompt, comment, target, search, or credential content.
 
-The eight pinned Claude Action steps remain present and deployable behind the unified selection boundary; six serve the non-repair actions (and the triage correction turn, which rides the original action's own step), and two are the schema-repair rollback path.
+The nine pinned Claude Action steps remain present and deployable behind the unified selection boundary; seven serve the non-repair actions (and the triage correction turn, which rides the original action's own step), and two are the schema-repair rollback path.
 One direct supervisor step serves both schema-repair actions because they share the same one-turn, no-tool profile.
 They run only in the separately permissioned `claude-model.yml` reusable workflow after a trusted parent job uploads a bounded content-addressed `AgentTask` handoff.
 Each local reusable-workflow call resolves from the caller's exact commit and also passes that commit as `expected_commit_sha`; the model job must observe the same `GITHUB_SHA` before hydration, checkpointing, or provider execution.
@@ -1360,6 +1448,7 @@ The notes below record selected non-obvious regression coverage:
 - `python tests/test_reconcile.py` - reconcile routing, target-activity state-only reflection, fixed-K adjacent scheduled-observation soft-close lifecycle/provenance, hard-close and stale-snapshot race safety, and stale-card self-healing, no network. Also covers the #551 approve/wait freeze: a `ci_wait_pr_numbers` PR-kind card is FROZEN (never consumed), its stale-head display is exact-reread and refreshed to pending or explicit unknown via `ci_wait_refresh_items` (anti-masquerade) without ever creating a card, the refresh is a no-op once the semantic projection is already current (no churn), and the intervening scheduled observation invalidates any prior absence streak before terminal checks release the freeze.
 - `python tests/test_card_reuse.py` - deterministic end-to-end coverage through the actual reconcile, renderer/upsert, triage, decision, criteria, and trusted auto-merge indexing modules with an in-memory GitHub boundary: same/new-head and CI-to-PR reuse, strict provenance/actor/identity exclusions, legacy behavior, complete pagination, mutation races, partial failures, global lifecycle serialization, post-open uniqueness rollback, unchanged auto-merge duplicate denial, and the full two-absence waiting/re-entry lifecycle.
 - `python tests/test_merge_conflict.py` - mergeability-independent readiness, source pushability policy routing, inert policy card rendering, and Phase 0 captain-facing manual-conflict copy, no network.
+- `python tests/test_merge_assist.py` - captain-initiated assisted in-place merge, no network: conflict parsing and zero-novel-line reconstruction; every pre-spend escalation including the schema-derived hunk cap; the model-result boundary; an end-to-end real-local-git resolution proving exact parents, contributor commit identity, trailer, and confinement; same-repository and editable-fork source admission; plain non-force push confinement and credential isolation; the non-material head-bound card record and section; confirmation routing; fail-closed config; and normalized workflow proof that only the fork push step receives `ASSISTED_MERGE_PUSH_TOKEN` while the model stays read-only.
 - `python tests/test_ci_autoapprove.py` - the shared `ci_safety` verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed.
   It covers the completed-context plus separate `action_required` masking regression, fail-closed pending-run discovery, the unchanged draft/fork/author boundaries, and approval of every verified same-workflow duplicate run.
   It also asserts that the risky-file HOLD still short-circuits before run listing or approval, the advisory security summary is attached only to a carded risky contributor PR, and the #551 approve/wait freeze remains limited to freshly approved or running CI.

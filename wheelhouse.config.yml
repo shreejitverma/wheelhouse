@@ -266,6 +266,7 @@ agent_runtime:
     nl-decision.local: {target: claude, profile: claude-action-current-pinned}
     nl-decision.search: {target: claude, profile: claude-action-current-pinned}
     nl-decision.schema-repair: {target: claude, profile: claude-action-current-pinned}
+    merge.resolve-conflicts: {target: claude, profile: claude-action-current-pinned}
 
 # Automatic lightweight PR triage. DEFAULT ON when this key is absent.
 # When CLAUDE_CODE_OAUTH_TOKEN is present, each pure needs-decision pr-review
@@ -460,3 +461,29 @@ thank_on_merge: true
 # label on the target PR. Auto-merge never auto-reverts; each merge leaves a
 # resolved decision card plus an entry in the durable auto-merge ledger issue.
 auto_merge: true
+
+# Captain-initiated ASSISTED IN-PLACE MERGE. DEFAULT OFF; deliberately left off
+# in this repository's committed config too, because enabling it also requires
+# provisioning the `ASSISTED_MERGE_PUSH_TOKEN` secret (see README).
+#
+# When the captain decides "merge" on a CONFLICTED same-repository or editable
+# personal-fork pull request and this is on, Wheelhouse resolves the conflict as
+# a merge commit pushed to the contributor's EXISTING pull request branch - never
+# a landing branch, never a replacement PR, never a force push, never a rewrite
+# of their commits. Immediately before the plain non-force push, Wheelhouse
+# re-reads the remote head and refuses any racing contributor update. A bounded
+# model turn only chooses, per conflicted hunk, an ordering of lines
+# that already exist in the two merge parents; trusted code writes the bytes.
+# Anything risky or ambiguous escalates instead of being guessed, and the
+# captain still makes a second `Merge it` decision on the refreshed card.
+#
+# Scan-time auto-merge is UNAFFECTED and stays clean-state-only (G4/G7).
+#
+# Kill switches (layered): this flag, a per-repo `assisted_merge: false`,
+# removing `CLAUDE_CODE_OAUTH_TOKEN`, removing `ASSISTED_MERGE_PUSH_TOKEN`, and
+# a per-PR `wheelhouse:no-assisted-merge` label on the target pull request.
+assisted_merge: false
+# Conflicts larger than either cap escalate to the captain without any model
+# spend. Both may be overridden per repository under `repos:`.
+assisted_merge_max_conflict_files: 5
+assisted_merge_max_conflict_lines: 200

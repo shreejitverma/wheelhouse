@@ -245,6 +245,14 @@ def plan_card_projection(
         )
     projected_item["decision_context"] = context
 
+    # Non-material, revision-bound assisted-merge audit state (merge_assist.py).
+    # It survives a refresh only while it still describes the projected head -
+    # the head the captain decided on, or the resolution head that replaced it.
+    # A genuine contributor push clears it. It is never authority.
+    render_card.carry_merge_assist(
+        projected_item, render_card.parse_state_block((prior or {}).get("body") or "")
+    )
+
     assessment = assessment_admission.normalize_assessment(item.get("assessment"))
     if assessment and assessment["target"]["observation_id"] == observation["observation_id"]:
         projected_item["assessment"] = assessment

@@ -410,6 +410,44 @@ def _pr_label_names(pr):
     return names
 
 
+def _bulk_confirmation_label_hold(pr):
+    labels = (pr or {}).get("labels")
+    if not isinstance(labels, list):
+        return (True, "target labels could not be read")
+    if core.AWAITING_CAPTAIN_CONFIRM_LABEL in _pr_label_names(pr):
+        return (True, "assisted resolution awaits captain confirmation")
+    if (pr or {}).get("labels_truncated") is not False:
+        return (True, "target label observation is incomplete")
+    return (False, "")
+
+
+def _live_confirmation_label_hold(owner, repo, number):
+    state = core.target_label_state(
+        owner, repo, number, core.AWAITING_CAPTAIN_CONFIRM_LABEL
+    )
+    if state is None:
+        return (True, "assisted-confirmation label could not be re-read")
+    if state:
+        return (True, "assisted resolution awaits captain confirmation")
+    return (False, "")
+
+
+def _assisted_confirmation_hold(state, head_sha):
+    state = state if isinstance(state, dict) else {}
+    if render_card.MERGE_ASSIST_FIELD not in state:
+        return (False, "")
+    status, record = render_card.merge_assist_status(state, head_sha)
+    if status == "malformed":
+        return (True, "assisted-merge confirmation record is malformed")
+    if (
+        status == "matching"
+        and record.get("phase") == render_card.MERGE_ASSIST_PHASE_AWAITING
+        and record.get("resolution_head_sha") == head_sha
+    ):
+        return (True, "assisted resolution awaits the captain's confirmation")
+    return (False, "")
+
+
 def auto_merge_triage_available():
     return os.environ.get("WHEELHOUSE_AUTOMERGE_HAS_TOKEN", "").lower() == "true"
 
@@ -1096,7 +1134,25 @@ def evaluate_candidate(
     else:
         met("safety_target_open", "target PR is open and unmerged")
 
-    if core.NO_AUTO_MERGE_LABEL in _pr_label_names(pr):
+    pr_labels = pr.get("labels")
+    label_hold, label_reason = _bulk_confirmation_label_hold(item)
+    if not label_hold:
+        label_hold, label_reason = _live_confirmation_label_hold(
+            owner, repo, number
+        )
+    confirmation_hold, confirmation_reason = _assisted_confirmation_hold(
+        state, head_sha
+    )
+    if not isinstance(pr_labels, list):
+        stopped = fail(
+            "safety_escape_hatch",
+            "target labels could not be read",
+            "target labels are unavailable",
+            unavailable=True,
+        )
+        if stopped:
+            return stopped
+    elif core.NO_AUTO_MERGE_LABEL in _pr_label_names(pr):
         stopped = fail(
             "safety_escape_hatch",
             "%s is present" % core.NO_AUTO_MERGE_LABEL,
@@ -1104,8 +1160,25 @@ def evaluate_candidate(
         )
         if stopped:
             return stopped
+    elif label_hold:
+        stopped = fail(
+            "safety_escape_hatch",
+            label_reason,
+            label_reason,
+            unavailable=core.AWAITING_CAPTAIN_CONFIRM_LABEL not in _pr_label_names(pr),
+        )
+        if stopped:
+            return stopped
+    elif confirmation_hold:
+        stopped = fail(
+            "safety_escape_hatch",
+            confirmation_reason,
+            confirmation_reason,
+        )
+        if stopped:
+            return stopped
     else:
-        met("safety_escape_hatch", "%s is absent" % core.NO_AUTO_MERGE_LABEL)
+        met("safety_escape_hatch", "no target or assisted-confirmation hold is present")
 
     live_head = str((pr.get("head") or {}).get("sha") or "")
     if live_head and live_head == head_sha:
@@ -2207,8 +2280,16 @@ def _read_card_with_card_token(number, card_token):
 
 def final_auto_merge_guard(expected_card, owner, repo, number, card_token):
     def guard(pr):
-        if core.NO_AUTO_MERGE_LABEL in _pr_label_names(pr):
+        if not isinstance((pr or {}).get("labels"), list):
+            return (False, "target labels could not be re-read")
+        labels = _pr_label_names(pr)
+        if core.NO_AUTO_MERGE_LABEL in labels:
             return (False, "escape hatch label appeared before merging")
+        label_hold, label_reason = _live_confirmation_label_hold(
+            owner, repo, number
+        )
+        if label_hold:
+            return (False, label_reason)
         current_card = _read_card_with_card_token(
             expected_card.get("issue"), card_token
         )
@@ -2219,6 +2300,13 @@ def final_auto_merge_guard(expected_card, owner, repo, number, card_token):
         )
         if not card_ok:
             return (False, "card claim changed: %s" % card_reason)
+        current_entry = _card_index([current_card]).get((repo, str(number)))
+        confirmation_hold, confirmation_reason = _assisted_confirmation_hold(
+            (current_entry or {}).get("state"),
+            str(((pr or {}).get("head") or {}).get("sha") or ""),
+        )
+        if confirmation_hold:
+            return (False, confirmation_reason)
         overlap_read, overlap_note = core.same_closing_issue_overlap(
             owner, repo, number
         )
@@ -2265,6 +2353,16 @@ def act_merge(
         return held("could not re-read PR before merging")
     if pr.get("merged") or str(pr.get("state") or "").lower() != "open":
         return held("PR left the open merge-ready state before acting")
+    if not isinstance(pr.get("labels"), list):
+        return held("target labels could not be re-read before acting")
+    label_hold, label_reason = _live_confirmation_label_hold(owner, repo, number)
+    if label_hold:
+        return held(label_reason)
+    confirmation_hold, confirmation_reason = _assisted_confirmation_hold(
+        (expected_card or {}).get("state"), head_sha
+    )
+    if confirmation_hold:
+        return held(confirmation_reason)
     live_head = str((pr.get("head") or {}).get("sha") or "")
     if not live_head or live_head != head_sha:
         return held("head moved immediately before acting")

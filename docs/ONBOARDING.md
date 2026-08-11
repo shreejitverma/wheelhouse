@@ -85,7 +85,7 @@ For a newly created card, that queueing happens in the same ingest run, not only
 
 ## Fork contribution policy
 
-Add the [fork contribution requirement](../CONTRIBUTING.md#pull-requests-from-forks) to each fleet repository's `CONTRIBUTING.md`. The README owns the [source-permission policy](../README.md#security-notes) and [future assisted-merge credential](../README.md#future-assisted-merge-credential) contracts.
+Add the [fork contribution requirement](../CONTRIBUTING.md#pull-requests-from-forks) to each fleet repository's `CONTRIBUTING.md`. The README owns the [source-permission policy](../README.md#security-notes) and [assisted-merge push credential](../README.md#optional-assisted-merge-push-credential) contracts.
 
 ## Token for the source side
 

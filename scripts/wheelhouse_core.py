@@ -58,6 +58,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from urllib.parse import quote, urlparse
 
 import target_observation as target_contracts
@@ -262,6 +263,7 @@ query($owner:String!, $name:String!, $number:Int!) {
       headRefName headRefOid baseRefName baseRefOid
       headRepository { name nameWithOwner isFork owner { login __typename } }
       baseRepository { name owner { login } }
+      labels(first:%d) { totalCount pageInfo { hasNextPage } nodes { name } }
       commits(last:1) { nodes { commit { statusCheckRollup {
         state
         contexts(first:%d) { totalCount pageInfo { hasNextPage } nodes {
@@ -273,7 +275,7 @@ query($owner:String!, $name:String!, $number:Int!) {
     }
   }
 }
-""" % STATUS_CONTEXTS_PAGE_SIZE
+""" % (PR_LABELS_PAGE_SIZE, STATUS_CONTEXTS_PAGE_SIZE)
 
 PR_USER_CONTENT_EDITS_GQL = """
 query($owner:String!, $name:String!, $number:Int!, $after:String) {
@@ -290,7 +292,11 @@ query($owner:String!, $name:String!, $number:Int!, $after:String) {
 """
 
 # Buckets that need the maintainer's call vs. ones waiting on the contributor.
-NEEDS_MAINTAINER = {"merge-ready", "needs-ci-approval", "review-needed"}
+NEEDS_MAINTAINER = {
+    "merge-ready",
+    "needs-ci-approval",
+    "review-needed",
+}
 # (waiting-on-contributor: needs-reraise, fix-tests, draft, ci-running)
 # Retained only to parse and silently disarm historical rebase-cleanup markers.
 REBASE_NUDGE_MARKER_PREFIX = "wheelhouse-rebase-nudge"
@@ -300,6 +306,12 @@ PENDING_CONTRIBUTOR_KEEP_OPEN_LABEL = "wheelhouse:keep-open"
 # scan-time auto-merge (see auto_merge.py). It never affects the manual merge
 # path or any other decision - it only forces the auto-merge gate to hold.
 NO_AUTO_MERGE_LABEL = "wheelhouse:no-auto-merge"
+# Per-PR escape hatch for the CAPTAIN-INITIATED assisted in-place merge
+# (merge_assist.py). Applying it to a TARGET PR means Wheelhouse never pushes a
+# conflict resolution to that pull request's branch; the conflict stays a
+# manual captain resolution. It changes no other decision.
+NO_ASSISTED_MERGE_LABEL = "wheelhouse:no-assisted-merge"
+AWAITING_CAPTAIN_CONFIRM_LABEL = "wheelhouse:awaiting-captain-confirm"
 PENDING_CONTRIBUTOR_MARKER_PREFIX = "wheelhouse-pending-contributor-action"
 PENDING_CONTRIBUTOR_REMINDER_PREFIX = "wheelhouse-pending-contributor-reminder"
 PENDING_CONTRIBUTOR_CLOSE_PREFIX = "wheelhouse-pending-contributor-close"
@@ -336,6 +348,17 @@ TRIAGE_CONTEXT_ALLOWANCE_MAX = 5
 TRIAGE_DAILY_CEILING_DEFAULT = 1200
 TRIAGE_DAILY_CEILING_MIN = 1
 TRIAGE_DAILY_CEILING_MAX = 2000
+
+# Captain-initiated assisted in-place merge (scripts/merge_assist.py). The caps
+# bound how much conflict a single bounded model turn may even look at; going
+# over them is an escalation, never a larger request. Both are validated with
+# the same fail-closed integer contract the triage budgets use.
+ASSISTED_MERGE_MAX_FILES_DEFAULT = 5
+ASSISTED_MERGE_MAX_FILES_MIN = 1
+ASSISTED_MERGE_MAX_FILES_MAX = 20
+ASSISTED_MERGE_MAX_LINES_DEFAULT = 200
+ASSISTED_MERGE_MAX_LINES_MIN = 1
+ASSISTED_MERGE_MAX_LINES_MAX = 2000
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +533,17 @@ def load_config():
         # until the owner opts in globally or per repo AND commits a VISION.md on
         # the target's default branch (see auto_merge.py / AGENTS.md "Auto-merge").
         "auto_merge": cfg.get("auto_merge", False) is True,
+        # Captain-initiated assisted in-place merge is DEFAULT OFF (opt-in): it
+        # pushes a resolution commit to a contributor's own branch and needs a
+        # separate push credential, so a fork enables it deliberately. See
+        # scripts/merge_assist.py and README "Assisted-merge push credential".
+        "assisted_merge": cfg.get("assisted_merge", False) is True,
+        "assisted_merge_max_conflict_files": cfg.get(
+            "assisted_merge_max_conflict_files", ASSISTED_MERGE_MAX_FILES_DEFAULT
+        ),
+        "assisted_merge_max_conflict_lines": cfg.get(
+            "assisted_merge_max_conflict_lines", ASSISTED_MERGE_MAX_LINES_DEFAULT
+        ),
         # Advisory LLM triage is DEFAULT ON when the Claude token exists. The
         # flag is only a spend-control opt-out; absence keeps fresh forks useful.
         "auto_triage": bool(cfg.get("auto_triage", True)),
@@ -2017,7 +2051,9 @@ def derive_pushability(pr):
     return {"mode": PUSHABILITY_UNVERIFIED, "reason": "fork source permission evidence is incomplete", "source": source}
 
 
-def classify(draft, comp, tests, ci, cross_repo=True, mergeable=None):
+def classify(
+    draft, comp, tests, ci, cross_repo=True, mergeable=None, labels=None
+):
     """Return the work-readiness bucket, independently of mergeability.
 
     Mergeability is still observed for card display and remains a clean-state
@@ -2274,6 +2310,7 @@ def observe_exact_pr(owner, repo_cfg, number, expected_head_sha=""):
             ci,
             cross_repo,
             pr.get("mergeable"),
+            ((pr.get("labels") or {}).get("nodes") or []),
         )
         if str(pr.get("state") or "OPEN").upper() != "OPEN":
             bucket = "target-closed"
@@ -2378,6 +2415,56 @@ def _auto_merge_enabled(repo_cfg, global_default):
     kill switch even when the fleet-wide default is on."""
     v = repo_cfg.get("auto_merge")
     return global_default is True if v is None else v is True
+
+
+def _assisted_merge_enabled(repo_cfg, global_default):
+    """Effective assisted in-place merge for one repo.
+
+    DEFAULT OFF in shipped code, exactly like `auto_merge`: the assisted path
+    pushes a resolution commit to a contributor's branch, so a fork must opt in
+    globally or per repo (and configure the push credential) before it can act.
+    A per-repo `assisted_merge: false` is the portable one-repo kill switch.
+    """
+    v = (repo_cfg or {}).get("assisted_merge")
+    return global_default is True if v is None else v is True
+
+
+def _assisted_merge_max_files(repo_cfg, global_default):
+    if "assisted_merge_max_conflict_files" not in (repo_cfg or {}):
+        return _bounded_config_int(
+            global_default,
+            "assisted_merge_max_conflict_files",
+            ASSISTED_MERGE_MAX_FILES_MIN,
+            ASSISTED_MERGE_MAX_FILES_MAX,
+            ASSISTED_MERGE_MAX_FILES_MIN,
+        )
+    return _bounded_config_int(
+        repo_cfg.get("assisted_merge_max_conflict_files"),
+        "assisted_merge_max_conflict_files",
+        ASSISTED_MERGE_MAX_FILES_MIN,
+        ASSISTED_MERGE_MAX_FILES_MAX,
+        ASSISTED_MERGE_MAX_FILES_MIN,
+        scope="repo %s" % str((repo_cfg or {}).get("name") or "?"),
+    )
+
+
+def _assisted_merge_max_lines(repo_cfg, global_default):
+    if "assisted_merge_max_conflict_lines" not in (repo_cfg or {}):
+        return _bounded_config_int(
+            global_default,
+            "assisted_merge_max_conflict_lines",
+            ASSISTED_MERGE_MAX_LINES_MIN,
+            ASSISTED_MERGE_MAX_LINES_MAX,
+            ASSISTED_MERGE_MAX_LINES_MIN,
+        )
+    return _bounded_config_int(
+        repo_cfg.get("assisted_merge_max_conflict_lines"),
+        "assisted_merge_max_conflict_lines",
+        ASSISTED_MERGE_MAX_LINES_MIN,
+        ASSISTED_MERGE_MAX_LINES_MAX,
+        ASSISTED_MERGE_MAX_LINES_MIN,
+        scope="repo %s" % str((repo_cfg or {}).get("name") or "?"),
+    )
 
 
 def _default_branch_vision_observation(slug):
@@ -4124,7 +4211,14 @@ def build_repo(
             if pushability["mode"] == PUSHABILITY_UNVERIFIED
             else "needs-ci-approval"
             if pending_ci_approval
-            else classify(pr["isDraft"], comp, tests, ci, cross_repo)
+            else classify(
+                pr["isDraft"],
+                comp,
+                tests,
+                ci,
+                cross_repo,
+                labels=((pr.get("labels") or {}).get("nodes") or []),
+            )
         )
         author_excluded = _author_excluded_from_queue(author, maintainer_logins)
         try:
@@ -4891,6 +4985,23 @@ def qualify_issue_refs(text, owner, repo):
 def _is_not_found(stderr):
     s = (stderr or "").lower()
     return "404" in s or "not found" in s
+
+
+def target_label_state(owner, repo, number, label):
+    """Return True/False for one exact target label, or None on read failure."""
+    path = "/repos/%s/%s/issues/%s/labels/%s" % (
+        owner,
+        repo,
+        number,
+        quote(label, safe=""),
+    )
+    try:
+        value = gh_rest(path)
+    except RuntimeError as error:
+        return False if _is_not_found(str(error)) else None
+    except ValueError:
+        return None
+    return bool(isinstance(value, dict) and value.get("name") == label) or None
 
 
 def _gh_api_capture(path):

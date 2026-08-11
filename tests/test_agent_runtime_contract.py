@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -97,6 +98,66 @@ def main():
         check("task: unavailable limit evidence must match null value", rejects(changed, "enforcement availability"))
         check("task: no host source path is serialized", str(root) not in json.dumps(task))
         check("task: every artifact reference is content-addressed", all("artifacts/sha256/" in row["artifact"] for row in task["spec"]["inputs"]))
+
+        merge_prompt = root / "merge-prompt.txt"
+        merge_prompt.write_text(
+            "Read the bounded conflict payload from target.txt.\n", encoding="utf-8"
+        )
+        merge_target = root / "merge-target.txt"
+        merge_target.write_text(
+            '{"conflicts":[{"path":"src/example.py","hunks":[]}]}\n',
+            encoding="utf-8",
+        )
+        merge_bundle = root / "merge-bundle"
+        merge_task = build_task(
+            action="merge.resolve-conflicts",
+            selection=codex_selection(),
+            prompt_path=str(merge_prompt),
+            bundle_dir=str(merge_bundle),
+            output_path=str(merge_bundle / "task.json"),
+            owner="owner",
+            repo="repo",
+            number=2,
+            target_kind="pr-review",
+            revision="b" * 40,
+            wheelhouse_revision=WHEELHOUSE_REVISION,
+            event_key="b" * 64,
+            target_file=str(merge_target),
+        )
+        validate_contract(merge_task, "AgentTask")
+        merge_segments = merge_task["spec"]["prompt"]["segments"]
+        runtime_segment = merge_segments[0]
+        prompt_artifact = (
+            merge_bundle / merge_task["spec"]["prompt"]["userArtifact"]
+        )
+        prompt_content = prompt_artifact.read_bytes()
+        check(
+            "merge task: trusted runtime instructions retain prompt provenance",
+            runtime_segment["name"] == "runtime-instructions"
+            and runtime_segment["trust"] == "trusted"
+            and runtime_segment["sha256"]
+            == hashlib.sha256(prompt_content).hexdigest()
+            and runtime_segment["bytes"] == len(prompt_content),
+        )
+        untrusted_segments = [
+            segment for segment in merge_segments if segment["trust"] == "untrusted"
+        ]
+        target_input = next(
+            item for item in merge_task["spec"]["inputs"] if item["id"] == "target"
+        )
+        target_segment = untrusted_segments[0]
+        target_content = (merge_bundle / target_segment["artifact"]).read_bytes()
+        check(
+            "merge task: conflict payload has one artifact-bound trust segment",
+            len(untrusted_segments) == 1
+            and target_segment["name"] == "target"
+            and target_segment["artifact"] == target_input["artifact"]
+            and target_segment["sha256"] == target_input["sha256"]
+            and target_segment["bytes"] == target_input["bytes"]
+            and target_segment["sha256"]
+            == hashlib.sha256(target_content).hexdigest()
+            and target_segment["bytes"] == len(target_content),
+        )
 
         repository = root / "repository"
         repository.mkdir()

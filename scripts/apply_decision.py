@@ -499,6 +499,10 @@ def cmd_parse():
     set_output("kind", kind)
     set_output("head_sha", state.get("head_sha", ""))
     set_output("target_revision", state.get("head_sha") or state.get("updated_at", ""))
+    set_output(
+        "merge_assist_record",
+        json.dumps(state.get("merge_assist") or {}, separators=(",", ":")),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1073,6 +1077,73 @@ def _manual_merge_pushability_gate(owner, repo, number, pr):
     return None
 
 
+def _assisted_merge_enabled(repo):
+    """Whether this repository opted into captain-initiated assisted merge.
+
+    Cheap and denial-only: the merge-assist workflow re-proves the exact target,
+    source permission, workflow gates, and kill switches before it touches
+    anything. This only decides whether a conflict is worth dispatching.
+    """
+    try:
+        cfg = core.load_config()
+    except SystemExit:
+        return False
+    repo_cfg = (cfg.get("repos") or {}).get(repo) or {}
+    return core._assisted_merge_enabled(repo_cfg, cfg.get("assisted_merge"))
+
+
+def _live_assisted_resolution_proof(owner, repo, number, pr):
+    slug = "%s/%s" % (owner, repo)
+    head_sha = str(((pr.get("head") or {}).get("sha") or ""))
+    base_sha = str(((pr.get("base") or {}).get("sha") or ""))
+    expected_count = core._changed_file_count(pr.get("commits"))
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha) or not re.fullmatch(
+        r"[0-9a-f]{40}", base_sha
+    ):
+        return False, "the live head or base revision is unavailable"
+    commits, error = _read_pr_commit_shas(slug, number, expected_count)
+    if error:
+        return False, error
+    if (
+        expected_count is None
+        or len(commits) != expected_count
+        or len(commits) < 2
+        or commits[-1] != head_sha
+    ):
+        return False, "the complete pull request commit sequence could not be proven"
+    previous_head = commits[-2]
+    try:
+        commit = core.gh_rest("/repos/%s/commits/%s" % (slug, head_sha))
+    except _WORKFLOW_SCAN_READ_ERRORS as error:
+        return False, "the resolution commit could not be read: %s" % str(error)[:120]
+    parents = commit.get("parents") if isinstance(commit, dict) else None
+    if (
+        not isinstance(parents, list)
+        or len(parents) != 2
+        or not all(isinstance(parent, dict) for parent in parents)
+        or str(parents[0].get("sha") or "") != previous_head
+    ):
+        return False, "the live head is not a two-parent assisted resolution"
+    second_parent = str(parents[1].get("sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", second_parent):
+        return False, "the resolution base parent is unavailable"
+    try:
+        comparison = core.gh_rest(
+            "/repos/%s/compare/%s...%s" % (slug, second_parent, base_sha)
+        )
+    except _WORKFLOW_SCAN_READ_ERRORS as error:
+        return False, "the resolution base ancestry could not be read: %s" % str(error)[:120]
+    merge_base = comparison.get("merge_base_commit") if isinstance(comparison, dict) else None
+    if (
+        not isinstance(comparison, dict)
+        or comparison.get("status") not in {"ahead", "identical"}
+        or not isinstance(merge_base, dict)
+        or str(merge_base.get("sha") or "") != second_parent
+    ):
+        return False, "the resolution second parent is not an ancestor of the live base"
+    return True, ""
+
+
 def do_merge(
     owner,
     repo,
@@ -1080,20 +1151,52 @@ def do_merge(
     head_sha,
     return_merge_commit=False,
     return_workflow_gate=False,
+    return_assist=False,
     expected_base_sha=None,
     require_clean_merge_state=False,
     auto_merge_guard=None,
+    merge_assist_record=None,
 ):
-    def outcome(message, terminal, merge_commit="", workflow_gate=None):
+    def outcome(message, terminal, merge_commit="", workflow_gate=None, assist=False):
         values = [message, terminal]
         if return_merge_commit:
             values.append(merge_commit)
         if return_workflow_gate:
             values.append(workflow_gate)
+        if return_assist:
+            values.append(assist)
         return tuple(values)
 
     slug = "%s/%s" % (owner, repo)
     pr = core.gh_rest("/repos/%s/pulls/%s" % (slug, number))
+    try:
+        awaiting_label = core.target_label_state(
+            owner, repo, number, core.AWAITING_CAPTAIN_CONFIRM_LABEL
+        )
+    except _WORKFLOW_SCAN_READ_ERRORS:
+        awaiting_label = None
+    if awaiting_label is None:
+        return outcome(
+            "HOLD: could not verify the assisted-merge confirmation label on %s#%s. No merge was attempted."
+            % (repo, number),
+            "error",
+        )
+    confirmation_pending = awaiting_label is True
+    live_head_sha = str(((pr or {}).get("head") or {}).get("sha") or "")
+    if confirmation_pending and head_sha != live_head_sha:
+        return outcome(
+            "The assisted resolution for %s#%s is not yet bound to this card revision. The card remains actionable and will become confirmable after its next refresh."
+            % (repo, number),
+            "none",
+        )
+    if confirmation_pending:
+        proven, reason = _live_assisted_resolution_proof(owner, repo, number, pr)
+        if not proven:
+            return outcome(
+                "The %s label appears stale for the current head of %s#%s (%s). Remove the label to retry; no merge was attempted."
+                % (core.AWAITING_CAPTAIN_CONFIRM_LABEL, repo, number, reason),
+                "none",
+            )
     precondition = _merge_pr_precondition(
         repo,
         number,
@@ -1150,6 +1253,26 @@ def do_merge(
     source_gate = _manual_merge_pushability_gate(owner, repo, number, pr)
     if source_gate:
         return outcome(*source_gate)
+    if confirmation_pending:
+        try:
+            final_label_state = core.target_label_state(
+                owner, repo, number, core.AWAITING_CAPTAIN_CONFIRM_LABEL
+            )
+        except _WORKFLOW_SCAN_READ_ERRORS:
+            final_label_state = None
+        if final_label_state is not True:
+            return outcome(
+                "HOLD: the assisted-merge confirmation label on %s#%s changed or could not be verified before merging. No merge was attempted."
+                % (repo, number),
+                "error",
+            )
+        proven, reason = _live_assisted_resolution_proof(owner, repo, number, pr)
+        if not proven:
+            return outcome(
+                "The %s label appears stale for the current head of %s#%s (%s). Remove the label to retry; no merge was attempted."
+                % (core.AWAITING_CAPTAIN_CONFIRM_LABEL, repo, number, reason),
+                "none",
+            )
     try:
         fields = {"merge_method": method}
         if head_sha:
@@ -1181,6 +1304,27 @@ def do_merge(
             # needs-decision). A later clean head reactivates via the normal
             # scan/reconcile refresh path. Generic non-conflict failures stay
             # durable "error" (#447 / a8b0989).
+            #
+            # When assisted in-place merge is enabled, the SAME pure-pending
+            # shape also becomes the assisted-merge entry point: the handler
+            # dispatches merge-assist.yml, which resolves the conflict on the
+            # contributor's own branch and returns the card for the captain's
+            # second decision. Nothing merges here either way.
+            head_repo = ((pr.get("head") or {}).get("repo") or {})
+            source_slug = (
+                str(head_repo.get("full_name") or "")
+                if isinstance(head_repo, dict)
+                else ""
+            )
+            if _assisted_merge_enabled(repo) and source_slug:
+                return outcome(
+                    "Merge of %s#%s found a merge conflict. Starting assisted "
+                    "in-place resolution on the contributor's existing branch - "
+                    "their commits are not rewritten and nothing merges without "
+                    "your second decision. (%s)" % (repo, number, detail),
+                    "none",
+                    assist=True,
+                )
             return outcome(
                 "Merge of %s#%s found a merge conflict. In-place conflict "
                 "resolution is not enabled yet; the captain must resolve it manually "
@@ -1189,6 +1333,19 @@ def do_merge(
                 "none",
             )
         return outcome("Merge of %s#%s failed: %s" % (repo, number, detail), "error")
+    if confirmation_pending:
+        try:
+            core.gh_rest(
+                "/repos/%s/issues/%s/labels/%s"
+                % (slug, number, core.AWAITING_CAPTAIN_CONFIRM_LABEL),
+                method="DELETE",
+            )
+        except (RuntimeError, TypeError, ValueError) as error:
+            print(
+                "::warning::assisted-merge confirmation label cleanup failed for %s#%s: %s"
+                % (repo, number, str(error)[:160]),
+                file=sys.stderr,
+            )
     _thank_contributor(owner, repo, number, pr)
     merge_commit = (
         str(merge_result.get("sha") or "") if isinstance(merge_result, dict) else ""
@@ -1449,7 +1606,26 @@ def cmd_execute():
             set_output("source_policy_mode", source_mode)
             return
     if decision == "merge":
-        message, terminal = do_merge(owner, repo, number, head_sha)
+        raw_record = os.environ.get("MERGE_ASSIST_RECORD", "")
+        try:
+            merge_assist_record = json.loads(raw_record) if raw_record else None
+        except (TypeError, ValueError):
+            merge_assist_record = None
+        message, terminal, assist = do_merge(
+            owner,
+            repo,
+            number,
+            head_sha,
+            return_assist=True,
+            merge_assist_record=merge_assist_record,
+        )
+        if assist:
+            # The handler dispatches merge-assist.yml with these immutable
+            # coordinates under the DEFAULT token, exactly like Investigate.
+            set_output("assisted_merge", "true")
+            set_output("assisted_merge_repo", repo)
+            set_output("assisted_merge_number", number)
+            set_output("assisted_merge_head_sha", head_sha)
     elif decision == "approve-ci":
         message, terminal = do_approve_ci(owner, repo, number)
     elif decision == "close":
@@ -2282,6 +2458,9 @@ def route_decision(result, kind, state, owner=""):
         "head_sha": (state or {}).get("head_sha", ""),
         "target_revision": (state or {}).get("head_sha")
         or (state or {}).get("updated_at", ""),
+        "merge_assist_record": json.dumps(
+            (state or {}).get("merge_assist") or {}, separators=(",", ":")
+        ),
     }
 
     def finish():
@@ -2388,6 +2567,9 @@ def cmd_nl_route():
             "kind": kind,
             "head_sha": state.get("head_sha", ""),
             "target_revision": state.get("head_sha") or state.get("updated_at", ""),
+            "merge_assist_record": json.dumps(
+                state.get("merge_assist") or {}, separators=(",", ":")
+            ),
         }
     )
     out.update(
@@ -2416,6 +2598,7 @@ def cmd_nl_route():
         "kind",
         "head_sha",
         "target_revision",
+        "merge_assist_record",
         "result_valid",
         "repair_status",
         "failure_code",

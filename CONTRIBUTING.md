@@ -26,9 +26,11 @@ Automated authors are exempt: PRs from `github-actions[bot]`, `dependabot[bot]`,
 
 ## Pull requests from forks
 
-If you open a pull request from a fork, use a personal fork and enable **Allow edits from maintainers** in the pull request sidebar. This permission is required for the planned captain-initiated path that will resolve a small conflict on that same branch without asking you to rebase. That assisted path is not enabled in Phase 0; until it ships, the captain handles conflicts manually. The planned path will not rewrite your existing commits, and checks will run on the same PR.
+If you open a pull request from a fork, use a personal fork and enable **Allow edits from maintainers** in the pull request sidebar. This permission lets a maintainer resolve a small conflict on that same branch without asking you to rebase. The path does not rewrite your existing commits, and checks run on the same PR. A visible `wheelhouse:awaiting-captain-confirm` label remains until the maintainer confirms and merges the resolution; the label is advisory and does not prevent a deliberate GitHub merge.
 
 GitHub does not allow organization-owned forks to grant this permission. Pull requests from a fork that cannot be updated by maintainers are closed with an explanation. You can enable the setting and reopen the PR, or send a replacement from a personal fork.
+
+When a maintainer resolves a conflict this way, they push one merge commit to the existing PR branch, whether it is in this repository or an editable personal fork. Immediately before the plain non-force push, the branch is re-read and the update is refused if you pushed meanwhile. Your commits are not rewritten, rebased, or squashed, and you keep authorship; the merge commit credits you with a `Co-authored-by` trailer. Checks then run again on this same pull request.
 
 If GitHub shows **Allow edits and access to secrets by maintainers**, read GitHub's warning before enabling it. That setting has the security implications GitHub documents for fork workflows. Do not enable it if you do not accept those implications. In that case, this contribution policy cannot accept the fork PR.
 
@@ -66,6 +68,7 @@ python tests/test_card_reuse.py
 python tests/test_reconcile.py
 python tests/test_merge_conflict.py
 python tests/test_maintainer_edits_policy.py
+python tests/test_merge_assist.py
 python tests/test_pending_contributor_cleanup.py
 python tests/test_ci_autoapprove.py
 python tests/test_target_observation.py

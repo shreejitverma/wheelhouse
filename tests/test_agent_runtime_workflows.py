@@ -34,7 +34,7 @@ def main():
     docs = {name: yaml.safe_load(path.read_text()) for name, path in WORKFLOWS.items()}
     all_steps = [(name, step) for name, doc in docs.items() for step in steps(doc)]
     claude = [(name, step) for name, step in all_steps if str(step.get("uses", "")).startswith("anthropics/claude-code-action@")]
-    check("production: exactly eight inventoried direct Claude steps remain", len(claude) == 8)
+    check("production: exactly nine inventoried direct Claude steps remain", len(claude) == 9)
     check("production: every direct step keeps exact action pin", all(step["uses"] == PIN for _, step in claude))
     check("production: every direct step is selected by immutable task action", all("steps.hydrate.outputs.action" in str(step.get("if", "")) for _, step in claude))
     check("production: direct Claude is never a failure fallback", all("failure()" not in str(step.get("if", "")) and "agent-runtime.outcome" not in str(step.get("if", "")) for _, step in claude))

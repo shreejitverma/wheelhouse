@@ -312,6 +312,8 @@ def make_item(repo, number, head, comp="pass", tests="green", bucket="merge-read
         "head_sha": head,
         "comp": comp,
         "tests": tests,
+        "labels": [],
+        "labels_truncated": False,
         "same_closing_issue_overlap": "",
     }
 
@@ -438,6 +440,7 @@ def run_act(world, items, cards, has_token=True, has_card_token=True):
         "compare": am.immutable_compare_files,
         "checks": am.live_check_status,
         "closing_overlap": core.same_closing_issue_overlap,
+        "target_label_state": core.target_label_state,
         "domerge": apply_decision.do_merge,
         "get_card": render_card.get_card,
         "edit_body": render_card._edit_issue_body,
@@ -456,6 +459,18 @@ def run_act(world, items, cards, has_token=True, has_card_token=True):
     am.immutable_compare_files = world.immutable_compare_files
     am.live_check_status = world.live_check_status
     core.same_closing_issue_overlap = world.same_closing_issue_overlap
+
+    def target_label_state(owner, repo, number, label):
+        pr = world.last_pr.get(("%s/%s" % (owner, repo), str(number)))
+        if not isinstance(pr, dict) or not isinstance(pr.get("labels"), list):
+            return None
+        return label in {
+            value.get("name")
+            for value in pr["labels"]
+            if isinstance(value, dict)
+        }
+
+    core.target_label_state = target_label_state
     apply_decision.do_merge = world.do_merge
     am.closed_audit_intent_entries = lambda card_token: getattr(
         world, "closed_audit_intents", {}
@@ -507,6 +522,7 @@ def run_act(world, items, cards, has_token=True, has_card_token=True):
         am.immutable_compare_files = saved["compare"]
         am.live_check_status = saved["checks"]
         core.same_closing_issue_overlap = saved["closing_overlap"]
+        core.target_label_state = saved["target_label_state"]
         apply_decision.do_merge = saved["domerge"]
         render_card.get_card = saved["get_card"]
         render_card._edit_issue_body = saved["edit_body"]

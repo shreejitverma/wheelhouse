@@ -464,6 +464,23 @@ jobs:
           settings: '{"permissions":{"deny":["Bash","Read","Edit","Write","MultiEdit","NotebookEdit","Glob","Grep","WebFetch","WebSearch","Task"]}}'
           claude_args: "--allowedTools \"\"\n--max-turns 1\n--model claude-sonnet-4-6"
 
+      # Assisted in-place merge conflict resolution. Read-only tools over the
+      # bounded conflict payload only: no Write, no Bash, no search broker, no
+      # credential of any kind. The model selects between existing parent
+      # lines; trusted caller-side code writes every byte it commits.
+      - id: merge_resolve
+        if: ${{ steps.hydrate.outputs.adapter == 'claude-action-compat' && steps.hydrate.outputs.action == 'merge.resolve-conflicts' }}
+        continue-on-error: true
+        env: {CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"}
+        uses: anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e # v1.0.178
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_bots: github-actions[bot]
+          allowed_non_write_users: ${{ github.actor }}
+          prompt: ${{ steps.hydrate.outputs.prompt }}
+          claude_args: "--allowedTools Read,Grep,Glob\n--max-turns 24\n--model claude-sonnet-4-6"
+
       - name: Capture trusted public-clone provenance
         if: ${{ always() && steps.hydrate.outputs.action == 'triage.pr.search' }}
         run: |
@@ -489,7 +506,7 @@ jobs:
           TASK_SHA: ${{ steps.hydrate.outputs.taskSha256 }}
           HANDOFF: ${{ runner.temp }}/wheelhouse-handoff
           HANDOFF_SHA256: ${{ inputs.handoff_sha256 }}
-          EXECUTION_FILE: ${{ steps.triage_search.outputs.execution_file || steps.triage_local.outputs.execution_file || steps.triage_repair.outputs.execution_file || steps.deep_search.outputs.execution_file || steps.deep_local.outputs.execution_file || steps.nl_search.outputs.execution_file || steps.nl_local.outputs.execution_file || steps.nl_repair.outputs.execution_file }}
+          EXECUTION_FILE: ${{ steps.triage_search.outputs.execution_file || steps.triage_local.outputs.execution_file || steps.triage_repair.outputs.execution_file || steps.deep_search.outputs.execution_file || steps.deep_local.outputs.execution_file || steps.nl_search.outputs.execution_file || steps.nl_local.outputs.execution_file || steps.nl_repair.outputs.execution_file || steps.merge_resolve.outputs.execution_file }}
           OUTPUT: ${{ runner.temp }}/wheelhouse-model-output
           ATTEMPT: ${{ runner.temp }}/wheelhouse-model-attempt/enforcement.json
           PYTHONPYCACHEPREFIX: ${{ runner.temp }}/wheelhouse-pycache

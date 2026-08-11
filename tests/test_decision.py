@@ -1073,6 +1073,8 @@ def fake_gh_rest(
             }
         )
         if method in (None, "GET"):
+            if "/issues/" in path and "/labels/" in path:
+                raise RuntimeError("HTTP 404: label not found")
             if "/reviews/" in path:
                 if review_get_error:
                     raise RuntimeError(review_get_error)

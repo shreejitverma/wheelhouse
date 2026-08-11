@@ -142,6 +142,8 @@ def test_manual_conflict_copy_blames_not_contributor():
     calls = []
     def fake_rest(path, method=None, fields=None, **_kwargs):
         calls.append((path, method, fields))
+        if "/labels/wheelhouse%3Aawaiting-captain-confirm" in path:
+            raise RuntimeError("HTTP 404: label not found")
         if method == "PUT": raise RuntimeError("merge conflict")
         return {
             "head": {"sha": "head", "repo": {"full_name": "owner/demo"}},
@@ -153,7 +155,7 @@ def test_manual_conflict_copy_blames_not_contributor():
         message, terminal = apply_decision.do_merge("owner", "demo", 1, "head")
     finally:
         apply_decision.core.gh_rest = save_rest
-    check("conflict remains retryable until assist ships", terminal == "none")
+    check("conflict remains retryable while assisted merge is disabled", terminal == "none")
     check("conflict copy makes the captain own manual resolution", "captain must resolve" in message and "without asking the contributor to rebase" in message)
 
 

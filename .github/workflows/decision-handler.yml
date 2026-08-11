@@ -988,6 +988,7 @@ jobs:
           KIND: ${{ steps.decide.outputs.kind || steps.route.outputs.kind }}
           HEAD_SHA: ${{ steps.decide.outputs.head_sha || steps.route.outputs.head_sha }}
           TARGET_REVISION: ${{ steps.decide.outputs.target_revision || steps.route.outputs.target_revision }}
+          MERGE_ASSIST_RECORD: ${{ steps.decide.outputs.merge_assist_record || steps.route.outputs.merge_assist_record }}
           BASH_ENV: ""
           ENV: ""
           LD_PRELOAD: ""
@@ -1013,6 +1014,7 @@ jobs:
             KIND="$KIND" \
             HEAD_SHA="$HEAD_SHA" \
             TARGET_REVISION="$TARGET_REVISION" \
+            MERGE_ASSIST_RECORD="$MERGE_ASSIST_RECORD" \
             "$TRUSTED_PYTHON" scripts/apply_decision.py execute
 
       - name: Queue final source-policy reconciliation
@@ -1100,6 +1102,40 @@ jobs:
           LD_LIBRARY_PATH: ""
           GH_PROMPT_DISABLED: "1"
         run: gh issue close "${{ github.event.issue.number }}" || true
+
+      # --- Assisted in-place merge (captain-initiated conflict resolution) ----
+      # The captain's `Merge it` decision hit a merge conflict on an eligible
+      # source branch and assisted merge is enabled for the repo. Dispatch
+      # merge-assist.yml with the immutable coordinates - same `github.token`
+      # workflow_dispatch pattern, and the same recursion-barrier reason, as
+      # Investigate. The card is left pure pending (terminal `none`), so this
+      # runs AFTER the label steps above and never races them. merge-assist
+      # re-proves the exact target, source permission, workflow gates, and kill
+      # switches itself; failing to dispatch changes nothing on the target.
+      - name: Start assisted in-place merge
+        if: ${{ always() && steps.current-card.outputs.allowed == 'true' && steps.execute.outputs.assisted_merge == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          TARGET_REPO: ${{ steps.execute.outputs.assisted_merge_repo }}
+          TARGET_NUMBER: ${{ steps.execute.outputs.assisted_merge_number }}
+          HEAD_SHA: ${{ steps.execute.outputs.assisted_merge_head_sha }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GH_PROMPT_DISABLED: "1"
+        run: |
+          set -uo pipefail
+          if ! gh workflow run merge-assist.yml \
+            -f issue="$ISSUE" \
+            -f repo="$TARGET_REPO" \
+            -f number="$TARGET_NUMBER" \
+            -f head_sha="$HEAD_SHA"; then
+            gh issue comment "$ISSUE" --body \
+              "Couldn't start assisted in-place conflict resolution (workflow dispatch failed). Nothing on the target changed; resolve the conflict manually or tick Merge it again." || true
+          fi
 
       # --- NL answer / clarify: post the reply, leave the card OPEN ----------
       - id: nl-reply-consumer
@@ -1600,6 +1636,7 @@ jobs:
           KIND: ${{ steps.route.outputs.kind }}
           HEAD_SHA: ${{ steps.route.outputs.head_sha }}
           TARGET_REVISION: ${{ steps.route.outputs.target_revision }}
+          MERGE_ASSIST_RECORD: ${{ steps.route.outputs.merge_assist_record }}
           BASH_ENV: ""
           ENV: ""
           LD_PRELOAD: ""
@@ -1625,6 +1662,7 @@ jobs:
             KIND="$KIND" \
             HEAD_SHA="$HEAD_SHA" \
             TARGET_REVISION="$TARGET_REVISION" \
+            MERGE_ASSIST_RECORD="$MERGE_ASSIST_RECORD" \
             "$TRUSTED_PYTHON" scripts/apply_decision.py execute
 
       - name: Queue final source-policy reconciliation
