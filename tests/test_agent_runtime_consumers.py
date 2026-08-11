@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
 from pathlib import Path
@@ -35,6 +34,7 @@ def main():
         "deep-review.search",
         "nl-decision.local",
         "nl-decision.search",
+        "nl-decision.schema-repair",
     ]
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -58,6 +58,7 @@ def main():
         pr_final["recommended_action"] = "merge"
         pr_final["automerge"] = {
             "behavior_class": "A",
+            "behavior_assertions": [],
             "aligns_with_vision": True,
             "changes_existing_or_default_behavior": False,
             "optin_default_off": False,

@@ -20,6 +20,12 @@ import reconcile  # noqa: E402
 import render_card as rc  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
+# Closed-card lifecycle tests use an in-memory GitHub boundary and isolate that
+# lifecycle from the cross-repo projection covered by test_automerge_card_ui.py.
+rc._evaluate_automerge_card_projection = lambda *args, **kwargs: (
+    rc.criteria_schema.unavailable_criteria("offline card-reuse fixture")
+)
+
 _failures = []
 
 
@@ -73,20 +79,167 @@ def item(head="a" * 40, kind="pr-review", **overrides):
         "automerge_vision_sha": "c" * 40,
     }
     base.update(overrides)
+    # Production pr-review items always carry a complete bound observation and
+    # DecisionContext, so bind them AFTER overrides land on the identity
+    # fields. Scenarios needing a legacy pre-Option-B item pass
+    # `target_observation=None` explicitly.
+    if base["kind"] == "pr-review" and "target_observation" not in base:
+        observation = current_observation(base)
+        base["target_observation"] = observation
+        base["decision_context"] = rc.context_contracts.build_decision_context(
+            observation, current_repository_snapshot(base)
+        )
     return base
 
 
+def current_observation(base):
+    return reconcile.target_contracts.make_observation(
+        "kunchenguid",
+        base["repo"],
+        int(base["number"]),
+        head_sha=base["head_sha"],
+        base_sha=base["base_sha"],
+        expected_head_sha=base["head_sha"],
+        observed_at=base["updated_at"],
+        source="bulk-scan",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": base["title"],
+            "author": base["author"],
+            "updated_at": base["updated_at"],
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "feature",
+            "mergeable": "MERGEABLE",
+            "ci": True,
+            "comp": base["comp"],
+            "tests": base["tests"],
+            "bucket": base["bucket"],
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "Gate", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=reconcile.target_contracts.changed_path_facts(
+            ["src/example.py"], complete=True
+        ),
+    )
+
+
+def current_repository_snapshot(base):
+    return rc.context_contracts.repository_snapshot(
+        [
+            {
+                "owner": "kunchenguid",
+                "repo": base["repo"],
+                "number": int(base["number"]),
+                "head_sha": base["head_sha"],
+                "title": base["title"],
+                "paths_complete": True,
+                "paths": ["src/example.py"],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": 0,
+                "url": base["url"],
+                "card_url": "",
+            }
+        ],
+        base["updated_at"],
+    )
+
+
+def absence_observation(number=42, head="h" * 40):
+    return reconcile.target_contracts.make_observation(
+        "kunchenguid",
+        "wheelhouse",
+        number,
+        head_sha=head,
+        base_sha="b" * 40,
+        expected_head_sha=head,
+        observed_at="2026-07-13T12:00:00Z",
+        source="bulk-scan",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": "Ready PR",
+            "author": "contributor",
+            "updated_at": "2026-07-13T12:00:00Z",
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "feature",
+            "mergeable": "CONFLICTING",
+            "ci": True,
+            "comp": "pass",
+            "tests": "green",
+            "bucket": "needs-rebase",
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "Gate", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=reconcile.target_contracts.changed_path_facts(
+            ["src/example.py"], complete=True
+        ),
+    )
+
+
 def scan_payload(items, open_target=True):
+    pr_numbers = []
+    issue_numbers = []
+    if open_target:
+        for entry in items or []:
+            number = int(entry.get("number") or 0)
+            if not number:
+                continue
+            if entry.get("kind") == "issue-triage":
+                issue_numbers.append(number)
+            else:
+                pr_numbers.append(number)
+        if not pr_numbers and not issue_numbers:
+            pr_numbers = [42]
     return {
         "repos": {
             "wheelhouse": {
                 "ok": True,
                 "truncated": False,
-                "open_pr_numbers": [42] if open_target else [],
-                "open_issue_numbers": [],
+                "open_pr_numbers": pr_numbers,
+                "open_issue_numbers": issue_numbers,
                 "indeterminate_pr_numbers": [],
                 "ci_wait_pr_numbers": [],
                 "ci_wait_refresh_items": [],
+                "worklist_absence_observations": {
+                    str(number): absence_observation(number)
+                    for number in pr_numbers
+                },
             }
         },
         "items": items,
@@ -96,12 +249,13 @@ def scan_payload(items, open_target=True):
 def valid_triage():
     return {
         "summary": "The change is narrow and grounded.",
-        "product_implications": "Default behavior stays stable.",
+        "product_implications": "Documentation and tests stay focused.",
         "evidence": 'target.txt: "The change is narrow and grounded"',
         "recommended_action": "merge",
         "recommended_reason": "Checks and behavior are safe.",
         "automerge": {
             "behavior_class": "A",
+            "behavior_assertions": [],
             "aligns_with_vision": True,
             "changes_existing_or_default_behavior": False,
             "recommend_merge": True,
@@ -111,24 +265,44 @@ def valid_triage():
 
 
 class LifecycleGitHub:
-    """Stateful GitHub boundary used by actual reconcile and render modules."""
+    """Stateful GitHub boundary used by actual reconcile and render modules.
 
-    def __init__(self, initial_item=None):
+    Issue-by-number reads are immediately consistent. Open-list and label-search
+    visibility can lag independently via `list_index_lag_seconds` and
+    `search_index_lag_seconds` (fake time advanced by `_lifecycle_sleep`).
+    """
+
+    def __init__(self, initial_item=None, start_empty=False):
         self.issues = {}
         self.next_number = 8
         self.clock = 0
+        self.fake_time = 0.0
+        self.list_index_lag_seconds = 0.0
+        self.search_index_lag_seconds = 0.0
+        self.list_visible_at = {}
+        self.search_visible_at = {}
         self.create_calls = 0
+        self.close_calls = 0
         self.fail_list_state = ""
         self.fail_prepare = ""
         self.inject_duplicate_on_reopen = False
+        self.inject_open_duplicate_after_create = False
         self.fail_post_reopen_view_once = False
         self.fail_open_list_after_reopen = False
+        self.fail_open_list_after_create = False
+        self.just_created = False
         self.fail_reopen_after_mutation = False
+        self.direct_issue_overrides = {}
         self.labels_on_reopen = []
         self.just_reopened = False
         self.run_number = 0
         self.workflow_calls = []
-        self.add_card(initial_item or item(), number=7)
+        self.issue_edit_calls = 0
+        self.patch_calls = 0
+        self.timeline_failures = set()
+        self.budget_reservations = 0
+        if not start_empty:
+            self.add_card(initial_item or item(), number=7)
 
     def _timestamp(self):
         self.clock += 1
@@ -138,8 +312,42 @@ class LifecycleGitHub:
     def _touch(self, issue):
         issue["updated_at"] = self._timestamp()
 
-    def add_card(self, current_item, number, state="OPEN", author=rc.CARD_AUTOMATION_AUTHOR):
-        card = rc.render(current_item)
+    def _mark_index_visibility(self, number, *, list_lag=None, search_lag=None):
+        list_delay = (
+            self.list_index_lag_seconds if list_lag is None else float(list_lag)
+        )
+        search_delay = (
+            self.search_index_lag_seconds if search_lag is None else float(search_lag)
+        )
+        self.list_visible_at[number] = self.fake_time + max(0.0, list_delay)
+        self.search_visible_at[number] = self.fake_time + max(0.0, search_delay)
+
+    def advance_time(self, seconds):
+        self.fake_time += float(seconds)
+
+    def _list_visible(self, number):
+        return self.fake_time >= self.list_visible_at.get(number, 0.0)
+
+    def _search_visible(self, number):
+        # REST label list is the production open-list path; search lag is tracked
+        # independently so tests can prove both indexes lag without affecting
+        # authoritative issue-by-number reads.
+        return self.fake_time >= self.search_visible_at.get(number, 0.0)
+
+    def add_card(
+        self,
+        current_item,
+        number,
+        state="OPEN",
+        author=rc.CARD_AUTOMATION_AUTHOR,
+        list_lag=0.0,
+        search_lag=0.0,
+        held=False,
+        has_token=False,
+    ):
+        card = rc.render(
+            current_item, held=held or rc.should_hold(current_item, has_token)
+        )
         self.issues[number] = {
             "number": number,
             "body": card["body"],
@@ -151,7 +359,9 @@ class LifecycleGitHub:
             "closed_at": "",
             "closed_by": "",
             "comments": [],
+            "timeline": [],
         }
+        self._mark_index_visibility(number, list_lag=list_lag, search_lag=search_lag)
         self.next_number = max(self.next_number, number + 1)
         return self.issues[number]
 
@@ -220,11 +430,27 @@ class LifecycleGitHub:
     def _close(self, issue):
         issue["state"] = "CLOSED"
         provenance = rc.reconcile_soft_close_provenance(issue["body"])
-        issue["closed_at"] = (
-            provenance["at"] if provenance else "2026-07-13T13:59:59Z"
-        )
+        issue["closed_at"] = provenance["at"] if provenance else "2026-07-13T13:59:59Z"
         issue["closed_by"] = rc.CARD_AUTOMATION_AUTHOR
         issue["updated_at"] = issue["closed_at"]
+        issue["timeline"].append(
+            {
+                "event": "closed",
+                "created_at": issue["closed_at"],
+                "actor": {"login": rc.CARD_AUTOMATION_AUTHOR},
+            }
+        )
+
+    def post_close_activity(self, number, actor=rc.CARD_AUTOMATION_AUTHOR):
+        issue = self.issues[number]
+        issue["updated_at"] = "2099-01-01T00:00:00Z"
+        issue["timeline"].append(
+            {
+                "event": "labeled",
+                "created_at": issue["updated_at"],
+                "actor": {"login": actor},
+            }
+        )
 
     def _api_list(self, endpoint):
         parsed = urlparse(endpoint)
@@ -237,13 +463,27 @@ class LifecycleGitHub:
             and requested_state == "OPEN"
         ):
             raise RuntimeError("simulated persistent post-reopen list failure")
+        if (
+            self.just_created
+            and self.fail_open_list_after_create
+            and requested_state == "OPEN"
+        ):
+            raise RuntimeError("simulated persistent post-create list failure")
         if self.fail_list_state == requested_state:
             raise RuntimeError("simulated incomplete %s pagination" % requested_state)
-        rows = [
-            self._rest(issue)
-            for issue in self.issues.values()
-            if issue["state"] == requested_state and marker in label_names(issue)
-        ]
+        rows = []
+        for issue in self.issues.values():
+            if issue["state"] != requested_state:
+                continue
+            if marker not in label_names(issue):
+                continue
+            # Open-list and search indexes lag independently of issue-by-number.
+            if requested_state == "OPEN" and not (
+                self._list_visible(issue["number"])
+                and self._search_visible(issue["number"])
+            ):
+                continue
+            rows.append(self._rest(issue))
         return SimpleNamespace(returncode=0, stdout=json.dumps([rows]), stderr="")
 
     def gh(self, args, check=True):
@@ -254,6 +494,34 @@ class LifecycleGitHub:
         if args[:3] == ["api", "--method", "PATCH"]:
             number = int(args[3].rsplit("/", 1)[-1])
             issue = self.issues[number]
+            if "--input" in args:
+                path = args[args.index("--input") + 1]
+                with open(path, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                self.patch_calls += 1
+                # The v2 writer prepares closed pr-review cards through this
+                # PATCH, so writer-failure-before-reopen injection lives here;
+                # partial modes model a response lost after the server applied
+                # part of the intent.
+                is_closed_prepare = issue["state"] == "CLOSED"
+                if is_closed_prepare and self.fail_prepare == "before":
+                    raise RuntimeError("simulated projection update failure")
+                if is_closed_prepare and self.fail_prepare == "body-only":
+                    issue["title"] = payload["title"]
+                    issue["body"] = payload["body"]
+                    self._touch(issue)
+                    raise RuntimeError("simulated body-only partial projection")
+                if is_closed_prepare and self.fail_prepare == "labels-only":
+                    issue["labels"] = label_objects(payload["labels"])
+                    self._touch(issue)
+                    raise RuntimeError("simulated label-only partial projection")
+                issue["title"] = payload["title"]
+                issue["body"] = payload["body"]
+                issue["labels"] = label_objects(payload["labels"])
+                self._touch(issue)
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps(self._rest(issue)), stderr=""
+                )
             names = {
                 value.removeprefix("labels[]=")
                 for value in args
@@ -269,10 +537,30 @@ class LifecycleGitHub:
                 self.just_reopened = False
                 self.fail_post_reopen_view_once = False
                 raise RuntimeError("simulated post-reopen read failure")
+            if "/timeline?" in args[1]:
+                number = int(args[1].split("/issues/", 1)[1].split("/", 1)[0])
+                if number in self.timeline_failures:
+                    raise RuntimeError("simulated unreadable timeline")
+                query = parse_qs(urlparse(args[1]).query)
+                page = int((query.get("page") or ["1"])[0])
+                per_page = int((query.get("per_page") or ["100"])[0])
+                start = (page - 1) * per_page
+                rows = self.issues[number]["timeline"][start : start + per_page]
+                return SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
             number = int(args[1].rsplit("/", 1)[-1])
+            if number in self.direct_issue_overrides:
+                override = self.direct_issue_overrides[number]
+                if override is None:
+                    raise RuntimeError("issue not found")
+                if isinstance(override, Exception):
+                    raise override
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps(override), stderr=""
+                )
             issue = self.issues.get(number)
             if not issue:
                 raise RuntimeError("issue not found")
+            # Direct issue-by-number is immediately consistent even while list lags.
             return SimpleNamespace(
                 returncode=0, stdout=json.dumps(self._rest(issue)), stderr=""
             )
@@ -293,9 +581,7 @@ class LifecycleGitHub:
             with open(args[args.index("--body-file") + 1]) as body_file:
                 body = body_file.read()
             names = [
-                args[index + 1]
-                for index, arg in enumerate(args)
-                if arg == "--label"
+                args[index + 1] for index, arg in enumerate(args) if arg == "--label"
             ]
             self.issues[number] = {
                 "number": number,
@@ -308,13 +594,28 @@ class LifecycleGitHub:
                 "closed_at": "",
                 "closed_by": "",
                 "comments": [],
+                "timeline": [],
             }
+            self._mark_index_visibility(number)
+            self.just_created = True
+            if self.inject_open_duplicate_after_create:
+                self.inject_open_duplicate_after_create = False
+                peer_number = self.next_number
+                self.next_number += 1
+                peer = copy.deepcopy(self.issues[number])
+                peer["number"] = peer_number
+                peer["updated_at"] = self._timestamp()
+                self.issues[peer_number] = peer
+                # Peer is already list-visible so uniqueness can observe it.
+                self.list_visible_at[peer_number] = self.fake_time
+                self.search_visible_at[peer_number] = self.fake_time
             return SimpleNamespace(
                 returncode=0,
                 stdout="https://github.com/kunchenguid/wheelhouse/issues/%s\n" % number,
                 stderr="",
             )
         if args[:2] == ["issue", "edit"]:
+            self.issue_edit_calls += 1
             issue = self.issues[int(args[2])]
             is_closed_prepare = issue["state"] == "CLOSED" and "--body-file" in args
             if is_closed_prepare and self.fail_prepare == "before":
@@ -331,6 +632,8 @@ class LifecycleGitHub:
                     self._touch(issue)
                     raise RuntimeError("simulated body-only partial update")
             self._apply_label_args(issue, args)
+            if "--title" in args:
+                issue["title"] = args[args.index("--title") + 1]
             self._touch(issue)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if args[:2] == ["issue", "comment"]:
@@ -344,6 +647,7 @@ class LifecycleGitHub:
             self._touch(issue)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if args[:2] == ["issue", "close"]:
+            self.close_calls += 1
             self._close(self.issues[int(args[2])])
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if args[:2] == ["issue", "reopen"]:
@@ -354,12 +658,17 @@ class LifecycleGitHub:
             issue["closed_by"] = ""
             self._touch(issue)
             self.just_reopened = True
+            # Reopen is immediately list-visible by default (pre-existing identity).
+            self.list_visible_at[issue["number"]] = self.fake_time
+            self.search_visible_at[issue["number"]] = self.fake_time
             if self.inject_duplicate_on_reopen:
                 self.inject_duplicate_on_reopen = False
                 duplicate = copy.deepcopy(issue)
                 duplicate["number"] = self.next_number
                 duplicate["updated_at"] = self._timestamp()
                 self.issues[self.next_number] = duplicate
+                self.list_visible_at[self.next_number] = self.fake_time
+                self.search_visible_at[self.next_number] = self.fake_time
                 self.next_number += 1
             if self.fail_reopen_after_mutation:
                 self.fail_reopen_after_mutation = False
@@ -367,18 +676,32 @@ class LifecycleGitHub:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError("unexpected gh call: %r" % (args,))
 
+    def _sleep(self, seconds):
+        self.advance_time(seconds)
+
     def _with_boundary(self, callback):
         old_gh = rc._gh
         old_sleep = rc._lifecycle_sleep
+        old_reserve = rc.reserve_triage_budget
         old_owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
         rc._gh = self.gh
-        rc._lifecycle_sleep = lambda _seconds: None
+        rc._lifecycle_sleep = self._sleep
+
+        # Daily-ledger behavior has its own exhaustive offline boundary suite in
+        # test_triage_budget.py. This lifecycle fixture focuses on the card side
+        # of the verified queue checkpoint while preserving the real permit API.
+        def reserve(_number, _queued_item, _ceiling):
+            self.budget_reservations += 1
+            return True
+
+        rc.reserve_triage_budget = reserve
         os.environ["GITHUB_REPOSITORY_OWNER"] = "kunchenguid"
         try:
             return callback()
         finally:
             rc._gh = old_gh
             rc._lifecycle_sleep = old_sleep
+            rc.reserve_triage_budget = old_reserve
             if old_owner is None:
                 os.environ.pop("GITHUB_REPOSITORY_OWNER", None)
             else:
@@ -444,12 +767,28 @@ class LifecycleGitHub:
 
 def add_triage_and_verdict(issue, current_item):
     queued = rc.body_with_triage_queued(issue["body"], current_item)
+    triage = valid_triage()
+    state = core.parse_state_block(queued) or {}
+    observation = rc.target_contracts.normalize_review_observation(
+        state.get(rc.REVIEW_OBSERVATION_FIELD)
+    )
+    context = rc.context_contracts.normalize_decision_context(
+        state.get(rc.DECISION_CONTEXT_FIELD)
+    )
+    if observation and context:
+        triage["recommendation_basis"] = {
+            "kind": "other",
+            "observation_id": observation["observation_id"],
+            "context_id": context["context_id"],
+            "check_names": [],
+        }
     issue["body"] = rc.body_with_triage_result(
         queued,
         current_item["head_sha"],
-        triage=valid_triage(),
+        triage=triage,
         base_sha=current_item["base_sha"],
         vision_sha=current_item["automerge_vision_sha"],
+        automerge_behavior_available=True,
     )
 
 
@@ -467,9 +806,8 @@ def test_same_head_reopens_same_issue():
         and github.create_calls == 0,
     )
     check(
-        "same-head: normal refresh semantics preserve current triage/verdict",
-        state.get("triaged_sha") == current["head_sha"]
-        and state.get("automerge_verdict") is not None,
+        "same-head: lifecycle context invalidation drops stale triage/verdict",
+        "triaged_sha" not in state and "automerge_verdict" not in state,
     )
     check(
         "same-head: soft-close state is cleared on reuse",
@@ -508,8 +846,7 @@ def test_new_head_reopens_and_drops_stale_analysis():
         and "automerge_audit_pending" not in state
         and not rc.reconcile_absence_needs_clear(github.issues[7]["body"])
         and all(
-            "forged" not in row
-            for row in state.get(rc.AUTOMERGE_CRITERIA_FIELD, [])
+            "forged" not in row for row in state.get(rc.AUTOMERGE_CRITERIA_FIELD, [])
         ),
     )
     check(
@@ -524,7 +861,36 @@ def test_new_head_reopens_and_drops_stale_analysis():
     )
     check(
         "new-head: target-updated warning is posted",
-        any("Target updated: head moved" in comment["body"] for comment in github.issues[7]["comments"]),
+        any(
+            "Target updated: head moved" in comment["body"]
+            for comment in github.issues[7]["comments"]
+        ),
+    )
+
+
+def test_census_head_mismatch_reuses_after_trusted_post_close_activity_once():
+    """F1 separates the head move trigger, the old updatedAt mask, and the
+    visible duplicate-card symptom from the proven same-head reuse path."""
+    old = item(head="c7c2e78a" + "0" * 32)
+    current = item(head="4d19b725" + "0" * 32)
+    github = LifecycleGitHub(old)
+    github.soft_close()
+    github.post_close_activity(7)
+
+    first = github.run_reconcile(scan_payload([current]))
+    writes_after_first = github.issue_edit_calls
+    github.run_reconcile(scan_payload([current]))
+    check(
+        "F1: trusted post-close automation no longer masks new-head reuse",
+        github.issues[7]["state"] == "OPEN"
+        and github.create_calls == 0
+        and core.parse_state_block(github.issues[7]["body"])["head_sha"]
+        == current["head_sha"]
+        and "reopened card #7" in first,
+    )
+    check(
+        "F1: repaired head-mismatch path converges on the second scan",
+        github.issue_edit_calls == writes_after_first,
     )
 
 
@@ -548,6 +914,488 @@ def test_ci_approval_to_pr_review_reuses_issue():
         and "kind:ci-approval" not in names
         and len([name for name in names if name.startswith("target:")]) == 1
         and "opt:merge" in github.issues[7]["body"],
+    )
+
+
+def test_open_ci_approval_to_pr_review_converts_on_moved_head():
+    """Card #1817 class: an OPEN, not-yet-v2-owned ci-approval card whose live
+    target moved to a safe pr-review head must convert in one ordinary
+    reconcile pass via migration-current, retaining thread identity.
+
+    The pre-fix cause order selected target-revision on head drift first, so
+    the writer's kind guard deferred forever with card_not_pr_review. Already
+    v2-owned moved-head cards keep target-revision; closed-card migration and
+    race-lost writes stay on their existing paths.
+    """
+    import projection_writer
+
+    def reset_writer_stats():
+        projection_writer._RUN_STATS.clear()
+        projection_writer._RUN_STATS.update(
+            {
+                "planned": 0,
+                "noop": 0,
+                "deferred": 0,
+                "committed": 0,
+                "verification_failed": 0,
+                "committed_by_cause": {},
+                "deferred_by_reason": {},
+            }
+        )
+
+    old_head = "2a4fefe6" + "0" * 32
+    new_head = "4cc3777d" + "0" * 32
+
+    # --- production wedge shape: open ci-approval @ old head ---------------
+    reset_writer_stats()
+    github = LifecycleGitHub(item(kind="ci-approval", head=old_head))
+    prior_body = github.issues[7]["body"]
+    prior_state = core.parse_state_block(prior_body)
+    check(
+        "open CI->PR: fixture starts non-v2-owned ci-approval at old head",
+        prior_state.get("kind") == "ci-approval"
+        and prior_state.get("head_sha") == old_head
+        and prior_state.get(rc.PROJECTION_OWNER_FIELD) != rc.PROJECTION_OWNER
+        and github.issues[7]["state"] == "OPEN",
+    )
+    # Seed a thread comment so conversion must retain the same issue identity.
+    github.issues[7]["comments"].append(
+        {
+            "id": 9001,
+            "author": {"login": "kunchenguid"},
+            "body": "captain note on the hold",
+            "createdAt": "2026-07-28T16:50:00Z",
+        }
+    )
+    current = item(kind="pr-review", head=new_head)
+    out = github.run_reconcile(scan_payload([current]))
+    state = core.parse_state_block(github.issues[7]["body"])
+    names = label_names(github.issues[7])
+    stats = projection_writer.run_stats()
+    check(
+        "open CI->PR: one migration-current commit converts kind and head",
+        github.issues[7]["state"] == "OPEN"
+        and state.get("kind") == "pr-review"
+        and state.get("head_sha") == new_head
+        and state.get(rc.PROJECTION_OWNER_FIELD) == rc.PROJECTION_OWNER
+        and github.create_calls == 0
+        and github.patch_calls == 1
+        and '"cause":"migration-current"' in out
+        and '"event":"committed"' in out
+        and '"reason":"card_not_pr_review"' not in out
+        and stats.get("committed_by_cause", {}).get("migration-current") == 1
+        and stats.get("deferred") == 0,
+    )
+    check(
+        "open CI->PR: thread identity and managed labels follow the conversion",
+        len(github.issues[7]["comments"]) == 1
+        and github.issues[7]["comments"][0]["id"] == 9001
+        and "kind:pr-review" in names
+        and "kind:ci-approval" not in names
+        and "opt:merge" in github.issues[7]["body"]
+        and "needs-decision" in names,
+    )
+    # Run-summary must not hide non-race deferrals under owner_race_deferrals.
+    summary_line = next(
+        (line for line in out.splitlines() if "wheelhouse run-summary " in line),
+        "",
+    )
+    summary = json.loads(summary_line.split("wheelhouse run-summary ", 1)[1]) if summary_line else {}
+    check(
+        "open CI->PR: run-summary reports zero owner-race deferrals on success",
+        summary.get("owner_race_deferrals") == 0
+        and summary.get("projection_writes_by_cause", {}).get("migration-current") == 1
+        and summary.get("projection_deferrals_by_reason") == {},
+    )
+
+    reset_writer_stats()
+    returning = LifecycleGitHub(item(kind="ci-approval", head=old_head))
+    returning.run_reconcile(scan_payload([]))
+    check(
+        "open CI->PR return: legacy card records first trusted absence",
+        returning.issues[7]["state"] == "OPEN"
+        and rc.reconcile_absence_count(returning.issues[7]["body"]) == 1
+        and core.parse_state_block(returning.issues[7]["body"]).get(
+            rc.PROJECTION_OWNER_FIELD
+        )
+        != rc.PROJECTION_OWNER,
+    )
+    return_out = returning.run_reconcile(
+        scan_payload([item(kind="pr-review", head=new_head)])
+    )
+    return_state = core.parse_state_block(returning.issues[7]["body"])
+    check(
+        "open CI->PR return: migration ownership precedes lifecycle cause",
+        return_state.get("kind") == "pr-review"
+        and return_state.get("head_sha") == new_head
+        and return_state.get(rc.PROJECTION_OWNER_FIELD) == rc.PROJECTION_OWNER
+        and not rc.reconcile_absence_needs_clear(returning.issues[7]["body"])
+        and '"cause":"migration-current"' in return_out
+        and '"cause":"lifecycle-transition"' not in return_out
+        and '"reason":"card_not_pr_review"' not in return_out
+        and projection_writer.run_stats()
+        .get("committed_by_cause", {})
+        .get("migration-current")
+        == 1,
+    )
+
+    # --- already-owned moved head keeps target-revision --------------------
+    reset_writer_stats()
+    owned = LifecycleGitHub(item(kind="pr-review", head=old_head))
+    # Force v2 ownership on the open card (the create path stamps it).
+    owned_state = core.parse_state_block(owned.issues[7]["body"])
+    check(
+        "owned head-move control: fixture is already v2-owned pr-review",
+        owned_state.get(rc.PROJECTION_OWNER_FIELD) == rc.PROJECTION_OWNER
+        and owned_state.get("kind") == "pr-review",
+    )
+    moved = item(kind="pr-review", head=new_head)
+    owned_out = owned.run_reconcile(scan_payload([moved]))
+    owned_after = core.parse_state_block(owned.issues[7]["body"])
+    check(
+        "owned head-move control: already-owned card takes target-revision",
+        owned_after.get("head_sha") == new_head
+        and owned_after.get(rc.PROJECTION_OWNER_FIELD) == rc.PROJECTION_OWNER
+        and '"cause":"target-revision"' in owned_out
+        and '"event":"committed"' in owned_out
+        and '"cause":"migration-current"' not in owned_out
+        and projection_writer.run_stats()
+        .get("committed_by_cause", {})
+        .get("target-revision")
+        == 1,
+    )
+
+    reset_writer_stats()
+    owned_returning = LifecycleGitHub(item(kind="pr-review", head=old_head))
+    owned_returning.run_reconcile(scan_payload([]))
+    reset_writer_stats()
+    owned_return_out = owned_returning.run_reconcile(
+        scan_payload([item(kind="pr-review", head=new_head)])
+    )
+    owned_return_state = core.parse_state_block(owned_returning.issues[7]["body"])
+    check(
+        "owned return control: lifecycle cause remains authoritative",
+        owned_return_state.get("head_sha") == new_head
+        and owned_return_state.get(rc.PROJECTION_OWNER_FIELD) == rc.PROJECTION_OWNER
+        and not rc.reconcile_absence_needs_clear(owned_returning.issues[7]["body"])
+        and '"cause":"lifecycle-transition"' in owned_return_out
+        and '"cause":"migration-current"' not in owned_return_out
+        and projection_writer.run_stats()
+        .get("committed_by_cause", {})
+        .get("lifecycle-transition")
+        == 1,
+    )
+
+    # --- writer still refuses kind change under non-migration causes -------
+    reset_writer_stats()
+    import card_projection
+
+    race_github = LifecycleGitHub(item(kind="ci-approval", head=old_head))
+    expected = projection_writer.card_snapshot(
+        {
+            "number": 7,
+            "title": race_github.issues[7]["title"],
+            "body": race_github.issues[7]["body"],
+            "labels": race_github.issues[7]["labels"],
+            "updated_at": race_github.issues[7]["updated_at"],
+            "author": race_github.issues[7]["author"],
+            "state": race_github.issues[7]["state"],
+            "comments": race_github.issues[7]["comments"],
+        }
+    )
+    # Build a pr-review projection with a non-migration cause against the
+    # still-ci-approval card - the writer's kind guard must still defer.
+    pr_item = item(kind="pr-review", head=new_head)
+    bad_projection = card_projection.plan_card_projection(
+        pr_item,
+        prior={
+            "number": 7,
+            "title": race_github.issues[7]["title"],
+            "body": race_github.issues[7]["body"],
+            "labels": race_github.issues[7]["labels"],
+            "updated_at": race_github.issues[7]["updated_at"],
+            "author": {"login": race_github.issues[7]["author"]},
+            "comments": race_github.issues[7]["comments"],
+        },
+        cause="target-revision",
+        held=False,
+        has_token=False,
+    )
+
+    def refuse_kind_change():
+        return projection_writer.commit_projection(7, expected, bad_projection)
+
+    outcome = race_github._with_boundary(refuse_kind_change)
+    refuse_stats = projection_writer.run_stats()
+    refuse_state = core.parse_state_block(race_github.issues[7]["body"])
+    check(
+        "writer guard: non-migration cause still defers card_not_pr_review",
+        outcome == "deferred"
+        and refuse_state.get("kind") == "ci-approval"
+        and race_github.patch_calls == 0
+        and refuse_stats.get("deferred_by_reason", {}).get("card_not_pr_review") == 1
+        and refuse_stats.get("deferred_by_reason", {}).get("owner_or_handler_race", 0)
+        == 0,
+    )
+
+    # Telemetry: owner_race_deferrals must not absorb the kind-guard deferral.
+    # Simulate the run-summary accounting path against the writer stats.
+    deferred_by_reason = refuse_stats.get("deferred_by_reason") or {}
+    owner_race_count = int(deferred_by_reason.get("owner_or_handler_race") or 0)
+    check(
+        "telemetry: card_not_pr_review is not counted as owner_race_deferrals",
+        owner_race_count == 0
+        and deferred_by_reason.get("card_not_pr_review") == 1
+        and refuse_stats.get("deferred") == 1,
+    )
+
+    # --- owner/handler race still defers under migration-current -----------
+    reset_writer_stats()
+    raced = LifecycleGitHub(item(kind="ci-approval", head=old_head))
+    stale_expected = projection_writer.card_snapshot(
+        {
+            "number": 7,
+            "title": raced.issues[7]["title"],
+            "body": raced.issues[7]["body"],
+            "labels": raced.issues[7]["labels"],
+            "updated_at": raced.issues[7]["updated_at"],
+            "author": raced.issues[7]["author"],
+            "state": raced.issues[7]["state"],
+            "comments": raced.issues[7]["comments"],
+        }
+    )
+    # Mutate the live card so expected-snapshot CAS fails.
+    raced.issues[7]["body"] = raced.issues[7]["body"] + "\n<!-- owner edit -->\n"
+    raced.issues[7]["updated_at"] = "2099-01-01T00:00:00Z"
+    good_projection = card_projection.plan_card_projection(
+        item(kind="pr-review", head=new_head),
+        prior={
+            "number": 7,
+            "title": raced.issues[7]["title"],
+            "body": stale_expected["body"] if stale_expected else "",
+            "labels": raced.issues[7]["labels"],
+            "updated_at": stale_expected["updated_at"] if stale_expected else "",
+            "author": {"login": raced.issues[7]["author"]},
+            "comments": raced.issues[7]["comments"],
+        },
+        cause="migration-current",
+        held=False,
+        has_token=False,
+    )
+
+    def race_commit():
+        return projection_writer.commit_projection(
+            7, stale_expected, good_projection
+        )
+
+    race_outcome = raced._with_boundary(race_commit)
+    race_stats = projection_writer.run_stats()
+    check(
+        "writer guard: owner race still defers under migration-current",
+        race_outcome == "deferred"
+        and raced.patch_calls == 0
+        and race_stats.get("deferred_by_reason", {}).get("owner_or_handler_race") == 1
+        and race_stats.get("deferred_by_reason", {}).get("card_not_pr_review", 0) == 0,
+    )
+
+
+def test_production_shaped_resolved_card_reuse_keeps_label_ownership():
+    """The chrome-devtools-axi#86 / wheelhouse card #1408 production shape: a
+    trusted soft-closed pr-review card carrying `resolved` and
+    `wheelhouse:confirming-target-state` reopens through the v2 writer. The
+    commit itself proves `resolved` never entered managed projection input,
+    because normalization rejects lifecycle labels as managed."""
+    current = item(head="e" * 40)
+    github = LifecycleGitHub(item())
+    github.soft_close()
+    # Mirror card #1408: the first-absence confirming label survives on the
+    # closed card alongside `resolved`.
+    github.issues[7]["labels"] = label_objects(
+        label_names(github.issues[7]) | {rc.LIFECYCLE_CONFIRM_LABEL}
+    )
+    out = github.run_reconcile(scan_payload([current]))
+    names = label_names(github.issues[7])
+    check(
+        "production shape: soft-closed resolved card reopens via the writer",
+        github.issues[7]["state"] == "OPEN"
+        and github.create_calls == 0
+        and "reopened card #7" in out
+        and '"cause":"migration-current"' in out
+        and '"event":"committed"' in out,
+    )
+    check(
+        "production shape: prepared closed card keeps `resolved` as passthrough",
+        bool(github.labels_on_reopen)
+        and "resolved" in github.labels_on_reopen[-1]
+        and "needs-decision" not in github.labels_on_reopen[-1],
+    )
+    check(
+        "production shape: activation returns lifecycle labels to their owner",
+        "needs-decision" in names
+        and "resolved" not in names
+        and rc.LIFECYCLE_CONFIRM_LABEL not in names,
+    )
+    edits_after_reuse = github.issue_edit_calls
+    patches_after_reuse = github.patch_calls
+    github.run_reconcile(scan_payload([current]))
+    check(
+        "production shape: the second scan is a no-op",
+        github.issue_edit_calls == edits_after_reuse
+        and github.patch_calls == patches_after_reuse,
+    )
+
+
+def test_writer_authorship_and_managed_ownership_controls():
+    """Focused controls for the two writer-boundary contracts closed-card
+    reuse depends on: the exact REST/GraphQL automation-actor duality and the
+    strict rejection of lifecycle labels as managed projection input."""
+    import card_projection
+    import projection_writer
+
+    canonical = projection_writer._canonical_automation_author
+    check(
+        "duality: only the exact GraphQL spelling maps to the REST actor",
+        canonical("app/github-actions") == "github-actions[bot]"
+        and canonical("github-actions[bot]") == "github-actions[bot]"
+        and canonical("github-actions") == "github-actions"
+        and canonical("app/other-bot") == "app/other-bot"
+        and canonical("APP/GITHUB-ACTIONS") == "APP/GITHUB-ACTIONS",
+    )
+
+    def snapshot(author):
+        return {
+            "number": 7,
+            "title": "t",
+            "body": "b",
+            "labels": ["kind:pr-review"],
+            "updated_at": "2026-07-13T13:00:01Z",
+            "comments": {"count": 0, "digest": ""},
+            "author": author,
+            "open": False,
+            "target": {
+                "repo": "wheelhouse",
+                "number": 42,
+                "kind": "pr-review",
+                "head_sha": "",
+            },
+        }
+
+    check(
+        "duality: expected-snapshot comparison joins exactly the two spellings",
+        projection_writer._expected_matches(
+            snapshot("app/github-actions"), snapshot("github-actions[bot]")
+        )
+        and projection_writer._expected_matches(
+            snapshot("github-actions[bot]"), snapshot("app/github-actions")
+        )
+        and not projection_writer._expected_matches(
+            snapshot("app/other-bot"), snapshot("github-actions[bot]")
+        ),
+    )
+
+    rejected = card_projection.projection_from_values(
+        title="t",
+        body="b",
+        labels=["kind:pr-review", "resolved"],
+        cause="migration-current",
+        observation_id="sha256:" + "0" * 64,
+        context_id="sha256:" + "1" * 64,
+    )
+    accepted = card_projection.projection_from_values(
+        title="t",
+        body="b",
+        labels=["kind:pr-review"],
+        cause="migration-current",
+        observation_id="sha256:" + "0" * 64,
+        context_id="sha256:" + "1" * 64,
+    )
+    check(
+        "ownership: normalization still rejects lifecycle labels as managed",
+        rejected is None and accepted is not None,
+    )
+
+
+def test_reuse_without_current_observation_fails_closed():
+    """An event item with no current ReviewObservation cannot reuse a closed
+    pr-review card: the observation-projection gate holds and nothing mutates."""
+    github = LifecycleGitHub(item())
+    github.soft_close()
+    body_before = github.issues[7]["body"]
+    labels_before = label_names(github.issues[7])
+    legacy = item(head="6" * 40, target_observation=None)
+    legacy.pop("target_observation", None)
+    legacy.pop("decision_context", None)
+    failed = False
+    try:
+        github.event_upsert(legacy)
+    except rc.CardLifecycleError:
+        failed = True
+    check(
+        "no-observation reuse fails closed without mutation or creation",
+        failed
+        and github.issues[7]["state"] == "CLOSED"
+        and github.issues[7]["body"] == body_before
+        and label_names(github.issues[7]) == labels_before
+        and github.create_calls == 0,
+    )
+
+
+def test_census_ci_approval_head_move_reuses_once():
+    """F6 proves the non-model CI kind uses the same widened lifecycle path."""
+    old = item(kind="ci-approval", head="339a3470" + "0" * 32)
+    current = item(kind="ci-approval", head="2d8cd317" + "0" * 32)
+    github = LifecycleGitHub(old)
+    github.soft_close()
+    github.post_close_activity(7)
+    github.run_reconcile(scan_payload([current]))
+    writes = github.issue_edit_calls
+    github.run_reconcile(scan_payload([current]))
+    check(
+        "F6: CI-approval card reopens at the current head without creation",
+        github.issues[7]["state"] == "OPEN"
+        and github.create_calls == 0
+        and core.parse_state_block(github.issues[7]["body"])["head_sha"]
+        == current["head_sha"],
+    )
+    check("F6: CI-approval reuse converges", github.issue_edit_calls == writes)
+
+
+def test_issue_updated_at_refresh_and_queue_write_ownership():
+    old = item(
+        kind="issue-triage",
+        head="",
+        updated_at="2026-07-15T14:05:50Z",
+        bucket="issue-triage",
+        comp="n/a",
+        tests="n/a",
+        priority="low",
+        url="https://github.com/kunchenguid/wheelhouse/issues/42",
+    )
+    current = dict(old, updated_at="2026-07-15T14:07:59Z")
+
+    ineligible = LifecycleGitHub(old)
+    ineligible.run_reconcile(scan_payload([current]), token=False)
+    ineligible_writes = ineligible.issue_edit_calls
+    ineligible.run_reconcile(scan_payload([current]), token=False)
+    ineligible_state = core.parse_state_block(ineligible.issues[7]["body"])
+    check(
+        "F4: ineligible issue advisory still gets one deterministic refresh",
+        ineligible_state["updated_at"] == current["updated_at"]
+        and ineligible.issue_edit_calls == ineligible_writes
+        and ineligible.budget_reservations == 0
+        and ineligible.workflow_calls == [],
+    )
+
+    eligible = LifecycleGitHub(old)
+    eligible.run_reconcile(scan_payload([current]), token=True)
+    eligible_state = core.parse_state_block(eligible.issues[7]["body"])
+    check(
+        "F4: eligible issue revision is owned by one queued write and dispatch",
+        eligible.issue_edit_calls == 1
+        and eligible_state["updated_at"] == current["updated_at"]
+        and eligible_state["triage_status"] == "queued"
+        and eligible.budget_reservations == 1
+        and len(eligible.workflow_calls) == 1,
     )
 
 
@@ -663,7 +1511,9 @@ def test_forbidden_candidates_never_reopen():
             eligible, _reason = rc.reusable_closed_card(candidate, item())
         except rc.CardLifecycleError:
             eligible = False
-        all_closed = all_closed and not eligible and github.issues[7]["state"] == "CLOSED"
+        all_closed = (
+            all_closed and not eligible and github.issues[7]["state"] == "CLOSED"
+        )
     check(
         "forbidden resolved/declined/auto-merged/owner/blocked/held/audit cases stay closed",
         all_closed,
@@ -698,22 +1548,20 @@ def test_legacy_card_is_not_guessed_reusable():
     )
     check(
         "legacy: current safe create behavior remains available",
-        number == 8 and github.issues[8]["state"] == "OPEN" and github.create_calls == 1,
+        number == 8
+        and github.issues[8]["state"] == "OPEN"
+        and github.create_calls == 1,
     )
 
 
-def test_duplicate_and_incomplete_lookup_fail_without_create():
+def test_multiple_candidates_select_highest_and_incomplete_lookup_fails():
     duplicate = LifecycleGitHub(item())
     duplicate.soft_close()
     clone = copy.deepcopy(duplicate.issues[7])
     clone["number"] = 8
     duplicate.issues[8] = clone
     duplicate.next_number = 9
-    duplicate_failed = False
-    try:
-        duplicate.event_upsert(item(head="2" * 40))
-    except rc.CardLifecycleError:
-        duplicate_failed = True
+    selected = duplicate.event_upsert(item(head="2" * 40))
 
     incomplete = LifecycleGitHub(item())
     incomplete.soft_close()
@@ -724,16 +1572,60 @@ def test_duplicate_and_incomplete_lookup_fail_without_create():
     except rc.CardLifecycleError:
         incomplete_failed = True
     check(
-        "ambiguity: duplicate reusable candidates fail closed without creation",
-        duplicate_failed
+        "multiple trusted candidates: highest number is selected deterministically",
+        selected == 8
         and duplicate.create_calls == 0
-        and all(issue["state"] == "CLOSED" for issue in duplicate.issues.values()),
+        and duplicate.issues[8]["state"] == "OPEN"
+        and duplicate.issues[7]["state"] == "CLOSED",
     )
     check(
         "ambiguity: incomplete closed lookup fails closed without creation",
         incomplete_failed
         and incomplete.create_calls == 0
         and incomplete.issues[7]["state"] == "CLOSED",
+    )
+
+
+def test_post_close_timeline_refuses_human_unreadable_and_incomplete_history():
+    outcomes = []
+
+    human = LifecycleGitHub(item())
+    human.soft_close()
+    human.post_close_activity(7, actor="owner")
+    outcomes.append(
+        human._with_boundary(
+            lambda: rc.reusable_closed_card(human.normalized(7), item())[0]
+        )
+    )
+
+    unreadable = LifecycleGitHub(item())
+    unreadable.soft_close()
+    unreadable.post_close_activity(7)
+    unreadable.timeline_failures.add(7)
+    outcomes.append(
+        unreadable._with_boundary(
+            lambda: rc.reusable_closed_card(unreadable.normalized(7), item())[0]
+        )
+    )
+
+    incomplete = LifecycleGitHub(item())
+    incomplete.soft_close()
+    incomplete.post_close_activity(7)
+    incomplete.issues[7]["timeline"] = [
+        {
+            "event": "labeled",
+            "created_at": incomplete.issues[7]["updated_at"],
+            "actor": {"login": rc.CARD_AUTOMATION_AUTHOR},
+        }
+    ] * (rc.POST_CLOSE_TIMELINE_PAGE_SIZE * rc.POST_CLOSE_TIMELINE_MAX_PAGES)
+    outcomes.append(
+        incomplete._with_boundary(
+            lambda: rc.reusable_closed_card(incomplete.normalized(7), item())[0]
+        )
+    )
+    check(
+        "post-close trust: human, unreadable, and incomplete histories refuse reuse",
+        outcomes == [False, False, False],
     )
 
 
@@ -751,6 +1643,28 @@ def test_malformed_target_marker_fails_without_create():
     check(
         "malformed target identity fails closed without creating a card",
         failed and github.create_calls == 0 and github.issues[7]["state"] == "CLOSED",
+    )
+
+
+def test_candidate_identity_disagreement_remains_an_error():
+    github = LifecycleGitHub(item())
+    github.soft_close()
+    conflicting = copy.deepcopy(github.issues[7])
+    conflicting["number"] = 8
+    state = core.parse_state_block(conflicting["body"])
+    state["number"] = 99
+    conflicting["body"] = rc._replace_state_block(conflicting["body"], state)
+    github.issues[8] = conflicting
+    failed = False
+    try:
+        github.event_upsert(item(head="5" * 40))
+    except rc.CardLifecycleError:
+        failed = True
+    check(
+        "candidate identity disagreement fails closed without creation",
+        failed
+        and github.create_calls == 0
+        and all(issue["state"] == "CLOSED" for issue in github.issues.values()),
     )
 
 
@@ -807,17 +1721,27 @@ def test_live_races_stop_reuse_before_mutation():
 
 
 def test_partial_prepare_failures_stay_closed_non_actionable():
+    # pr-review preparation runs through the v2 writer's `gh api PATCH`;
+    # ci-approval preparation still runs through `gh issue edit`. A writer
+    # failure always precedes reopen, so every mode must leave the card
+    # closed and non-actionable on both paths.
     safe = True
-    for mode in ("before", "body-only", "labels-only"):
-        github = LifecycleGitHub(item())
-        github.soft_close()
-        github.fail_prepare = mode
-        try:
-            github.event_upsert(item(head="4" * 40))
-        except RuntimeError:
-            pass
-        issue = github.issues[7]
-        safe = safe and issue["state"] == "CLOSED" and github.create_calls == 0
+    for kind in ("pr-review", "ci-approval"):
+        for mode in ("before", "body-only", "labels-only"):
+            github = LifecycleGitHub(item(kind=kind))
+            github.soft_close()
+            github.fail_prepare = mode
+            try:
+                github.event_upsert(item(kind=kind, head="4" * 40))
+            except RuntimeError:
+                pass
+            issue = github.issues[7]
+            safe = (
+                safe
+                and issue["state"] == "CLOSED"
+                and github.create_calls == 0
+                and "needs-decision" not in label_names(issue)
+            )
     check(
         "partial body/label failures leave the reused issue closed and non-actionable",
         safe,
@@ -962,7 +1886,10 @@ def test_full_lifecycle_wait_then_new_head():
         cross_repo=False,
         mergeable="CONFLICTING",
     )
-    check("full lifecycle: conflict enters waiting phase", waiting_bucket == "needs-rebase")
+    check(
+        "full lifecycle: conflict enters waiting phase",
+        waiting_bucket == "needs-rebase",
+    )
     github.soft_close()
     github.run_reconcile(scan_payload([]))
     check(
@@ -991,26 +1918,470 @@ def test_full_lifecycle_wait_then_new_head():
 
     add_triage_and_verdict(issue, current)
     fresh_state = core.parse_state_block(issue["body"])
-    after_fresh = auto_merge.verdict_eligible(
-        fresh_state.get("automerge_verdict")
-    )[0]
+    after_fresh = auto_merge.verdict_eligible(fresh_state.get("automerge_verdict"))[0]
     check(
         "full lifecycle: a current-head successful triage can restore verdict eligibility",
         fresh_state.get("triaged_sha") == current["head_sha"] and after_fresh is True,
     )
 
 
+def test_list_lag_create_is_retained_and_queued_once():
+    """Production shape: create response + direct read OK, open-list lag 0..30s+."""
+    # Probe sleeps advance fake time by up to ~(ATTEMPTS-1)*DELAY (~0.5s).
+    probe_budget = (
+        rc.LIFECYCLE_VERIFY_ATTEMPTS - 1
+    ) * rc.LIFECYCLE_VERIFY_DELAY_SECONDS
+    for lag in (0.0, 0.5, 5.0, 30.0, 45.0):
+        github = LifecycleGitHub(start_empty=True)
+        github.list_index_lag_seconds = lag
+        github.search_index_lag_seconds = lag
+        # Isolate each lag case on a distinct target so markers never collide.
+        # Identity overrides go through item() so the bound observation and
+        # context carry the scenario's own target, never a stale default.
+        target_number = 100 + int(lag * 10)
+        current = item(
+            head=("a" if lag == 0 else "b") * 40,
+            number=target_number,
+            url="https://github.com/kunchenguid/wheelhouse/pull/%s" % target_number,
+        )
+        closes_before = github.close_calls
+        creates_before = github.create_calls
+        with io.StringIO() as buf, redirect_stdout(buf):
+            number = github.event_upsert(current, has_token=True)
+            admission_out = buf.getvalue()
+        issue = github.issues[number]
+        state = core.parse_state_block(issue["body"])
+        check(
+            "list-lag %.1fs: create retained open without rollback" % lag,
+            number is not None
+            and issue["state"] == "OPEN"
+            and github.close_calls == closes_before
+            and github.create_calls == creates_before + 1
+            and "resolved" not in label_names(issue)
+            and "card-admission rollback" not in admission_out,
+        )
+        expect_lag_notice = lag > probe_budget
+        check(
+            "list-lag %.1fs: direct-read admission succeeds for held agent card" % lag,
+            state.get("held") is True
+            and rc.HOLD_LABEL in label_names(issue)
+            and "needs-decision" in label_names(issue)
+            and "card-admission direct_ok" in admission_out
+            and (
+                ("list_index_lag" in admission_out)
+                if expect_lag_notice
+                else (
+                    "card-admission unique" in admission_out
+                    or "list_index_lag" in admission_out
+                )
+            ),
+        )
+
+        # After index convergence, same target is stable: no mint/close churn.
+        github.advance_time(lag + 1.0)
+        closes_mid = github.close_calls
+        creates_mid = github.create_calls
+        again = github.event_upsert(current, has_token=True)
+        check(
+            "list-lag %.1fs: repeated upsert after convergence does not mint or close"
+            % lag,
+            again == number
+            and github.create_calls == creates_mid
+            and github.close_calls == closes_mid
+            and github.issues[number]["state"] == "OPEN",
+        )
+
+        out = github.run_reconcile(scan_payload([current]), token=True)
+        open_numbers = [n for n, iss in github.issues.items() if iss["state"] == "OPEN"]
+        check(
+            "list-lag %.1fs: eventually one open card and no create churn" % lag,
+            open_numbers == [number]
+            and github.create_calls == creates_mid
+            and "0 admission rollback(s)" in out
+            and "destructive card-admission rollback" not in out,
+        )
+
+
+def test_list_lag_never_rolls_back_valid_create():
+    github = LifecycleGitHub(start_empty=True)
+    github.list_index_lag_seconds = 30.0
+    github.search_index_lag_seconds = 60.0
+    current = item()
+    with io.StringIO() as buf, redirect_stdout(buf):
+        number = github.event_upsert(current, has_token=False)
+        out = buf.getvalue()
+    issue = github.issues[number]
+    check(
+        "list lag alone never labels resolved or closes",
+        issue["state"] == "OPEN"
+        and "resolved" not in label_names(issue)
+        and github.close_calls == 0
+        and "list_index_lag" in out
+        and "card-admission rollback" not in out,
+    )
+    check(
+        "deterministic CI path also survives list lag",
+        github.event_upsert(item(kind="ci-approval", number=99, head="c" * 40))
+        and all(
+            iss["state"] == "OPEN" and "resolved" not in label_names(iss)
+            for iss in github.issues.values()
+        ),
+    )
+
+
+def test_trusted_open_duplicate_before_or_after_create_fails_closed():
+    # Existing trusted open card before create: lookup finds it, no create.
+    existing = item(head="d" * 40)
+    github = LifecycleGitHub(existing)
+    number = github.event_upsert(existing, has_token=True)
+    check(
+        "pre-existing open card is reused without a second create",
+        number == 7
+        and github.create_calls == 0
+        and github.issues[7]["state"] == "OPEN",
+    )
+
+    # Peer becomes list-visible after create while new card is still lagging.
+    racing = LifecycleGitHub(start_empty=True)
+    racing.list_index_lag_seconds = 30.0
+    racing.inject_open_duplicate_after_create = True
+    failed = False
+    outcome = None
+    try:
+        racing.event_upsert(item(head="e" * 40), has_token=True)
+    except rc.CardAdmissionError as error:
+        failed = True
+        outcome = error.outcome
+        should_rollback = error.should_rollback
+    created = [n for n, iss in racing.issues.items() if iss.get("body")]
+    closed_resolved = [
+        n
+        for n, iss in racing.issues.items()
+        if iss["state"] == "CLOSED" and "resolved" in label_names(iss)
+    ]
+    check(
+        "post-create observed duplicate fails closed with rollback of new card",
+        failed
+        and outcome == rc.CARD_ADMISSION_DUPLICATE
+        and should_rollback is True
+        and closed_resolved
+        and racing.close_calls >= 1,
+    )
+    # Exactly one peer may remain open (the injected duplicate).
+    open_after = [n for n, iss in racing.issues.items() if iss["state"] == "OPEN"]
+    check(
+        "post-create duplicate leaves only the alternate open peer",
+        len(open_after) == 1 and open_after[0] not in closed_resolved,
+    )
+    del created  # silence unused in strict linters
+
+
+def test_malformed_direct_objects_fail_closed():
+    cases = []
+
+    def run_case(name, mutate_issue, expect_resolved=True, expected_state="CLOSED"):
+        github = LifecycleGitHub(start_empty=True)
+        current = item(head="f" * 40)
+        card = rc.render(current, held=False)
+        created = {}
+        original_create = rc._create_card
+
+        def create_then_poison(rendered):
+            number = original_create(rendered)
+            created["number"] = number
+            mutate_issue(github, number)
+            return number
+
+        failed = False
+        outcome = None
+        should_rollback = None
+        try:
+
+            def attempt():
+                nonlocal failed, outcome, should_rollback
+                rc._create_card = create_then_poison
+                try:
+                    return rc._create_and_verify_card(current, card)
+                except rc.CardAdmissionError as error:
+                    failed = True
+                    outcome = error.outcome
+                    should_rollback = error.should_rollback
+                    raise
+                finally:
+                    rc._create_card = original_create
+
+            github._with_boundary(attempt)
+        except rc.CardAdmissionError:
+            pass
+        except Exception:
+            rc._create_card = original_create
+            raise
+        finally:
+            rc._create_card = original_create
+        number = created.get("number")
+        issue = github.issues.get(number) if number else None
+        ok = (
+            failed
+            and outcome == rc.CARD_ADMISSION_MALFORMED
+            and should_rollback is True
+            and issue is not None
+            and issue["state"] == expected_state
+            and (not expect_resolved or "resolved" in label_names(issue))
+        )
+        cases.append((name, ok))
+
+    def close_direct(github, number):
+        # Already closed before rollback runs - fail closed on direct read.
+        github.issues[number]["state"] = "CLOSED"
+        github.issues[number]["closed_at"] = "2026-07-13T14:00:00Z"
+        github.issues[number]["closed_by"] = rc.CARD_AUTOMATION_AUTHOR
+
+    def wrong_author(github, number):
+        github.issues[number]["author"] = "human-contributor"
+
+    def wrong_target(github, number):
+        state = core.parse_state_block(github.issues[number]["body"])
+        state["repo"] = "other-repo"
+        github.issues[number]["body"] = rc._replace_state_block(
+            github.issues[number]["body"], state
+        )
+        names = label_names(github.issues[number])
+        names.discard("repo:wheelhouse")
+        names.discard("target:wheelhouse-42")
+        names.add("repo:other-repo")
+        names.add("target:other-repo-42")
+        github.issues[number]["labels"] = label_objects(names)
+
+    def wrong_kind(github, number):
+        state = core.parse_state_block(github.issues[number]["body"])
+        state["kind"] = "ci-approval"
+        github.issues[number]["body"] = rc._replace_state_block(
+            github.issues[number]["body"], state
+        )
+        names = label_names(github.issues[number])
+        names.discard("kind:pr-review")
+        names.add("kind:ci-approval")
+        github.issues[number]["labels"] = label_objects(names)
+
+    def body_mismatch(github, number):
+        github.issues[number]["body"] = (
+            github.issues[number]["body"] + "\n<!-- tampered -->\n"
+        )
+
+    run_case("closed", close_direct, expect_resolved=False)
+    run_case("untrusted author", wrong_author)
+    run_case("wrong target", wrong_target, expect_resolved=False, expected_state="OPEN")
+    run_case("wrong kind", wrong_kind, expect_resolved=False, expected_state="OPEN")
+    run_case(
+        "body mismatch", body_mismatch, expect_resolved=False, expected_state="OPEN"
+    )
+    check(
+        "malformed direct objects preserve changed bodies and close unchanged creates",
+        all(ok for _name, ok in cases),
+    )
+    if not all(ok for _name, ok in cases):
+        for name, ok in cases:
+            if not ok:
+                print("  detail FAIL malformed case: %s" % name)
+
+
+def test_thirty_sequential_and_burst_creates_under_list_lag():
+    github = LifecycleGitHub(start_empty=True)
+    github.list_index_lag_seconds = 30.0
+    github.search_index_lag_seconds = 30.0
+    created_numbers = []
+    for index in range(30):
+        current = item(
+            head=("%x" % (index % 16)) * 40,
+            number=200 + index,
+            title="PR %s" % (200 + index),
+        )
+        current["url"] = "https://github.com/kunchenguid/wheelhouse/pull/%s" % (
+            current["number"],
+        )
+        number = github.event_upsert(current, has_token=(index % 2 == 0))
+        created_numbers.append(number)
+        check(
+            "sequential create %s retained open under 30s lag" % (index + 1),
+            number is not None
+            and github.issues[number]["state"] == "OPEN"
+            and "resolved" not in label_names(github.issues[number]),
+        )
+    check(
+        "30 sequential creates: no close/rollback churn",
+        github.create_calls == 30
+        and github.close_calls == 0
+        and len(set(created_numbers)) == 30,
+    )
+
+    # Burst/concurrent-shaped: three waves of 10 distinct targets, lag still on.
+    burst_numbers = []
+    for wave in range(3):
+        wave_items = []
+        for offset in range(10):
+            n = 500 + wave * 10 + offset
+            wave_items.append(
+                item(
+                    head=("%x" % ((wave + offset) % 16)) * 40,
+                    number=n,
+                    title="burst %s" % n,
+                    url="https://github.com/kunchenguid/wheelhouse/pull/%s" % n,
+                )
+            )
+        for current in wave_items:
+            burst_numbers.append(github.event_upsert(current, has_token=True))
+    check(
+        "burst creates under lag: all retained, no mint/close churn pair",
+        github.create_calls == 60
+        and github.close_calls == 0
+        and all(
+            github.issues[n]["state"] == "OPEN"
+            and "resolved" not in label_names(github.issues[n])
+            for n in burst_numbers
+        ),
+    )
+
+    # Index converges; repeated scheduled scans do not re-mint.
+    github.advance_time(31.0)
+    creates_after = github.create_calls
+    scan_items = [
+        item(
+            head="1" * 40,
+            number=200 + index,
+            url="https://github.com/kunchenguid/wheelhouse/pull/%s" % (200 + index),
+        )
+        for index in range(30)
+    ]
+    github.run_reconcile(
+        {
+            "repos": {
+                "wheelhouse": {
+                    "ok": True,
+                    "truncated": False,
+                    "open_pr_numbers": [it["number"] for it in scan_items],
+                    "open_issue_numbers": [],
+                    "indeterminate_pr_numbers": [],
+                    "ci_wait_pr_numbers": [],
+                    "ci_wait_refresh_items": [],
+                }
+            },
+            "items": scan_items,
+        },
+        token=True,
+    )
+    github.run_reconcile(
+        {
+            "repos": {
+                "wheelhouse": {
+                    "ok": True,
+                    "truncated": False,
+                    "open_pr_numbers": [it["number"] for it in scan_items],
+                    "open_issue_numbers": [],
+                    "indeterminate_pr_numbers": [],
+                    "ci_wait_pr_numbers": [],
+                    "ci_wait_refresh_items": [],
+                }
+            },
+            "items": scan_items,
+        },
+        token=True,
+    )
+    check(
+        "repeated scans after lag: no additional creates for the same 30 targets",
+        github.create_calls == creates_after,
+    )
+
+
+def test_list_error_defers_without_destructive_rollback():
+    github = LifecycleGitHub(start_empty=True)
+    # Lookup must succeed (empty open list); only the post-create list probe fails.
+    github.fail_open_list_after_create = True
+    current = item(head="9" * 40)
+    failed = False
+    outcome = None
+    should_rollback = None
+    number = None
+    try:
+        github.event_upsert(current, has_token=True)
+    except rc.CardAdmissionError as error:
+        failed = True
+        outcome = error.outcome
+        should_rollback = error.should_rollback
+        number = error.number
+    check(
+        "incomplete open-list probe defers without rollback",
+        failed
+        and outcome == rc.CARD_ADMISSION_RETAINED_DEFERRED
+        and should_rollback is False
+        and number is not None
+        and github.close_calls == 0
+        and github.issues[number]["state"] == "OPEN"
+        and "resolved" not in label_names(github.issues[number]),
+    )
+
+
+def test_ci_and_held_agent_cards_under_list_lag():
+    github = LifecycleGitHub(start_empty=True)
+    github.list_index_lag_seconds = 30.0
+    pr_item = item(kind="pr-review", number=701, head="1" * 40)
+    pr_item["url"] = "https://github.com/kunchenguid/wheelhouse/pull/701"
+    issue_item = item(
+        kind="issue-triage",
+        number=702,
+        head="",
+        updated_at="2026-07-13T15:00:00Z",
+        bucket="needs-triage",
+        comp="none",
+        tests="none",
+        url="https://github.com/kunchenguid/wheelhouse/issues/702",
+    )
+    ci_item = item(kind="ci-approval", number=703, head="2" * 40, priority="high")
+    ci_item["url"] = "https://github.com/kunchenguid/wheelhouse/pull/703"
+
+    pr_number = github.event_upsert(pr_item, has_token=True)
+    issue_number = github.event_upsert(issue_item, has_token=True)
+    ci_number = github.event_upsert(ci_item, has_token=False)
+
+    pr_state = core.parse_state_block(github.issues[pr_number]["body"])
+    issue_state = core.parse_state_block(github.issues[issue_number]["body"])
+    ci_state = core.parse_state_block(github.issues[ci_number]["body"])
+    check(
+        "held agent pr/issue cards survive list lag",
+        pr_state.get("held") is True
+        and issue_state.get("held") is True
+        and rc.HOLD_LABEL in label_names(github.issues[pr_number])
+        and rc.HOLD_LABEL in label_names(github.issues[issue_number])
+        and github.close_calls == 0,
+    )
+    check(
+        "deterministic ci-approval card survives list lag without held state",
+        ci_state.get("held") is not True
+        and rc.HOLD_LABEL not in label_names(github.issues[ci_number])
+        and github.issues[ci_number]["state"] == "OPEN"
+        and github.close_calls == 0,
+    )
+
+
 def main():
     test_same_head_reopens_same_issue()
     test_new_head_reopens_and_drops_stale_analysis()
+    test_census_head_mismatch_reuses_after_trusted_post_close_activity_once()
     test_ci_approval_to_pr_review_reuses_issue()
+    test_open_ci_approval_to_pr_review_converts_on_moved_head()
+    test_production_shaped_resolved_card_reuse_keeps_label_ownership()
+    test_writer_authorship_and_managed_ownership_controls()
+    test_reuse_without_current_observation_fails_closed()
+    test_census_ci_approval_head_move_reuses_once()
+    test_issue_updated_at_refresh_and_queue_write_ownership()
     test_reconcile_and_ingest_share_reuse_operation()
     test_reopened_card_participates_in_normal_systems()
     test_forbidden_candidates_never_reopen()
     test_hard_close_clears_reuse_provenance()
     test_legacy_card_is_not_guessed_reusable()
-    test_duplicate_and_incomplete_lookup_fail_without_create()
+    test_multiple_candidates_select_highest_and_incomplete_lookup_fails()
+    test_post_close_timeline_refuses_human_unreadable_and_incomplete_history()
     test_malformed_target_marker_fails_without_create()
+    test_candidate_identity_disagreement_remains_an_error()
     test_live_races_stop_reuse_before_mutation()
     test_partial_prepare_failures_stay_closed_non_actionable()
     test_serialization_and_sequential_race_converge_to_one_card()
@@ -1019,6 +2390,13 @@ def main():
     test_ambiguous_reopen_response_forces_inert_card_closed()
     test_auto_merge_duplicate_and_authorization_gates_unchanged()
     test_full_lifecycle_wait_then_new_head()
+    test_list_lag_create_is_retained_and_queued_once()
+    test_list_lag_never_rolls_back_valid_create()
+    test_trusted_open_duplicate_before_or_after_create_fails_closed()
+    test_malformed_direct_objects_fail_closed()
+    test_thirty_sequential_and_burst_creates_under_list_lag()
+    test_list_error_defers_without_destructive_rollback()
+    test_ci_and_held_agent_cards_under_list_lag()
     if _failures:
         print("\n%d failure(s): %s" % (len(_failures), ", ".join(_failures)))
         sys.exit(1)

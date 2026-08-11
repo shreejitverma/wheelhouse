@@ -14,9 +14,32 @@
       "required": ["executionId", "action", "idempotencyKey", "wheelhouseRevision", "target"],
       "properties": {
         "executionId": {"type": "string", "pattern": "^[0-9a-f-]{36}$"},
-        "action": {"type": "string", "enum": ["triage.issue.local", "triage.issue.search", "triage.pr.local", "triage.pr.search", "triage.schema-repair", "deep-review.local", "deep-review.search", "nl-decision.local", "nl-decision.search"]},
+        "action": {"type": "string", "enum": ["triage.issue.local", "triage.issue.search", "triage.pr.local", "triage.pr.search", "triage.schema-repair", "deep-review.local", "deep-review.search", "nl-decision.local", "nl-decision.search", "nl-decision.schema-repair", "merge.resolve-conflicts"]},
         "idempotencyKey": {"type": "string", "minLength": 1, "maxLength": 512},
         "wheelhouseRevision": {"type": "string", "pattern": "^[0-9A-Fa-f]{7,64}$"},
+        "correction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["originalTaskSha256", "originalExecutionId", "rejectedValueSha256", "validationErrorCount"],
+          "properties": {
+            "originalTaskSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "originalExecutionId": {"type": "string", "pattern": "^[0-9a-f-]{36}$"},
+            "rejectedValueSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "validationErrorCount": {"type": "integer", "minimum": 1, "maximum": 64}
+          }
+        },
+        "sourceReview": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["baseSha", "visionSha", "visionContentSha256", "targetFactsSha256", "targetRepositoryCommit"],
+          "properties": {
+            "baseSha": {"type": "string", "pattern": "^[0-9A-Fa-f]{7,64}$"},
+            "visionSha": {"type": "string", "pattern": "^[0-9A-Fa-f]{7,64}$"},
+            "visionContentSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "targetFactsSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "targetRepositoryCommit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+          }
+        },
         "target": {
           "type": "object",
           "additionalProperties": false,
@@ -52,7 +75,7 @@
                   "adapter": {"type": "string", "minLength": 1},
                   "provider": {"type": "string", "minLength": 1},
                   "authProfile": {"type": "string", "minLength": 1},
-                  "authMechanism": {"type": "string", "enum": ["claude-action-oauth", "codex-access-token", "managed-auth-json", "fake"]},
+                  "authMechanism": {"type": "string", "enum": ["claude-action-oauth", "claude-code-oauth-token", "codex-access-token", "managed-auth-json", "fake"]},
                   "expectedWorkspaceId": {"type": ["string", "null"], "maxLength": 160},
                   "model": {"type": "string", "minLength": 1},
                   "effort": {"type": "string", "minLength": 1},
@@ -117,12 +140,15 @@
               "bytes": {"type": "integer", "minimum": 0, "maximum": 250000000},
               "git": {
                 "type": "object", "additionalProperties": false,
-                "required": ["commit", "detached", "fileCount", "treeSha256"],
+                "required": ["commit", "detached", "fileCount", "treeSha256", "symlinkCount", "symlinkProvenanceArtifact", "symlinkProvenanceSha256"],
                 "properties": {
                   "commit": {"type": "string", "pattern": "^[0-9A-Fa-f]{7,64}$"},
                   "detached": {"const": true},
                   "fileCount": {"type": "integer", "minimum": 0},
-                  "treeSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                  "treeSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                  "symlinkCount": {"type": "integer", "minimum": 0, "maximum": 4096},
+                  "symlinkProvenanceArtifact": {"type": "string", "pattern": "^artifacts/sha256/[0-9a-f]{64}$"},
+                  "symlinkProvenanceSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
                 }
               }
             }
@@ -167,7 +193,7 @@
                 "allowedHosts": {"type": "array", "maxItems": 16, "items": {"type": "string", "pattern": "^[A-Za-z0-9.-]+$"}}
               }
             },
-            "toolNetwork": {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"type": "string", "enum": ["none", "broker-only"]}}},
+            "toolNetwork": {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"type": "string", "enum": ["none", "broker-only", "runner-default"]}}},
             "inheritEnvironment": {"type": "boolean"},
             "dropCapabilities": {"type": "boolean"},
             "noNewPrivileges": {"type": "boolean"},
@@ -185,7 +211,7 @@
             "cancelGraceMs": {"type": ["integer", "null"], "minimum": 100, "maximum": 60000},
             "maxTurns": {"type": ["integer", "null"], "minimum": 1, "maximum": 128},
             "maxToolCalls": {"type": ["integer", "null"], "minimum": 0, "maximum": 512},
-            "maxFinalBytes": {"type": "integer", "minimum": 1, "maximum": 131072},
+            "maxFinalBytes": {"type": "integer", "minimum": 1, "maximum": 2097152},
             "maxEventBytes": {"type": "integer", "minimum": 1024, "maximum": 16777216},
             "maxProviderRequests": {"type": ["integer", "null"], "minimum": 1, "maximum": 128},
             "maxInputTokens": {"type": ["integer", "null"], "minimum": 1, "maximum": 1000000},

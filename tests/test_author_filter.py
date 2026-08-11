@@ -65,10 +65,20 @@ def pr_node(
         "headRefName": "feature-%d" % number,
         "headRefOid": "sha%d" % number,
         "baseRefName": "main",
-        "headRepository": {"name": "demo-fork", "owner": {"login": "forker"}},
+        "maintainerCanModify": True,
+        "headRepository": {
+            "name": "demo-fork",
+            "nameWithOwner": "forker/demo-fork",
+            "isFork": True,
+            "owner": {"login": "forker", "__typename": "User"},
+        },
         "baseRepository": {"name": "demo", "owner": {"login": "owner"}},
         "labels": {"nodes": []},
-        "closingIssuesReferences": {"nodes": [{"number": i} for i in (closes or [])]},
+        "closingIssuesReferences": {
+            "totalCount": len(closes or []),
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [{"number": i} for i in (closes or [])],
+        },
         "commits": {"nodes": [{"commit": {"statusCheckRollup": status_rollup}}]},
     }
     if closing_total is not None:
@@ -76,7 +86,12 @@ def pr_node(
     if closing_page_info is not None:
         node["closingIssuesReferences"]["pageInfo"] = closing_page_info
     if cross_repo is False:
-        node["headRepository"] = {"name": "demo", "owner": {"login": "owner"}}
+        node["headRepository"] = {
+            "name": "demo",
+            "nameWithOwner": "owner/demo",
+            "isFork": False,
+            "owner": {"login": "owner", "__typename": "User"},
+        }
     elif cross_repo == "missing":
         node.pop("isCrossRepository")
         node.pop("headRepository")
@@ -144,7 +159,9 @@ def run_build_repo(
             "auto_approve_ci": auto_approve_ci,
         }
 
-    def fake_approve(owner, name, pr, posture=None, strict=False):
+    def fake_approve(
+        owner, name, pr, posture=None, strict=False, expected_head_sha=None
+    ):
         calls["approve"].append(pr)
         return approve_result
 
@@ -155,6 +172,8 @@ def run_build_repo(
         core.ci_safety,
         core.approve_ci,
         core.ci_security_summary,
+        core._list_action_required_runs,
+        core.immutable_compare_files,
         os.environ.get("OWNER"),
         os.environ.get("GITHUB_REPOSITORY_OWNER"),
     )
@@ -179,6 +198,12 @@ def run_build_repo(
         safe_verdict if ci_safety_result is None else ci_safety_result
     )
     core.approve_ci = fake_approve
+    core._list_action_required_runs = lambda slug, head_ref, head_sha: ([], "")
+    core.immutable_compare_files = lambda _slug, _base, _head, expected: (
+        ["src/file-%d.py" % index for index in range(int(expected or 0))],
+        True,
+        True,
+    )
     os.environ["OWNER"] = "owner"
     os.environ["GITHUB_REPOSITORY_OWNER"] = "owner"
     err = io.StringIO()
@@ -195,6 +220,8 @@ def run_build_repo(
             core.ci_safety,
             core.approve_ci,
             core.ci_security_summary,
+            core._list_action_required_runs,
+            core.immutable_compare_files,
             old_owner,
             old_repo_owner,
         ) = save
@@ -368,15 +395,17 @@ def test_ci_approval_author_filter_suppresses_unknown_fork_cards():
     ]
     result, items, calls = run_build_repo(prs)
     numbers = [it["number"] for it in items]
-    check("author-filter: unknown-fork owner card suppressed", 40 not in numbers)
-    check("author-filter: unknown-fork human PR still carded", numbers == [41])
+    check("author-filter: unknown-fork owner gets a retryable policy card", 40 in numbers)
+    check("author-filter: unknown-fork human also gets a retryable policy card", numbers == [40, 41])
     check(
         "author-filter: unknown fork status still skips approve_ci",
         calls["approve"] == [],
     )
     check(
-        "author-filter: suppressed unknown fork still logs warning",
-        "suppressed-card demo#40" in calls["stderr"],
+        "author-filter: unknown forks never receive a target-side policy action",
+        calls["stderr"] == "" and all(
+            item.get("bucket") == "source-permission-unverified" for item in items
+        ),
     )
 
 

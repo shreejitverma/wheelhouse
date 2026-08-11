@@ -19,6 +19,9 @@ import apply_decision  # noqa: E402
 import auto_merge as am  # noqa: E402
 import automerge_criteria as criteria_schema  # noqa: E402
 import reconcile  # noqa: E402
+import target_observation  # noqa: E402
+import decision_context  # noqa: E402
+import assessment_admission  # noqa: E402
 
 _failures = []
 
@@ -40,6 +43,10 @@ HISTORY_COMMIT = "f" * 40
 def eligible_verdict():
     return {
         "behavior_class": "A",
+        "behavior_admission": {
+            "version": 1,
+            "contradicts_existing_contract": False,
+        },
         "aligns_with_vision": True,
         "changes_existing_or_default_behavior": False,
         "recommend_merge": True,
@@ -48,7 +55,95 @@ def eligible_verdict():
     }
 
 
+def review_inputs(head):
+    observation = target_observation.make_observation(
+        "owner",
+        "fmt",
+        5,
+        head_sha=head,
+        base_sha=BASE_SHA,
+        expected_head_sha=head,
+        observed_at="2026-07-23T12:00:00Z",
+        source="bulk-scan",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": "history-only workflow touch",
+            "author": "alice",
+            "updated_at": "2026-07-13T00:00:00Z",
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "fixture",
+            "mergeable": "MERGEABLE",
+            "ci": True,
+            "comp": "pass",
+            "tests": "green",
+            "bucket": "merge-ready",
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "compliance", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=target_observation.changed_path_facts(
+            ["README.md"], complete=True
+        ),
+    )
+    snapshot = decision_context.repository_snapshot(
+        [
+            {
+                "owner": "owner",
+                "repo": "fmt",
+                "number": 5,
+                "head_sha": head,
+                "title": "Fixture PR 5",
+                "paths_complete": True,
+                "paths": ["README.md"],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": 101,
+                "url": "https://github.com/owner/fmt/pull/5",
+                "card_url": "https://github.com/owner/wheelhouse/issues/101",
+            }
+        ],
+        "2026-07-23T12:00:00Z",
+    )
+    context = decision_context.build_decision_context(observation, snapshot)
+    assessment = assessment_admission.admit_assessment(
+        {
+            "summary": "Exact review.",
+            "product_implications": "Routine.",
+            "recommended_action": "merge",
+            "recommended_reason": "All gates are clear.",
+            "recommendation_basis": {
+                "kind": "other",
+                "observation_id": observation["observation_id"],
+                "context_id": context["context_id"],
+                "check_names": [],
+            },
+        },
+        observation,
+        context,
+    )
+    return observation, context, assessment
+
+
 def item_for(head, kind="pr-review"):
+    observation, context, _ = review_inputs(head)
     return {
         "repo": "fmt",
         "number": 5,
@@ -65,6 +160,9 @@ def item_for(head, kind="pr-review"):
         "summary": "compliance=pass tests=green",
         "recommendation": "Merge - compliance and tests are green.",
         "url": "https://github.com/owner/fmt/pull/5",
+        "same_closing_issue_overlap": "",
+        "target_observation": observation,
+        "decision_context": context,
     }
 
 
@@ -82,14 +180,38 @@ def scan_for(item, open_target=True):
     }
 
 
+_original_claim_cards = am.claim_cards
+
+
+def claim_cards_after_readonly_preclaim(scan, cards):
+    card_token = os.environ.get("GH_TOKEN")
+    os.environ["GH_TOKEN"] = "fleet-token"
+    try:
+        preclaims = am.preclaim_candidates(scan, cards)
+    finally:
+        if card_token is None:
+            os.environ.pop("GH_TOKEN", None)
+        else:
+            os.environ["GH_TOKEN"] = card_token
+    return _original_claim_cards(scan, cards, preclaims)
+
+
+am.claim_cards = claim_cards_after_readonly_preclaim
+
+
 def state_with_fresh_verdict(body, head):
     state = core.parse_state_block(body)
+    observation, context, assessment = review_inputs(head)
     state.update(
         {
             "triaged_sha": head,
             "triage_status": "succeeded",
             "triage_recommendation": {"action": "merge", "reason": ""},
             "automerge_verdict": eligible_verdict(),
+            render_card.PROJECTION_OWNER_FIELD: render_card.PROJECTION_OWNER,
+            render_card.REVIEW_OBSERVATION_FIELD: observation,
+            render_card.DECISION_CONTEXT_FIELD: context,
+            render_card.ASSESSMENT_FIELD: assessment,
         }
     )
     return render_card._replace_state_block(body, state)
@@ -177,17 +299,26 @@ class LifecycleWorld:
     def gh(self, args, check=True, input_text=None):
         token = os.environ.get("GH_TOKEN")
         if args[:3] == ["api", "--method", "PATCH"]:
-            fields = [
-                args[index + 1]
-                for index, value in enumerate(args)
-                if value == "--raw-field"
-            ]
-            body = next(value[5:] for value in fields if value.startswith("body="))
-            labels = [
-                value[len("labels[]=") :]
-                for value in fields
-                if value.startswith("labels[]=")
-            ]
+            if "--input" in args:
+                with open(args[args.index("--input") + 1], encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                body = payload["body"]
+                labels = list(payload["labels"])
+                self.card["title"] = payload["title"]
+            else:
+                fields = [
+                    args[index + 1]
+                    for index, value in enumerate(args)
+                    if value == "--raw-field"
+                ]
+                body = next(
+                    value[5:] for value in fields if value.startswith("body=")
+                )
+                labels = [
+                    value[len("labels[]=") :]
+                    for value in fields
+                    if value.startswith("labels[]=")
+                ]
             before = core.parse_state_block(self.card["body"]) or {}
             after = core.parse_state_block(body) or {}
             adding_hold = (
@@ -230,7 +361,9 @@ class LifecycleWorld:
             if adding_hold and self.fail_hold_body_writes:
                 raise RuntimeError("simulated manual-hold persistence failure")
             self.card["body"] = body
-            additions = [args[i + 1] for i, value in enumerate(args) if value == "--add-label"]
+            additions = [
+                args[i + 1] for i, value in enumerate(args) if value == "--add-label"
+            ]
             removals = [
                 args[i + 1] for i, value in enumerate(args) if value == "--remove-label"
             ]
@@ -297,7 +430,9 @@ class LifecycleWorld:
             return ([".github/workflows/ci.yml"], True, True)
         return (["src/app.py"], True, True)
 
-    def target_gh(self, path, method="GET", fields=None, paginate=False, slurp=False, **kwargs):
+    def target_gh(
+        self, path, method="GET", fields=None, paginate=False, slurp=False, **kwargs
+    ):
         if path in ("/repos/owner/fmt/pulls/5", "repos/owner/fmt/pulls/5"):
             return copy.deepcopy(self.pr)
         if path.startswith("/repos/owner/fmt/pulls/5/files"):
@@ -336,6 +471,7 @@ class LifecycleWorld:
             "maintainers": core.maintainers,
             "get_owner": core.get_owner,
             "gh_rest": core.gh_rest,
+            "closing_overlap": core.same_closing_issue_overlap,
             "get_card": render_card.get_card,
             "gh": render_card._gh,
             "ensure_labels": render_card.ensure_labels,
@@ -367,6 +503,7 @@ class LifecycleWorld:
         core.maintainers = lambda: {"owner"}
         core.get_owner = lambda: "owner"
         core.gh_rest = self.target_gh
+        core.same_closing_issue_overlap = lambda owner, repo, number: (True, "")
         render_card.get_card = self.get_card
         render_card._gh = self.gh
         render_card.ensure_labels = lambda labels: [
@@ -398,6 +535,7 @@ class LifecycleWorld:
         core.maintainers = self._saved["maintainers"]
         core.get_owner = self._saved["get_owner"]
         core.gh_rest = self._saved["gh_rest"]
+        core.same_closing_issue_overlap = self._saved["closing_overlap"]
         render_card.get_card = self._saved["get_card"]
         render_card._gh = self._saved["gh"]
         render_card.ensure_labels = self._saved["ensure_labels"]
@@ -490,46 +628,123 @@ def test_two_hour_hold_and_head_lifecycle():
         labels_one = {label["name"] for label in world.card["labels"]}
         check("hour one: exactly one eligible card is claimed", len(claims_one) == 1)
         check("hour one: the claim is validated", len(validated_one) == 1)
-        check("hour one: authoritative history is scanned once", delta_one["history_reads"] == 1)
+        check(
+            "hour one: authoritative history is scanned once",
+            delta_one["history_reads"] == 1,
+        )
         check("hour one: no merge endpoint is called", delta_one["merge_calls"] == 0)
-        check("hour one: one audit intent is staged", delta_one["audit_intent_writes"] == 1)
-        check("hour one: one trusted matching-head hold is persisted", status_one == "matching")
-        check("hour one: hold carries exact denial reason", hold_one["reason"] == render_card.AUTOMERGE_WORKFLOW_HOLD_REASON)
-        check("hour one: hold carries commit and bounded path evidence", hold_one["commit_sha"] == HISTORY_COMMIT and hold_one["paths"] == [".github/workflows/ci.yml"])
-        check("hour one: source PR is visible in trusted state", hold_one["source_pr_url"] == "https://github.com/owner/fmt/pull/5")
-        check("hour one: dedicated managed label is present", render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL in labels_one)
-        check("hour one: hold body and label use one card edit", delta_one["hold_atomic_writes"] == 1)
-        check("hour one: owner-visible section appears exactly once", world.card["body"].count("### Manual merge required") == 1)
-        check("hour one: owner-visible section explains history-only shape", "complete current net diff is clean" in world.card["body"] and "commit history" in world.card["body"])
-        check("hour one: no target-facing or duplicate comment is posted", delta_one["comments"] == 0)
-        check("hour one: claim releases only after hold persistence", "processing" not in labels_one and am.AUTO_MERGE_CLAIM_LABEL not in labels_one)
-        check("hour one: audit intent clears only after hold persistence", am.AUDIT_INTENT_FIELD not in state_one)
-        check("hour one: result handoff carries one structured hold", len(payload_one["workflow_holds"]) == 1)
+        check(
+            "hour one: one audit intent is staged",
+            delta_one["audit_intent_writes"] == 1,
+        )
+        check(
+            "hour one: one trusted matching-head hold is persisted",
+            status_one == "matching",
+        )
+        check(
+            "hour one: hold carries exact denial reason",
+            hold_one["reason"] == render_card.AUTOMERGE_WORKFLOW_HOLD_REASON,
+        )
+        check(
+            "hour one: hold carries commit and bounded path evidence",
+            hold_one["commit_sha"] == HISTORY_COMMIT
+            and hold_one["paths"] == [".github/workflows/ci.yml"],
+        )
+        check(
+            "hour one: source PR is visible in trusted state",
+            hold_one["source_pr_url"] == "https://github.com/owner/fmt/pull/5",
+        )
+        check(
+            "hour one: dedicated managed label is present",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL in labels_one,
+        )
+        check(
+            "hour one: hold body and label use one card edit",
+            delta_one["hold_atomic_writes"] == 1,
+        )
+        check(
+            "hour one: owner-visible section appears exactly once",
+            world.card["body"].count("### Manual merge required") == 1,
+        )
+        check(
+            "hour one: owner-visible section explains history-only shape",
+            "complete current net diff is clean" in world.card["body"]
+            and "commit history" in world.card["body"],
+        )
+        check(
+            "hour one: no target-facing or duplicate comment is posted",
+            delta_one["comments"] == 0,
+        )
+        check(
+            "hour one: claim releases only after hold persistence",
+            "processing" not in labels_one
+            and am.AUTO_MERGE_CLAIM_LABEL not in labels_one,
+        )
+        check(
+            "hour one: audit intent clears only after hold persistence",
+            am.AUDIT_INTENT_FIELD not in state_one,
+        )
+        check(
+            "hour one: result handoff carries one structured hold",
+            len(payload_one["workflow_holds"]) == 1,
+        )
 
         claims_two, validated_two, payload_two, delta_two = world.run_hour()
         state_two = core.parse_state_block(world.card["body"])
-        check("hour two: matching head is not claimed", claims_two == [] and validated_two == [])
+        check(
+            "hour two: matching head is not claimed",
+            claims_two == [] and validated_two == [],
+        )
         check("hour two: zero claim-label writes", delta_two["claim_label_writes"] == 0)
         check("hour two: zero history reads", delta_two["history_reads"] == 0)
-        check("hour two: zero audit-intent writes", delta_two["audit_intent_writes"] == 0)
+        check(
+            "hour two: zero audit-intent writes", delta_two["audit_intent_writes"] == 0
+        )
         check("hour two: zero duplicate comments", delta_two["comments"] == 0)
         check("hour two: zero merge calls", delta_two["merge_calls"] == 0)
-        check("hour two: hold remains matching and unique", render_card.automerge_workflow_hold_status(state_two, HEAD_ONE)[0] == "matching" and world.card["body"].count("### Manual merge required") == 1)
+        check(
+            "hour two: hold remains matching and unique",
+            render_card.automerge_workflow_hold_status(state_two, HEAD_ONE)[0]
+            == "matching"
+            and world.card["body"].count("### Manual merge required") == 1,
+        )
 
         rows = {row["id"]: row for row in payload_two["criteria"][0]["criteria"]}
-        check("criteria: matching-head G7 is an evaluated UNMET fact", rows["g7_immediate_recheck"]["status"] == criteria_schema.STATUS_UNMET)
-        check("criteria: G7 carries sanitized commit/path/source evidence", HISTORY_COMMIT[:8] in rows["g7_immediate_recheck"]["evidence"] and ".github/workflows/ci.yml" in rows["g7_immediate_recheck"]["evidence"] and "https://github.com/owner/fmt/pull/5" in rows["g7_immediate_recheck"]["evidence"])
+        check(
+            "criteria: matching-head G7 is an evaluated UNMET fact",
+            rows["g7_immediate_recheck"]["status"] == criteria_schema.STATUS_UNMET,
+        )
+        check(
+            "criteria: G7 carries sanitized commit/path/source evidence",
+            HISTORY_COMMIT[:8] in rows["g7_immediate_recheck"]["evidence"]
+            and ".github/workflows/ci.yml" in rows["g7_immediate_recheck"]["evidence"]
+            and "https://github.com/owner/fmt/pull/5"
+            in rows["g7_immediate_recheck"]["evidence"],
+        )
 
         forged = [
-            {"id": key, "label": criteria_schema.CRITERIA_LABELS[key], "status": "met", "evidence": "forged"}
+            {
+                "id": key,
+                "label": criteria_schema.CRITERIA_LABELS[key],
+                "status": "met",
+                "evidence": "forged",
+            }
             for key in criteria_schema.CRITERIA_IDS
         ]
         forged_state = dict(state_two, automerge_criteria=forged)
-        world.card["body"] = render_card._replace_state_block(world.card["body"], forged_state)
+        world.card["body"] = render_card._replace_state_block(
+            world.card["body"], forged_state
+        )
         writes_before_forgery = world.metrics["claim_label_writes"]
         os.environ["GH_TOKEN"] = "card-token"
-        forged_claims = am.claim_cards(scan_for(item_for(HEAD_ONE)), [world.card_snapshot()])
-        check("criteria: forged displayed MET rows do not bypass trusted hold", forged_claims == [] and world.metrics["claim_label_writes"] == writes_before_forgery)
+        forged_claims = am.claim_cards(
+            scan_for(item_for(HEAD_ONE)), [world.card_snapshot()]
+        )
+        check(
+            "criteria: forged displayed MET rows do not bypass trusted hold",
+            forged_claims == []
+            and world.metrics["claim_label_writes"] == writes_before_forgery,
+        )
 
         world.set_head(HEAD_TWO)
         current_cards = [world.card_snapshot()]
@@ -537,25 +752,51 @@ def test_two_hour_hold_and_head_lifecycle():
         world.run_reconcile(scan_for(item_for(HEAD_TWO)), current_cards)
         refreshed_state = core.parse_state_block(world.card["body"])
         refreshed_labels = {label["name"] for label in world.card["labels"]}
-        check("new head: authoritative refresh clears old hold state", render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in refreshed_state)
-        check("new head: authoritative refresh clears managed hold label", render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL not in refreshed_labels)
-        check("new head: stale verdict and triage are dropped", "automerge_verdict" not in refreshed_state and "triaged_sha" not in refreshed_state)
+        check(
+            "new head: authoritative refresh clears old hold state",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in refreshed_state,
+        )
+        check(
+            "new head: authoritative refresh clears managed hold label",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL not in refreshed_labels,
+        )
+        check(
+            "new head: stale verdict and triage are dropped",
+            "automerge_verdict" not in refreshed_state
+            and "triaged_sha" not in refreshed_state,
+        )
         os.environ["GH_TOKEN"] = "card-token"
-        no_fresh_claim = am.claim_cards(scan_for(item_for(HEAD_TWO)), [world.card_snapshot()])
-        check("new head: no claim before fresh current-head triage", no_fresh_claim == [])
+        no_fresh_claim = am.claim_cards(
+            scan_for(item_for(HEAD_TWO)), [world.card_snapshot()]
+        )
+        check(
+            "new head: no claim before fresh current-head triage", no_fresh_claim == []
+        )
 
         world.set_fresh_verdict(HEAD_TWO)
         world.history_mode = "clean"
         history_before_clean = world.metrics["history_reads"]
         merge_before_clean = world.metrics["merge_calls"]
         os.environ["GH_TOKEN"] = "card-token"
-        clean_claims = am.claim_cards(scan_for(item_for(HEAD_TWO)), [world.card_snapshot()])
+        clean_claims = am.claim_cards(
+            scan_for(item_for(HEAD_TWO)), [world.card_snapshot()]
+        )
         clean_validated = am.validate_claimed_cards(clean_claims)
         os.environ["GH_TOKEN"] = "fleet-token"
         clean_payload = am.act_on_scan(scan_for(item_for(HEAD_TWO)), clean_validated)
-        check("clean new head: current-head verdict restores one claim", len(clean_claims) == 1)
-        check("clean new head: unchanged final history gate still runs", world.metrics["history_reads"] - history_before_clean == 1)
-        check("clean new head: final gate can reach the unchanged merge endpoint", world.metrics["merge_calls"] - merge_before_clean == 1 and len(clean_payload["merges"]) == 1)
+        check(
+            "clean new head: current-head verdict restores one claim",
+            len(clean_claims) == 1,
+        )
+        check(
+            "clean new head: unchanged final history gate still runs",
+            world.metrics["history_reads"] - history_before_clean == 1,
+        )
+        check(
+            "clean new head: final gate can reach the unchanged merge endpoint",
+            world.metrics["merge_calls"] - merge_before_clean == 1
+            and len(clean_payload["merges"]) == 1,
+        )
     finally:
         world.restore()
 
@@ -572,13 +813,30 @@ def test_changed_history_head_establishes_one_new_hold():
         world.run_hour(reconcile_after=False)
         state = core.parse_state_block(world.card["body"])
         status, hold = render_card.automerge_workflow_hold_status(state, HEAD_THREE)
-        check("changed history head: one fresh authoritative history scan runs", world.metrics["history_reads"] - history_before == 1)
-        check("changed history head: one new head-scoped hold is established", status == "matching" and hold["head_sha"] == HEAD_THREE)
-        check("changed history head: visible reason remains unique", world.card["body"].count("### Manual merge required") == 1)
+        check(
+            "changed history head: one fresh authoritative history scan runs",
+            world.metrics["history_reads"] - history_before == 1,
+        )
+        check(
+            "changed history head: one new head-scoped hold is established",
+            status == "matching" and hold["head_sha"] == HEAD_THREE,
+        )
+        check(
+            "changed history head: visible reason remains unique",
+            world.card["body"].count("### Manual merge required") == 1,
+        )
         before_second = dict(world.metrics)
         world.run_hour(reconcile_after=False)
-        check("changed history head: second same-head pass performs no history scan", world.metrics["history_reads"] == before_second["history_reads"])
-        check("changed history head: second same-head pass performs no hold write", world.metrics["hold_body_writes"] == before_second["hold_body_writes"] and world.metrics["hold_label_writes"] == before_second["hold_label_writes"])
+        check(
+            "changed history head: second same-head pass performs no history scan",
+            world.metrics["history_reads"] == before_second["history_reads"],
+        )
+        check(
+            "changed history head: second same-head pass performs no hold write",
+            world.metrics["hold_body_writes"] == before_second["hold_body_writes"]
+            and world.metrics["hold_label_writes"]
+            == before_second["hold_label_writes"],
+        )
     finally:
         world.restore()
 
@@ -589,14 +847,29 @@ def test_net_diff_and_unproven_history_never_create_specialized_hold():
         try:
             claims, _, payload, _ = world.run_hour(reconcile_after=False)
             state = core.parse_state_block(world.card["body"])
-            check("%s: card can enter ordinary evaluation" % mode, len(claims) == 1)
-            check("%s: no specialized hold is persisted" % mode, render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in state)
-            check("%s: no specialized hold handoff is emitted" % mode, payload["workflow_holds"] == [])
+            check(
+                "%s: card can enter ordinary evaluation" % mode,
+                len(claims) == (0 if mode == "net" else 1),
+            )
+            check(
+                "%s: no specialized hold is persisted" % mode,
+                render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in state,
+            )
+            check(
+                "%s: no specialized hold handoff is emitted" % mode,
+                payload["workflow_holds"] == [],
+            )
             check("%s: target never merges" % mode, world.metrics["merge_calls"] == 0)
             if mode == "net":
-                check("net diff: G2 fails before final history gate", world.metrics["history_reads"] == 0)
+                check(
+                    "net diff: G2 fails before final history gate",
+                    world.metrics["history_reads"] == 0,
+                )
             else:
-                check("%s: unverifiable history remains generic fail-closed" % mode, payload["holds"] and world.metrics["history_reads"] <= 1)
+                check(
+                    "%s: unverifiable history remains generic fail-closed" % mode,
+                    payload["holds"] and world.metrics["history_reads"] <= 1,
+                )
         finally:
             world.restore()
 
@@ -610,15 +883,25 @@ def test_malformed_stale_and_persistence_failure_fail_closed():
             "head_sha": HEAD_ONE,
             "reason": render_card.AUTOMERGE_WORKFLOW_HOLD_REASON,
         }
-        malformed.card["body"] = render_card._replace_state_block(malformed.card["body"], state)
+        malformed.card["body"] = render_card._replace_state_block(
+            malformed.card["body"], state
+        )
         writes_before = malformed.metrics["claim_label_writes"]
         stderr = io.StringIO()
         os.environ["GH_TOKEN"] = "card-token"
         with redirect_stderr(stderr):
-            claims = am.claim_cards(scan_for(item_for(HEAD_ONE)), [malformed.card_snapshot()])
+            claims = am.claim_cards(
+                scan_for(item_for(HEAD_ONE)), [malformed.card_snapshot()]
+            )
         check("malformed same-head hold: claim fails closed", claims == [])
-        check("malformed same-head hold: no processing label write occurs", malformed.metrics["claim_label_writes"] == writes_before)
-        check("malformed same-head hold: loud diagnostic is emitted", "malformed" in stderr.getvalue())
+        check(
+            "malformed same-head hold: no processing label write occurs",
+            malformed.metrics["claim_label_writes"] == writes_before,
+        )
+        check(
+            "malformed same-head hold: loud diagnostic is emitted",
+            "malformed" in stderr.getvalue(),
+        )
     finally:
         malformed.restore()
 
@@ -645,11 +928,21 @@ def test_malformed_stale_and_persistence_failure_fail_closed():
         stale.card["labels"].append({"name": render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL})
         os.environ["GH_TOKEN"] = "card-token"
         claims = am.claim_cards(scan_for(item_for(HEAD_TWO)), [stale.card_snapshot()])
-        check("stale different-head hold: cannot authorize before refresh", claims == [] and stale.metrics["merge_calls"] == 0)
+        check(
+            "stale different-head hold: cannot authorize before refresh",
+            claims == [] and stale.metrics["merge_calls"] == 0,
+        )
         stale.run_reconcile(scan_for(item_for(HEAD_TWO)), [stale.card_snapshot()])
         refreshed = core.parse_state_block(stale.card["body"])
-        check("stale different-head hold: authoritative refresh clears state", render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in refreshed)
-        check("stale different-head hold: authoritative refresh clears label", render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL not in {label["name"] for label in stale.card["labels"]})
+        check(
+            "stale different-head hold: authoritative refresh clears state",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in refreshed,
+        )
+        check(
+            "stale different-head hold: authoritative refresh clears label",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL
+            not in {label["name"] for label in stale.card["labels"]},
+        )
     finally:
         stale.restore()
 
@@ -670,14 +963,40 @@ def test_malformed_stale_and_persistence_failure_fail_closed():
             record_failed = True
         state = core.parse_state_block(failed.card["body"])
         labels = {label["name"] for label in failed.card["labels"]}
-        check("persistence failure: act handoff remains loud and retryable", payload["ambiguous_outcomes"] and record_failed)
-        check("persistence failure: final-gate audit intent remains durable", state.get(am.AUDIT_INTENT_FIELD, {}).get(am.AUDIT_FINAL_GATE_PENDING_FIELD) is True)
-        check("persistence failure: exclusive claim remains recoverable", {"needs-decision", "processing", am.AUTO_MERGE_CLAIM_LABEL}.issubset(labels))
-        check("persistence failure: card never returns to pure reclaimable state", labels != {"needs-decision", "repo:fmt", "kind:pr-review", "priority:med", "target:fmt-5"})
+        check(
+            "persistence failure: act handoff remains loud and retryable",
+            payload["ambiguous_outcomes"] and record_failed,
+        )
+        check(
+            "persistence failure: final-gate audit intent remains durable",
+            state.get(am.AUDIT_INTENT_FIELD, {}).get(am.AUDIT_FINAL_GATE_PENDING_FIELD)
+            is True,
+        )
+        check(
+            "persistence failure: exclusive claim remains recoverable",
+            {"needs-decision", "processing", am.AUTO_MERGE_CLAIM_LABEL}.issubset(
+                labels
+            ),
+        )
+        check(
+            "persistence failure: card never returns to pure reclaimable state",
+            labels
+            != {
+                "needs-decision",
+                "repo:fmt",
+                "kind:pr-review",
+                "priority:med",
+                "target:fmt-5",
+            },
+        )
         writes_before = failed.metrics["claim_label_writes"]
         os.environ["GH_TOKEN"] = "card-token"
         recovered_claims = am.claim_cards(scan, [failed.card_snapshot()])
-        check("persistence failure: next hour preserves one existing claim without relabeling", len(recovered_claims) == 1 and failed.metrics["claim_label_writes"] == writes_before)
+        check(
+            "persistence failure: next hour preserves one existing claim without relabeling",
+            len(recovered_claims) == 1
+            and failed.metrics["claim_label_writes"] == writes_before,
+        )
     finally:
         failed.restore()
 
@@ -767,9 +1086,11 @@ def test_hold_persistence_rejects_card_snapshot_races():
             check(
                 "%s race: audit and claim remain recoverable" % race_name,
                 raced_state.get(am.AUDIT_INTENT_FIELD) == intent
-                and {"needs-decision", "processing", am.AUTO_MERGE_CLAIM_LABEL}.issubset(
-                    raced_labels
-                ),
+                and {
+                    "needs-decision",
+                    "processing",
+                    am.AUTO_MERGE_CLAIM_LABEL,
+                }.issubset(raced_labels),
             )
             check(
                 "%s race: reads and attempted writes use only the card token"
@@ -857,6 +1178,7 @@ def test_hold_persistence_rejects_split_write_window_races():
                 failed_closed = (
                     "changed before persistence" in str(error)
                     or "could not confirm persisted" in str(error)
+                    or "complete card projection did not verify" in str(error)
                 )
             raced_state = core.parse_state_block(world.card["body"])
             raced_labels = {label["name"] for label in world.card["labels"]}
@@ -864,9 +1186,11 @@ def test_hold_persistence_rejects_split_write_window_races():
             check(
                 "%s: audit and claim remain recoverable" % race_name,
                 raced_state.get(am.AUDIT_INTENT_FIELD) == intent
-                and {"needs-decision", "processing", am.AUTO_MERGE_CLAIM_LABEL}.issubset(
-                    raced_labels
-                ),
+                and {
+                    "needs-decision",
+                    "processing",
+                    am.AUTO_MERGE_CLAIM_LABEL,
+                }.issubset(raced_labels),
             )
             check(
                 "%s: claim is never released" % race_name,
@@ -895,9 +1219,23 @@ def test_refresh_reuse_hard_close_and_token_boundaries():
         reflected = render_card.body_with_activity_reflected(
             world.card["body"], reflected_item, card_updated_at="2026-07-13T00:00:00Z"
         )
-        check("same-head activity write preserves workflow hold", core.parse_state_block(reflected).get(render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD) == hold)
-        queued = render_card.body_with_triage_queued(world.card["body"], item_for(HEAD_ONE))
-        check("same-head triage write preserves workflow hold", core.parse_state_block(queued).get(render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD) == hold)
+        check(
+            "same-head activity write preserves workflow hold",
+            core.parse_state_block(reflected).get(
+                render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD
+            )
+            == hold,
+        )
+        queued = render_card.body_with_triage_queued(
+            world.card["body"], item_for(HEAD_ONE)
+        )
+        check(
+            "same-head triage write preserves workflow hold",
+            core.parse_state_block(queued).get(
+                render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD
+            )
+            == hold,
+        )
 
         closed_body = render_card.body_with_reconcile_absence(
             world.card["body"],
@@ -907,29 +1245,72 @@ def test_refresh_reuse_hard_close_and_token_boundaries():
         )
         candidate = copy.deepcopy(world.card)
         candidate.update({"body": closed_body, "state": "CLOSED"})
-        same_card, _ = render_card._reused_card_render(item_for(HEAD_ONE), candidate, False)
+        same_card, _ = render_card._reused_card_render(
+            item_for(HEAD_ONE), candidate, False
+        )
         same_state = core.parse_state_block(same_card["body"])
-        check("same-head machine-soft-close reuse preserves workflow hold", same_state.get(render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD) == hold and render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL in same_card["labels"])
-        changed_card, _ = render_card._reused_card_render(item_for(HEAD_TWO), candidate, False)
+        check(
+            "same-head machine-soft-close reuse preserves workflow hold",
+            same_state.get(render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD) == hold
+            and render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL in same_card["labels"],
+        )
+        changed_card, _ = render_card._reused_card_render(
+            item_for(HEAD_TWO), candidate, False
+        )
         changed_state = core.parse_state_block(changed_card["body"])
-        check("new-head reuse clears workflow hold", render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in changed_state and render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL not in changed_card["labels"])
+        check(
+            "new-head reuse clears workflow hold",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in changed_state
+            and render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL not in changed_card["labels"],
+        )
         incompatible = item_for(HEAD_ONE, kind="ci-approval")
-        incompatible_card, _ = render_card._reused_card_render(incompatible, candidate, False)
-        check("incompatible-kind reuse clears workflow hold", render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in core.parse_state_block(incompatible_card["body"]))
+        incompatible_card, _ = render_card._reused_card_render(
+            incompatible, candidate, False
+        )
+        check(
+            "incompatible-kind reuse clears workflow hold",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD
+            not in core.parse_state_block(incompatible_card["body"]),
+        )
 
         closed = []
+
         def hard_close(number, message, label="resolved", expected=None):
             closed.append((number, message))
             world.card["state"] = "CLOSED"
-        os.environ["GH_TOKEN"] = "card-token"
-        world.run_reconcile(scan_for(item_for(HEAD_ONE), open_target=False), [world.card_snapshot()], close_card=hard_close)
-        check("manual source merge/close hard-closes held card immediately", len(closed) == 1 and world.card["state"] == "CLOSED")
 
-        check("hold path: every card write uses only the default card token", world.card_write_tokens and set(world.card_write_tokens) == {"card-token"})
-        check("hold path: authoritative history reads use FLEET_TOKEN", world.history_read_tokens == ["fleet-token"])
+        os.environ["GH_TOKEN"] = "card-token"
+        world.run_reconcile(
+            scan_for(item_for(HEAD_ONE), open_target=False),
+            [world.card_snapshot()],
+            close_card=hard_close,
+        )
+        check(
+            "manual source merge/close hard-closes held card immediately",
+            len(closed) == 1 and world.card["state"] == "CLOSED",
+        )
+
+        check(
+            "hold path: every card write uses only the default card token",
+            world.card_write_tokens and set(world.card_write_tokens) == {"card-token"},
+        )
+        check(
+            "hold path: authoritative history reads use FLEET_TOKEN",
+            world.history_read_tokens == ["fleet-token"],
+        )
         check("hold path: no target mutation occurs", world.metrics["merge_calls"] == 0)
-        check("manual hold label remains refreshable and blocked stays unchanged", render_card.is_refreshable(["needs-decision", render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL]) and "blocked" in render_card.NON_REFRESHABLE_LABELS)
-        check("manual hold is non-material", render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD not in render_card.MATERIAL_FIELDS)
+        check(
+            "manual hold label remains refreshable and blocked stays unchanged",
+            render_card.is_refreshable(
+                ["needs-decision", render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL]
+            )
+            and "blocked" in render_card.NON_REFRESHABLE_LABELS,
+        )
+        check(
+            "manual hold is non-material",
+            render_card.AUTOMERGE_WORKFLOW_HOLD_FIELD
+            not in render_card.MATERIAL_FIELDS,
+        )
     finally:
         world.restore()
 
@@ -939,11 +1320,26 @@ def test_structured_authoritative_gate_contract():
     try:
         os.environ["GH_TOKEN"] = "fleet-token"
         gate = apply_decision._workflow_merge_gate("owner", "fmt", 5, world.pr)
-        check("shared gate: history-only result is structured", gate["status"] == apply_decision.WORKFLOW_GATE_BLOCKED and gate["reason"] == apply_decision.WORKFLOW_GATE_HISTORY_ONLY_REASON)
-        check("shared gate: structured result carries exact source evidence", gate["commit_sha"] == HISTORY_COMMIT and gate["paths"] == [".github/workflows/ci.yml"] and gate["net_diff_complete"] is True)
+        check(
+            "shared gate: history-only result is structured",
+            gate["status"] == apply_decision.WORKFLOW_GATE_BLOCKED
+            and gate["reason"] == apply_decision.WORKFLOW_GATE_HISTORY_ONLY_REASON,
+        )
+        check(
+            "shared gate: structured result carries exact source evidence",
+            gate["commit_sha"] == HISTORY_COMMIT
+            and gate["paths"] == [".github/workflows/ci.yml"]
+            and gate["net_diff_complete"] is True,
+        )
         message, terminal = apply_decision.do_merge("owner", "fmt", 5, HEAD_ONE)
-        check("direct owner decision: authoritative refusal remains blocked", terminal == "blocked" and "merge by hand in the GitHub UI" in message)
-        check("direct owner decision: refusal never calls merge endpoint", world.metrics["merge_calls"] == 0)
+        check(
+            "direct owner decision: authoritative refusal remains blocked",
+            terminal == "blocked" and "merge by hand in the GitHub UI" in message,
+        )
+        check(
+            "direct owner decision: refusal never calls merge endpoint",
+            world.metrics["merge_calls"] == 0,
+        )
     finally:
         world.restore()
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -60,16 +59,23 @@ def default_final(action: str) -> Any:
         return {"text": "HOLD\n\n- Reviewed `target.txt`."}
     if action.startswith("nl-decision"):
         return {"mode": "answer", "answer": "This remains safe to inspect."}
-    return {
+    result = {
         "summary": "A bounded fixture request.",
         "product_implications": "Routine and low risk.",
         "recommended_action": "hold",
         "recommended_reason": "Review the fixture.",
         "evidence": 'target.txt: "fixture evidence anchor text for runtime tests"',
     }
+    if action.startswith("triage.pr"):
+        result["recommendation_basis"] = {
+            "kind": "other",
+            "observation_id": "sha256:" + "0" * 64,
+            "context_id": "sha256:" + "1" * 64,
+        }
+    return result
 
 
-def make_task(root: Path, action: str, final: Any | None = None, script: dict[str, Any] | None = None) -> tuple[dict[str, Any], Path, Path]:
+def make_task(root: Path, action: str, final: Any | None = None, script: dict[str, Any] | None = None, event_key: str = "a" * 64) -> tuple[dict[str, Any], Path, Path]:
     root.mkdir(parents=True, exist_ok=True)
     prompt = root / "prompt.txt"
     target = root / "target.txt"
@@ -79,16 +85,16 @@ def make_task(root: Path, action: str, final: Any | None = None, script: dict[st
     kind = "issue-triage"
     repair_kind = "issue"
     target_file = str(target)
-    if action.startswith("triage.pr"):
+    if action.endswith(".schema-repair"):
+        kind = "schema-repair"
+        target_file = ""
+    elif action.startswith("triage.pr"):
         kind = "pr-review"
         repair_kind = "pr"
     elif action.startswith("deep-review"):
         kind = "pr-review"
     elif action.startswith("nl-decision"):
         kind = "pr-review"
-    elif action == "triage.schema-repair":
-        kind = "schema-repair"
-        target_file = ""
     task = build_task(
         action=action,
         selection=codex_selection(),
@@ -101,6 +107,7 @@ def make_task(root: Path, action: str, final: Any | None = None, script: dict[st
         target_kind=kind,
         revision="fixture-revision-1",
         wheelhouse_revision=WHEELHOUSE_REVISION,
+        event_key=event_key,
         target_file=target_file,
         repair_kind=repair_kind,
     )

@@ -280,10 +280,9 @@ def test_nl_fetch_bounds_target_on_disk_with_explicit_truncation():
 def test_both_nl_claude_steps_can_read_the_on_disk_file():
     """Both NL Claude steps (READONLY search + legacy no-token) consume the SAME
     by-reference nl-prompt and gain Read/Grep/Glob so they can open target.txt.
-    The write/acting boundary is unchanged: the search step keeps Bash limited to
-    wheelhouse-search, and the legacy step keeps Write (for decision.json) with no
-    shell and no GH_TOKEN."""
-    steps = handle_steps()
+    The write/acting boundary is unchanged: the search step keeps Write only for
+    search-request.json and Bash limited to wheelhouse-search, while the legacy
+    step has no Write, shell, or GH_TOKEN."""
     search = nl_model_step("nl_search")
     legacy = nl_model_step("nl_local")
     check("nl: read-only search Claude step exists", search is not None)
@@ -318,9 +317,9 @@ def test_both_nl_claude_steps_can_read_the_on_disk_file():
     if legacy:
         largs = str((legacy.get("with") or {}).get("claude_args", "")).strip()
         check(
-            "nl: legacy step is exactly Read,Grep,Glob,Write (no shell, no Bash)",
+            "nl: legacy step is exactly Read,Grep,Glob (no Write, shell, or Bash)",
             largs
-            == "--allowedTools Read,Grep,Glob,Write\n--max-turns 32\n--model claude-sonnet-4-6",
+            == "--allowedTools Read,Grep,Glob\n--max-turns 32\n--model claude-sonnet-4-6\n--json-schema '${{ steps.hydrate.outputs.nativeSchema }}'",
         )
         check(
             "nl: legacy step still receives no GH_TOKEN (unchanged isolation)",
@@ -349,8 +348,9 @@ def test_nl_failure_visibility_is_bounded_and_fire_once():
     cond = str(note.get("if", ""))
     check("nl: note runs even on a failed run (always)", "always()" in cond)
     check(
-        "nl: note fires only when NL was entered and the prompt built",
-        "steps.nl-gate.outputs.proceed == 'true'" in cond
+        "nl: note fires only for an admitted fresh event whose prompt built",
+        "steps.nl-claim.outputs.admitted == 'true'" in cond
+        and "steps.nl-post-model-freshness.outputs.fresh == 'true'" in cond
         and "steps.nl-prompt.outcome == 'success'" in cond,
     )
     check(
@@ -368,13 +368,14 @@ def test_nl_failure_visibility_is_bounded_and_fire_once():
         "FLEET_TOKEN" not in dumped and "READONLY_TOKEN" not in dumped,
     )
     check(
-        "nl: note keys idempotency on the triggering comment id, not content",
-        env.get("TRIGGER_COMMENT_ID") == "${{ github.event.comment.id }}",
+        "nl: note binds the durable exact-event claim, not comment content",
+        env.get("CLAIM_ID") == "${{ steps.nl-claim.outputs.comment_id }}"
+        and env.get("CLAIM_MARKER") == "${{ steps.nl-claim.outputs.marker }}",
     )
     run = str(note.get("run", ""))
     check(
-        "nl: note is fire-once (checks for an existing marker before posting)",
-        "wheelhouse-nl-error:" in run and "grep -qF" in run,
+        "nl: note is fire-once by editing the pre-spend claim",
+        "--method PATCH" in run and "issues/comments/$CLAIM_ID" in run,
     )
     check(
         "nl: note body carries NO prompt/comment content (no interpolation of either)",
@@ -388,6 +389,46 @@ def test_nl_failure_visibility_is_bounded_and_fire_once():
         and "needs-decision" not in run
         and "gh issue close" not in run,
     )
+
+
+def test_nl_consumer_evidence_requires_execution_and_durable_projection():
+    steps = handle_steps()
+    action = step_by_id(steps, "nl-action-consumer")
+    reply = step_by_id(steps, "nl-reply-consumer")
+    terminal = step_by_name(steps, "Record natural-language consumer stage")
+    check("nl: action consumer exists", action is not None)
+    check("nl: reply consumer exists", reply is not None)
+    check("nl: terminal consumer stage exists", terminal is not None)
+    if action:
+        execute = step_by_id(steps, "execute")
+        check(
+            "nl: action projection requires completed target execution",
+            "steps.execute.outcome == 'success'" in str(action.get("if", ""))
+            and "steps.execute.outputs.success" not in str(action.get("if", "")),
+        )
+        check(
+            "nl: action projection propagates write failure",
+            "|| true" not in str(action.get("run", "")),
+        )
+        check(
+            "nl: execute boundary receives the admitted exact revision",
+            execute is not None
+            and (execute.get("env") or {}).get("TARGET_REVISION")
+            == "${{ steps.decide.outputs.target_revision || steps.route.outputs.target_revision }}"
+            and 'TARGET_REVISION="$TARGET_REVISION"' in str(execute.get("run", "")),
+        )
+    if reply:
+        check(
+            "nl: reply projection propagates write failure",
+            "|| true" not in str(reply.get("run", "")),
+        )
+    if terminal:
+        run = str(terminal.get("run", ""))
+        check(
+            "nl: committed evidence requires a successful consumer",
+            "steps.nl-action-consumer.outcome" in run
+            and "steps.nl-reply-consumer.outcome" in run,
+        )
 
 
 def test_nl_prompt_step_is_pass_by_reference_not_inline():
@@ -409,6 +450,79 @@ def test_nl_prompt_step_is_pass_by_reference_not_inline():
         )
 
 
+def test_trusted_history_is_bounded_with_explicit_elision():
+    """The F1 class: trusted history is the one unbounded inline the #555 fix
+    left behind. A long-lived card accumulating large bot verdicts and answers
+    must still yield a spawnable prompt - bounded by the size-budget table with
+    explicit elision - while the trusted-author filter stays byte-independent."""
+    from agent_runtime.size_budget import (
+        NL_HISTORY_MAX_TOTAL_BYTES,
+        NL_HISTORY_MAX_TURNS,
+    )
+
+    verdict = "Deep review verdict: HOLD.\n" + ("v" * 100_000)
+    answer = "Prior answer. " + ("a" * 60_000)
+    comments = [
+        {"id": 1, "login": "github-actions[bot]", "body": verdict},
+        {"id": 2, "login": "github-actions[bot]", "body": verdict},
+        {"id": 3, "login": "github-actions[bot]", "body": answer},
+        {"id": 4, "login": "kunchenguid", "body": answer},
+        {"id": 5, "login": "github-actions[bot]", "body": answer},
+        {"id": 6, "login": "random-contributor", "body": "untrusted " + ("u" * 500_000)},
+        {"id": 7, "login": "kunchenguid", "body": "merge it please"},
+    ]
+    history = ad.assemble_history(comments, ["kunchenguid"], "7")
+    check(
+        "history: rendered history respects the total byte budget",
+        len(history.encode("utf-8")) <= NL_HISTORY_MAX_TOTAL_BYTES + 256,
+    )
+    check(
+        "history: per-turn truncation is explicit, never silent",
+        "[truncated: retained" in history,
+    )
+    check(
+        "history: the trusted-author filter is unchanged by bounding",
+        "untrusted" not in history and "random-contributor" not in history,
+    )
+    check(
+        "history: the triggering comment stays excluded from history",
+        "merge it please" not in history,
+    )
+    check(
+        "history: the newest trusted turn survives with its head intact",
+        "Prior answer." in history,
+    )
+    prompt = ad.build_nl_prompt("card body", "merge it please", "pr-review", history)
+    raw = len(prompt.encode("utf-8"))
+    escaped = len(json.dumps(prompt).encode("utf-8"))
+    check(
+        "history: two 100 KB verdicts + three 60 KB answers stay spawnable "
+        "(raw %d, escaped %d < %d)" % (raw, escaped, MAX_ARG_STRLEN - 4096),
+        raw < MAX_ARG_STRLEN - 4096 and escaped < MAX_ARG_STRLEN - 4096,
+    )
+    # More turns than the turn budget: the oldest are elided with a marker.
+    many = [
+        {"id": i, "login": "kunchenguid", "body": "turn %d" % i}
+        for i in range(NL_HISTORY_MAX_TURNS + 5)
+    ]
+    crowded = ad.assemble_history(many, ["kunchenguid"], None)
+    check(
+        "history: turn-count overflow is elided with an explicit marker",
+        "[earlier conversation elided: 5 turns," in crowded
+        and "turn %d" % (NL_HISTORY_MAX_TURNS + 4) in crowded
+        and "Maintainer: turn 0" not in crowded,
+    )
+    small = [
+        {"id": 1, "login": "kunchenguid", "body": "short question"},
+        {"id": 2, "login": "github-actions[bot]", "body": "short answer"},
+    ]
+    check(
+        "history: a small thread renders verbatim with no markers",
+        ad.assemble_history(small, ["kunchenguid"], None)
+        == "Maintainer: short question\n\nAssistant: short answer",
+    )
+
+
 def main():
     test_e2big_repro_giant_target_never_reaches_all_inputs()
     test_prompt_names_target_file_and_keeps_untrusted_framing()
@@ -416,7 +530,9 @@ def main():
     test_nl_fetch_bounds_target_on_disk_with_explicit_truncation()
     test_both_nl_claude_steps_can_read_the_on_disk_file()
     test_nl_failure_visibility_is_bounded_and_fire_once()
+    test_nl_consumer_evidence_requires_execution_and_durable_projection()
     test_nl_prompt_step_is_pass_by_reference_not_inline()
+    test_trusted_history_is_bounded_with_explicit_elision()
     print()
     if _failures:
         print("%d FAILED: %s" % (len(_failures), ", ".join(_failures)))

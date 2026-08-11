@@ -44,7 +44,7 @@ import render_card as rc  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
 CLAUDE_ACTION_PIN = (
-    "anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd"
+    "anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e"
 )
 _failures = []
 
@@ -308,6 +308,7 @@ def test_workflow_dispatch_gate_restricts_bot_reruns():
 def test_code_grounded_checkout_and_tool_isolation():
     doc = load_yaml(".github", "workflows", "deep-review.yml")
     steps = steps_of(doc, "deep-review")
+    consume_steps = steps_of(doc, "deep-review-consume")
 
     checkouts = [s for s in steps if "actions/checkout" in str(s.get("uses", ""))]
     check(
@@ -350,7 +351,7 @@ def test_code_grounded_checkout_and_tool_isolation():
     for claude in llm_steps:
         dumped = yaml.safe_dump(claude)
         check(
-            "workflow: Claude action is pinned to the reviewed v1.0.161 commit",
+            "workflow: Claude action is pinned to the reviewed v1.0.178 commit",
             str(claude.get("uses", "")) == CLAUDE_ACTION_PIN,
         )
         check(
@@ -447,8 +448,8 @@ def test_code_grounded_checkout_and_tool_isolation():
     # The verdict is posted by the workflow (default token), not by Claude.
     dr = read(".github", "workflows", "claude-model.yml")
     check(
-        "workflow: Claude action pin keeps the v1.0.161 breadcrumb",
-        f"uses: {CLAUDE_ACTION_PIN} # v1.0.161" in dr,
+        "workflow: Claude action pin keeps the v1.0.178 breadcrumb",
+        f"uses: {CLAUDE_ACTION_PIN} # v1.0.178" in dr,
     )
     trusted = step_by_id(steps, "trusted-src")
     check("workflow: trusted source snapshot step exists", trusted is not None)
@@ -470,10 +471,23 @@ def test_code_grounded_checkout_and_tool_isolation():
             and 'echo "safe_path=$safe_path"' in trusted_run,
         )
     post = next(
-        (s for s in steps if "post the verdict" in str(s.get("name", "")).lower()), None
+        (
+            s
+            for s in consume_steps
+            if "post the verdict" in str(s.get("name", "")).lower()
+        ),
+        None,
     )
     check("workflow: verdict.md handoff is gone", "verdict.md" not in dr)
     check("workflow: a trusted post step exists", post is not None)
+    post_freshness = step_by_id(consume_steps, "post-model-freshness")
+    check("workflow: post-model freshness step exists", post_freshness is not None)
+    if post_freshness:
+        check(
+            "workflow: post-model projection preserves the pre-model stale gate",
+            str(post_freshness.get("if", ""))
+            == "${{ needs.deep-review.outputs.pre_model_fresh == 'true' }}",
+        )
     if post:
         env = yaml.safe_dump(post.get("env", {}))
         run = str(post.get("run", ""))
@@ -504,7 +518,7 @@ def test_code_grounded_checkout_and_tool_isolation():
         check(
             "workflow: post step consumes normalized Claude AgentResult",
             "EXECUTION_FILE" in env
-            and "steps.claude-model.outputs.result" in env
+            and "steps.claude-result.outputs.result" in env
             and "steps.claude_search.outputs.execution_file" not in env
             and "steps.claude.outputs.execution_file" not in env,
         )
@@ -513,26 +527,28 @@ def test_code_grounded_checkout_and_tool_isolation():
             "result_text" in run,
         )
         check(
-            "workflow: post step can fall back to last assistant text",
-            'event.get("type") == "assistant"' in run
-            and 'item.get("type") == "text"' in run,
+            "workflow: post step accepts only the normalized result",
+            'event.get("type") == "assistant"' not in run
+            and "result_text(path, require_success=True)" in run,
         )
         check(
             "workflow: no-output fallback still posts and fails clearly",
             "Deep review ran but produced no verdict (see the workflow run logs)."
             in run
-            and "json.JSONDecodeError" in run
             and "failed = True" in run
             and "sys.exit(1)" in run,
         )
         check(
-            "workflow: trusted post step comments via gh, not Claude",
-            '["gh", "issue", "comment"' in run,
+            "workflow: trusted post step updates its durable claim via gh, not Claude",
+            '"gh"' in run
+            and '"api"' in run
+            and '"PATCH"' in run
+            and "CLAIM_MARKER" in run,
         )
         check(
             "workflow: post step carries the deterministic target slug for ref qualification",
             "TARGET_REPO" in env
-            and "steps.resolve.outputs.repo" in env
+            and "needs.deep-review.outputs.repo" in env
             and "GITHUB_REPOSITORY_OWNER" in env
             and "github.repository_owner" in env,
         )
@@ -548,7 +564,7 @@ def test_code_grounded_checkout_and_tool_isolation():
         )
         label_idx = run.find("cards.label_automated_status_lines(verdict)")
         qualify_idx = run.find("core.qualify_issue_refs(")
-        post_idx = run.find('["gh", "issue", "comment"')
+        post_idx = run.find('"PATCH"')
         check(
             "workflow: automated status labels are applied before ref qualification",
             label_idx != -1 and qualify_idx != -1 and label_idx < qualify_idx,
@@ -560,7 +576,7 @@ def test_code_grounded_checkout_and_tool_isolation():
     trusted_i = step_index(steps, lambda s: s.get("id") == "trusted-src")
     claude_indexes = [step_index(steps, lambda step: step.get("id") == "claude-model")]
     post_i = step_index(
-        steps,
+        consume_steps,
         lambda s: "post the verdict" in str(s.get("name", "")).lower(),
     )
     check(
@@ -572,8 +588,9 @@ def test_code_grounded_checkout_and_tool_isolation():
     check(
         "workflow: trusted post runs after Claude",
         post_i is not None
-        and claude_indexes
-        and all(i < post_i for i in claude_indexes),
+        and doc["jobs"]["deep-model"].get("uses")
+        == "./.github/workflows/claude-model.yml"
+        and "deep-model" in doc["jobs"]["deep-review-consume"].get("needs", []),
     )
 
 
@@ -752,6 +769,40 @@ def test_workflow_dispatch_uses_immutable_target_inputs():
     )
 
 
+def test_source_policy_is_revalidated_at_model_admission():
+    doc = load_yaml(".github", "workflows", "deep-review.yml")
+    steps = steps_of(doc, "deep-review")
+    ids = ("verify_head", "final-source-policy", "event-claim", "claude-task")
+    indexes = {
+        step_id: step_index(steps, lambda step, wanted=step_id: step.get("id") == wanted)
+        for step_id in ids
+    }
+    policy = next((step for step in steps if step.get("id") == "final-source-policy"), None)
+    claim = next((step for step in steps if step.get("id") == "event-claim"), None)
+    check(
+        "source policy: checkout head and permission precede claim and task",
+        None not in indexes.values()
+        and indexes["verify_head"]
+        < indexes["final-source-policy"]
+        < indexes["event-claim"]
+        < indexes["claude-task"],
+    )
+    check(
+        "source policy: final permission read binds the resolved revision",
+        policy is not None
+        and (policy.get("env") or {}).get("GH_TOKEN")
+        == "${{ secrets.FLEET_TOKEN }}"
+        and (policy.get("env") or {}).get("HEAD_SHA")
+        == "${{ steps.resolve.outputs.revision }}",
+    )
+    check(
+        "source policy: denied final evidence cannot claim model spend",
+        claim is not None
+        and str(claim.get("if", ""))
+        == "steps.final-source-policy.outputs.admitted == 'true'",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # investigate trigger wiring in the decision handler
 # --------------------------------------------------------------------------- #
@@ -761,6 +812,7 @@ def test_handler_investigate_wiring():
     top_perms = doc.get("permissions") or {}
     handle = doc["jobs"]["handle"]
     dispatch = doc["jobs"].get("investigate-dispatch")
+    nl_repair_prepare = doc["jobs"].get("nl-repair-prepare")
 
     check(
         "handler: workflow scope does NOT grant actions: write",
@@ -777,7 +829,12 @@ def test_handler_investigate_wiring():
     ]
     check(
         "handler: only trusted dispatching jobs have actions: write",
-        action_jobs == ["handle", "investigate-dispatch"],
+        action_jobs == ["handle", "nl-repair-prepare", "investigate-dispatch"],
+    )
+    check(
+        "handler: NL repair preparation has only dispatch, card, and read permissions",
+        (nl_repair_prepare or {}).get("permissions")
+        == {"actions": "write", "contents": "read", "issues": "write"},
     )
     check("handler: investigate dispatch job exists", dispatch is not None)
 
@@ -888,6 +945,7 @@ def main():
     test_code_grounded_checkout_and_tool_isolation()
     test_prompt_treats_card_body_as_untrusted_data()
     test_workflow_dispatch_uses_immutable_target_inputs()
+    test_source_policy_is_revalidated_at_model_admission()
     test_handler_investigate_wiring()
     print()
     if _failures:

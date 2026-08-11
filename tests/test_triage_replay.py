@@ -1,0 +1,5188 @@
+#!/usr/bin/env python3
+"""Offline regression coverage for the inert bounded triage replay path."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import hashlib
+import json
+import os
+import tempfile
+from contextlib import contextmanager, nullcontext, redirect_stdout
+from io import StringIO
+from pathlib import Path
+import sys
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+INCIDENT_OWNER = "kunchenguid"
+INCIDENT_REPO = "no-mistakes"
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
+
+from scripts import agent_claim  # noqa: E402
+import render_card as rc  # noqa: E402
+import triage_replay as replay  # noqa: E402
+import test_auto_triage as option_b_fixtures  # noqa: E402
+
+# Replay tests exercise exact-revision lifecycle behavior; the atomic
+# evaluator/write integration has dedicated coverage in test_automerge_card_ui.py.
+rc._evaluate_automerge_card_projection = lambda *args, **kwargs: (
+    rc.criteria_schema.unavailable_criteria("offline replay fixture")
+)
+
+
+@contextmanager
+def patched(module, replacements):
+    originals = {name: getattr(module, name) for name in replacements}
+    for name, value in replacements.items():
+        setattr(module, name, value)
+    try:
+        yield
+    finally:
+        for name, value in originals.items():
+            setattr(module, name, value)
+
+
+def base_item(number=17, kind="pr-review", revision="abcdef1", repo="wheelhouse"):
+    return {
+        "repo": repo,
+        "number": number,
+        "kind": kind,
+        "head_sha": revision if kind == "pr-review" else "",
+        "updated_at": revision if kind == "issue-triage" else "2026-07-16T10:00:00Z",
+        "title": "Replay this exact source",
+        "author": "contributor",
+        "bucket": "merge-ready" if kind == "pr-review" else "issue-triage",
+        "comp": "pass" if kind == "pr-review" else "n/a",
+        "tests": "green" if kind == "pr-review" else "n/a",
+        "url": "https://github.com/example/%s/pull/%s" % (repo, number),
+        "summary": "offline replay fixture",
+        "recommendation": "Review it.",
+        "priority": "med",
+        "auto_triage": True,
+        "auto_triage_issues": True,
+        "triage_attempt_cap_per_revision": 2,
+    }
+
+
+def source(
+    number=17,
+    kind="pr-review",
+    revision="abcdef1",
+    state="open",
+    author_login="contributor",
+    author_type="User",
+):
+    value = {
+        "number": number,
+        "state": state,
+        "title": "Replay this exact source",
+        "html_url": "https://github.com/example/wheelhouse/pull/%s" % number,
+        "updated_at": "2026-07-16T10:00:00Z",
+        "user": {"login": author_login, "type": author_type},
+    }
+    if kind == "pr-review":
+        value["head"] = {"sha": revision}
+    else:
+        value["updated_at"] = revision
+    return value
+
+
+def card(
+    number=42,
+    target=17,
+    kind="pr-review",
+    revision="abcdef1",
+    status="error",
+    repo="wheelhouse",
+):
+    candidate = base_item(target, kind, revision, repo=repo)
+    rendered = rc.render(candidate)
+    body = rendered["body"]
+    state = rc._unique_state_block(body)
+    if status is None:
+        pass
+    else:
+        state = rc._state_with_triage(
+            state,
+            revision,
+            status,
+            error="structural triage failure" if status == "error" else None,
+        )
+        body = rc._replace_state_block(body, state)
+    return {
+        "number": number,
+        "title": rendered["title"],
+        "body": body,
+        "labels": [{"name": name} for name in rendered["labels"]],
+        "state": "OPEN",
+        "updatedAt": "2026-07-16T10:01:00Z",
+        "author": {"login": rc.CARD_AUTOMATION_AUTHOR},
+        "comments": [],
+    }
+
+
+def config():
+    return {
+        "repos": {
+            "wheelhouse": {"name": "wheelhouse"},
+            "no-mistakes": {"name": "no-mistakes"},
+        },
+        "maintainer": "co-maintainer",
+        "auto_triage": True,
+        "auto_triage_issues": True,
+        "triage_attempt_cap_per_revision": 2,
+        "triage_attempt_caps": {"wheelhouse": 2, "no-mistakes": 2},
+        "triage_daily_ceiling": 1200,
+    }
+
+
+@contextmanager
+def replay_environment(
+    cards,
+    sources,
+    remaining=1200,
+    stub_queue=True,
+    stub_claim=True,
+    card_read_hook=None,
+    incident_binding_reason="",
+    incident_prior_evidence_reason="",
+    has_readonly_token=False,
+    prior_claim_action=None,
+    repository_owner="owner",
+    edit_error=None,
+    queue_error=None,
+    dispatch_error=None,
+):
+    card_reads = []
+    source_reads = []
+    edits = []
+    queued = []
+    dispatched = []
+    claims = []
+    events = []
+    preflighted_claims = {}
+
+    def get_card(number):
+        card_reads.append(number)
+        if card_read_hook is not None:
+            card_read_hook(number, len(card_reads), cards)
+        value = cards.get(number)
+        return copy.deepcopy(value) if value is not None else None
+
+    def edit(number, body, remove_labels=None):
+        events.append("marker-write")
+        if edit_error is not None:
+            raise edit_error
+        edits.append((number, body))
+        cards[number]["body"] = body
+        cards[number]["updatedAt"] = "2026-07-16T10:02:00Z"
+
+    def source_read(owner, repo, number, kind):
+        source_reads.append((owner, repo, number, kind))
+        value = sources.get((repo, number, kind))
+        if isinstance(value, Exception):
+            raise value
+        return copy.deepcopy(value)
+
+    def mark(number, item, body, prepare_body=None, publish_budget_deferral=True):
+        events.append("queue")
+        if queue_error is not None:
+            raise queue_error
+        queued.append((number, item["repo"], item["number"]))
+        body = prepare_body(body) if prepare_body else body
+        new_body = rc.body_with_triage_queued(body, item, attempt_cap=2)
+        assert new_body != body
+        edits.append((number, new_body))
+        cards[number]["body"] = new_body
+        return object()
+
+    def dispatch(permit):
+        events.append("dispatch")
+        dispatched.append(permit)
+        if dispatch_error is not None:
+            raise dispatch_error
+
+    replacements = {
+        "get_card": get_card,
+        "_edit_issue_body": edit,
+        "triage_budget_remaining": lambda ceiling: min(remaining, ceiling),
+        "auto_triage_has_token": lambda: True,
+        "dispatch_triage_workflow": dispatch,
+    }
+    if stub_queue:
+        replacements["mark_triage_queued"] = mark
+    old_env = dict(os.environ)
+    os.environ.update(
+        {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REPOSITORY_OWNER": repository_owner,
+            "GITHUB_REPOSITORY": "%s/wheelhouse" % repository_owner,
+            "GITHUB_ACTOR": repository_owner,
+            "GITHUB_RUN_NUMBER": "77",
+            "WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN": "true",
+            "WHEELHOUSE_AUTO_TRIAGE_HAS_READONLY_TOKEN": (
+                "true" if has_readonly_token else "false"
+            ),
+        }
+    )
+    try:
+
+        def _mirror_tombstone(issue, comment_id, event_key, body=None):
+            card = cards.get(issue)
+            if card is None:
+                return
+            if body is None:
+                marker = replay.agent_claim.triage_claim_superseded_marker(
+                    event_key, "2026-07-16T09:00:00Z"
+                )
+                body = (
+                    "Agent triage event finished with consumer.committed. %s\n\n"
+                    "Superseded by an operator-approved exact-revision "
+                    "auto-triage replay." % marker
+                )
+            comments = [
+                row
+                for row in list(card.get("comments") or [])
+                if replay._issue_comment_database_id(row) != comment_id
+            ]
+            comments.append(
+                {
+                    "id": "IC_test_%s" % comment_id,
+                    "url": (
+                        "https://github.com/owner/wheelhouse/issues/%s"
+                        "#issuecomment-%s" % (issue, comment_id)
+                    ),
+                    "author": {"login": "github-actions"},
+                    "body": body,
+                    "createdAt": "2026-07-16T09:00:00Z",
+                    "updatedAt": "2026-07-16T11:00:00Z",
+                }
+            )
+            card["comments"] = comments
+            card["updatedAt"] = "2026-07-16T11:00:00Z"
+
+        def recovery_state(**kwargs):
+            expected_action = prior_claim_action or (
+                "triage.pr.search" if has_readonly_token else "triage.pr.local"
+            )
+            if kwargs["action"] != expected_action:
+                identity = replay.agent_claim.normalized_event_identity(
+                    action=kwargs["action"],
+                    owner=kwargs["owner"],
+                    repo=kwargs["repo"],
+                    number=kwargs["number"],
+                    card_issue=kwargs["issue"],
+                    revision=kwargs["revision"],
+                    review_context=kwargs.get("review_context", ""),
+                )
+                return {
+                    "event_key": replay.agent_claim.event_key_sha256(identity),
+                    "status": "missing",
+                }
+            identity = replay.agent_claim.normalized_event_identity(
+                action=kwargs["action"],
+                owner=kwargs["owner"],
+                repo=kwargs["repo"],
+                number=kwargs["number"],
+                card_issue=kwargs["issue"],
+                revision=kwargs["revision"],
+                review_context=kwargs.get("review_context", ""),
+            )
+            event_key = replay.agent_claim.event_key_sha256(identity)
+            comment_id = 9000 + int(kwargs["issue"])
+            preflighted_claims[kwargs["issue"]] = (event_key, comment_id)
+            return {
+                "event_key": event_key,
+                "status": "active",
+                "claim": {"id": comment_id, "body": "trusted active claim"},
+            }
+
+        def supersede(**kwargs):
+            events.append("tombstone")
+            claims.append(kwargs)
+            identity = replay.agent_claim.normalized_event_identity(
+                action=kwargs["action"],
+                owner=kwargs["owner"],
+                repo=kwargs["repo"],
+                number=kwargs["number"],
+                card_issue=kwargs["issue"],
+                revision=kwargs["revision"],
+                review_context=kwargs.get("review_context", ""),
+            )
+            event_key = replay.agent_claim.event_key_sha256(identity)
+            superseded = (
+                kwargs["issue"] == replay.CARD_1585_INCIDENT_PERMIT["card"]
+                or preflighted_claims.get(kwargs["issue"], (None,))[0] == event_key
+            )
+            result = {"event_key": event_key, "superseded": superseded}
+            if superseded:
+                comment_id = 9000 + int(kwargs["issue"])
+                result["comment_id"] = comment_id
+                _mirror_tombstone(kwargs["issue"], comment_id, event_key)
+            return result
+
+        original_supersede = replay.agent_claim.supersede_triage_claim
+
+        def supersede_live(**kwargs):
+            events.append("tombstone")
+            claims.append(kwargs)
+            result = original_supersede(**kwargs)
+            if result.get("superseded") is True:
+                _mirror_tombstone(
+                    kwargs["issue"],
+                    result["comment_id"],
+                    result["event_key"],
+                    body=result.get("body"),
+                )
+            return result
+
+        claim_patches = {
+            "supersede_triage_claim": supersede if stub_claim else supersede_live,
+        }
+        if stub_claim:
+            claim_patches["triage_claim_recovery_state"] = recovery_state
+            claim_patches["triage_replay_duplicate_only_evidence"] = (
+                lambda **kwargs: False
+            )
+        claim_context = patched(replay.agent_claim, claim_patches)
+        with (
+            patched(rc, replacements),
+            patched(
+                replay,
+                {
+                    "_source_json": source_read,
+                    "_incident_source_binding_reason": (
+                        lambda owner, repo, number, kind, permit, before: (
+                            incident_binding_reason
+                        )
+                    ),
+                    "_incident_prior_evidence_reason": (
+                        lambda owner, permit: incident_prior_evidence_reason
+                    ),
+                    # Legacy replay fixtures predate v2 ReviewObservation.
+                    # The production helper is separately exercised with an
+                    # authoritative projected card; preserve these focused
+                    # replay-state tests' old identity shape.
+                    "_current_pr_review_context": (
+                        lambda owner, repo, number, revision, state, source: (
+                            {
+                                "repo": repo,
+                                "number": number,
+                                "kind": "pr-review",
+                                "head_sha": revision,
+                                "base_sha": "b" * 40,
+                                "automerge_vision_sha": "",
+                            },
+                            None,
+                            "" if repo == "no-mistakes" else "a" * 64,
+                            "",
+                        )
+                    ),
+                },
+            ),
+            patched(replay.core, {"load_config": config}),
+            claim_context,
+        ):
+            yield {
+                "card_reads": card_reads,
+                "source_reads": source_reads,
+                "edits": edits,
+                "queued": queued,
+                "dispatched": dispatched,
+                "claims": claims,
+                "events": events,
+            }
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+def cards_file(numbers):
+    handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(
+        [{"number": number, "body": "untrusted listing data"} for number in numbers],
+        handle,
+    )
+    handle.close()
+    return handle.name
+
+
+def exact_fixture(numbers):
+    cards = {}
+    sources = {}
+    revisions = {}
+    for number in numbers:
+        revision = "%07x" % number
+        target = number + 20_000
+        cards[number] = card(number=number, target=target, revision=revision)
+        sources[("wheelhouse", target, "pr-review")] = source(
+            number=target, revision=revision
+        )
+        revisions[number] = revision
+    return cards, sources, revisions
+
+
+def exact_plan_lines(output):
+    return [
+        line
+        for line in output.splitlines()
+        if line.startswith("replay exact-selector/v1 admitted card #")
+    ]
+
+
+def attempt_reset_fixture(cohort=None):
+    cohort = cohort or replay.ATTEMPT_RESET_COHORT
+    cards = {}
+    sources = {}
+    for card_number, prior_marker in sorted(cohort.items()):
+        revision = prior_marker["revision"]
+        kind = "issue-triage" if revision.endswith("Z") else "pr-review"
+        target = card_number + 10_000
+        value = card(
+            number=card_number,
+            target=target,
+            kind=kind,
+            revision=revision,
+        )
+        state = rc._unique_state_block(value["body"])
+        state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+            "version": rc.TRIAGE_ATTEMPTS_VERSION,
+            "kind": kind,
+            "revision": revision,
+            "count": 2,
+        }
+        state[replay.REPLAY_FIELD] = dict(prior_marker)
+        value["body"] = rc._replace_state_block(value["body"], state)
+        cards[card_number] = value
+        sources[("wheelhouse", target, kind)] = source(
+            number=target,
+            kind=kind,
+            revision=revision,
+        )
+    supplied = ",".join(str(number) for number in sorted(cards))
+    return cards, sources, supplied
+
+
+def card_1585_incident_fixture():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    binding = permit["source_binding"]
+    card_number = permit["card"]
+    revision = binding["target_head_sha"]
+    value = card(
+        number=card_number,
+        target=binding["number"],
+        kind=permit["kind"],
+        revision=revision,
+        repo=INCIDENT_REPO,
+    )
+    state = rc._unique_state_block(value["body"])
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": permit["kind"],
+        "revision": revision,
+        "count": 2,
+    }
+    state[replay.REPLAY_FIELD] = copy.deepcopy(permit["prior_marker"])
+    value["body"] = rc._replace_state_block(value["body"], state)
+    target = source(number=binding["number"], revision=revision)
+    return (
+        {card_number: value},
+        {(INCIDENT_REPO, binding["number"], permit["kind"]): target},
+    )
+
+
+def assert_card_1585_incident_second_use_rejected(path, permit, selector):
+    try:
+        replay.run(path, permit["wave"], 1, exact_cards=selector)
+    except ValueError as error:
+        assert "requested card(s) failed validation" in str(error)
+    else:
+        raise AssertionError("consumed incident permit was reused")
+
+
+def assert_card_1585_residual_state_is_scheduler_inert(cards, permit):
+    binding = permit["source_binding"]
+    item = {
+        "repo": INCIDENT_REPO,
+        "number": binding["number"],
+        "kind": permit["kind"],
+        "head_sha": binding["target_head_sha"],
+        "updated_at": "",
+        "auto_triage": True,
+    }
+    row = replay.reconcile.current_card({"number": permit["card"]})
+    assert row is not None
+    assert not replay.reconcile.maybe_queue_auto_triage(
+        item,
+        row,
+        True,
+        owner="kunchenguid",
+        publish_budget_deferral=False,
+    )
+
+
+# Production shape of the card #1746/#1704 class: a `succeeded` triage cache
+# whose trusted primary result failed, whose delivered candidate was consumed
+# only as advisory prose, and which therefore carries no admitted assessment
+# and no authority-bearing recommendation.
+ADVISORY_REVISION = "91be95d3584cbcfe3322d0f7827e1224ccb999cc"
+
+
+def advisory_payload(state, basis_kind, check_names=None):
+    basis = {
+        "kind": basis_kind,
+        "observation_id": state["review_observation"]["observation_id"],
+        "context_id": state["decision_context"]["context_id"],
+    }
+    if check_names is not None:
+        basis["check_names"] = list(check_names)
+    return {
+        "summary": "Straight chore pin bump.",
+        "product_implications": "No product behavior changes.",
+        "recommended_action": "merge",
+        "recommended_reason": "Compliance and tests are green.",
+        "evidence": "target.txt: 'chore(ci): bump pinned Treehouse'",
+        "recommendation_basis": basis,
+        "automerge": {
+            "behavior_class": "A",
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": False,
+        },
+    }
+
+
+def advisory_card(
+    number=1746,
+    target=1089,
+    revision=ADVISORY_REVISION,
+    basis_kind="configured-tests",
+    check_names=("tests",),
+    primary_error_code="output.schema_invalid",
+):
+    """Build a real card body through the production result writer.
+
+    ``basis_kind="configured-tests"`` is the exact invented kind observed on
+    card #1746, so admission denies it as `basis.missing_or_invalid`.
+    ``basis_kind="other"`` reproduces the card #1739 control, whose advisory
+    result still produced a current admitted assessment.
+    """
+    item = option_b_fixtures.option_b_item(number=target, head_sha=revision)
+    rendered = rc.render(item)
+    body = rendered["body"]
+    body = rc.body_with_triage_result(
+        body,
+        revision,
+        triage=advisory_payload(
+            rc._unique_state_block(body), basis_kind, check_names
+        ),
+        owner="owner",
+        primary_error_code=primary_error_code,
+    )
+    state = rc._unique_state_block(body)
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": revision,
+        "count": 1,
+    }
+    body = rc._replace_state_block(body, state)
+    return {
+        "number": number,
+        "title": rendered["title"],
+        "body": body,
+        "labels": [{"name": name} for name in rendered["labels"]],
+        "state": "OPEN",
+        "updatedAt": "2026-07-27T00:35:01Z",
+        "author": {"login": rc.CARD_AUTOMATION_AUTHOR},
+        "comments": [],
+    }, item
+
+
+def advisory_environment(value, item, revision=ADVISORY_REVISION, **options):
+    return replay_environment(
+        {value["number"]: value},
+        {
+            # Both kinds are registered so a kind-mutated fixture still reads a
+            # live source and is refused on its state, not on a missing read.
+            (item["repo"], item["number"], kind): source(
+                number=item["number"], kind=kind, revision=revision
+            )
+            for kind in ("pr-review", "issue-triage")
+        },
+        **options,
+    )
+
+
+def advisory_plan(
+    value,
+    item,
+    selector=None,
+    dry_run=True,
+    wave="advisory-wave",
+    revision=ADVISORY_REVISION,
+):
+    """Run one exact-selector replay over a single advisory-class card."""
+    selector = "v1:%s" % value["number"] if selector is None else selector
+    path = cards_file([value["number"]])
+    output = StringIO()
+    try:
+        with (
+            advisory_environment(value, item, revision=revision) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                result = replay.run(
+                    path,
+                    wave,
+                    1,
+                    dry_run=dry_run,
+                    exact_cards=selector,
+                )
+                error = ""
+            except ValueError as failure:
+                result, error = None, str(failure)
+            return {
+                "result": result,
+                "error": error,
+                "output": output.getvalue(),
+                "calls": dict(calls),
+                "body": value["body"],
+            }
+    finally:
+        os.unlink(path)
+
+
+def advisory_refusal(value, item, **kwargs):
+    run = advisory_plan(value, item, **kwargs)
+    assert run["result"] is None, run["output"]
+    assert not run["calls"]["edits"] and not run["calls"]["queued"]
+    reasons = [
+        line.split(": ")[-1]
+        for line in run["output"].splitlines()
+        if "refused card #" in line
+    ]
+    assert len(reasons) == 1, run["output"]
+    return reasons[0]
+
+
+def test_advisory_cache_recovers_only_through_the_exact_card_selector():
+    value, item = advisory_card()
+    state = rc._unique_state_block(value["body"])
+    # The fixture is the production shape, proven field by field.
+    assert state["triage_status"] == "succeeded"
+    assert state[rc.TRIAGE_PRIMARY_STATUS_FIELD] == "failed"
+    assert state[rc.TRIAGE_PRIMARY_ERROR_FIELD] == "output.schema_invalid"
+    assert state[rc.TRIAGE_CONSUMPTION_FIELD] == "advisory"
+    assert state["assessment_admission"] == {
+        "status": "unavailable",
+        "reason": "basis.missing_or_invalid",
+    }
+    assert rc.ASSESSMENT_FIELD not in state
+    assert "triage_recommendation" not in state
+    assert not rc.accept_recommendation_available(state)
+
+    run = advisory_plan(value, item)
+    assert run["result"] == {
+        "eligible": 1,
+        "planned": 1,
+        "deferred": 0,
+        "written": 0,
+    }
+    assert "clear=advisory" in run["output"]
+    assert (
+        "advisory-recovery basis: primary=failed(output.schema_invalid) "
+        "consumption=advisory admission=unavailable/basis.missing_or_invalid "
+        "assessment=none recommendation=none" in run["output"]
+    )
+    assert "writes=0" in run["output"]
+    # Dry-run is zero-write: no body edit, no queue, no dispatch, no claim.
+    assert run["body"] == value["body"]
+    for channel in ("edits", "queued", "dispatched", "claims"):
+        assert not run["calls"][channel], channel
+
+    # Generic (non-exact) discovery can never select this class.
+    generic = advisory_plan(value, item, selector="")
+    assert generic["result"] == {
+        "eligible": 0,
+        "planned": 0,
+        "deferred": 0,
+        "written": 0,
+    }
+    assert '{"triage-cache-not-terminal-error":1}' in generic["output"]
+    assert generic["body"] == value["body"]
+
+    # The attempt-reset cohorts and the incident permit are separate
+    # capabilities that still require a terminal error cache.
+    with advisory_environment(value, item):
+        plan, reason = replay.inspect_candidate(
+            value["number"],
+            config(),
+            "owner",
+            True,
+            attempt_reset=replay._attempt_reset_prior_marker(
+                ADVISORY_REVISION, replay.ATTEMPT_RESET_WAVE, 1, "2026-07-27T00:00:00Z"
+            ),
+            attempt_reset_wave=replay.ATTEMPT_RESET_WAVE,
+            exact_selected=True,
+        )
+    assert plan is None and reason == "attempt-reset-prior-marker-mismatch", reason
+
+
+def test_advisory_cache_write_run_clears_only_the_dead_advisory_state():
+    value, item = advisory_card()
+    before = rc._unique_state_block(value["body"])
+    path = cards_file([value["number"]])
+    try:
+        output = StringIO()
+        with (
+            advisory_environment(value, item) as calls,
+            redirect_stdout(output),
+        ):
+            result = replay.run(
+                path,
+                "advisory-write-wave",
+                1,
+                exact_cards="v1:%s" % value["number"],
+            )
+    finally:
+        os.unlink(path)
+    assert result == {
+        "eligible": 1,
+        "planned": 1,
+        "deferred": 0,
+        "written": 1,
+        "queued": 1,
+    }
+    state = rc._unique_state_block(value["body"])
+    marker = state[replay.REPLAY_FIELD]
+    assert marker["version"] == replay.REPLAY_VERSION
+    assert marker["cleared"] == replay.ADVISORY_RECOVERY_CLEARED
+    assert marker["revision"] == ADVISORY_REVISION
+    # A fresh, spend-guarded attempt is queued for the same exact revision.
+    assert state["triage_status"] == "queued"
+    assert state["triaged_sha"] == ADVISORY_REVISION
+    assert state["triage_attempts"] == {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": ADVISORY_REVISION,
+        "count": before["triage_attempts"]["count"] + 1,
+    }
+    # The dead advisory telemetry and denied admission record are gone; no
+    # authority was synthesized from the old prose or delivered candidate.
+    for field in replay.TRIAGE_ADVISORY_CACHE_FIELDS:
+        if field in {"triaged_sha", "triage_status"}:
+            continue
+        assert field not in state, field
+    assert "Straight chore pin bump" not in value["body"]
+    assert not rc.accept_recommendation_available(state)
+    # Deterministic identity, observation, and context are untouched.
+    for field in ("head_sha", "review_observation", "decision_context", "repo"):
+        assert state[field] == before[field]
+    assert len(calls["queued"]) == len(calls["dispatched"]) == 1
+    assert calls["claims"] and calls["claims"][0]["revision"] == ADVISORY_REVISION
+    # One exact card only, and the recovered card is not replayable again.
+    assert set(calls["card_reads"]) == {value["number"]}
+    second = advisory_plan(value, item, wave="advisory-second-wave")
+    assert second["result"] is None
+    assert "already-replayed" in second["output"]
+
+
+def test_advisory_recovery_refuses_every_disconfirming_shape():
+    control, control_item = advisory_card(
+        number=1739, target=1080, basis_kind="other", check_names=None
+    )
+    control_state = rc._unique_state_block(control["body"])
+    # Card #1739: the same schema-invalid primary, but its advisory result
+    # still produced a current admitted assessment and a merge recommendation.
+    assert control_state[rc.TRIAGE_PRIMARY_ERROR_FIELD] == "output.schema_invalid"
+    assert control_state[rc.TRIAGE_CONSUMPTION_FIELD] == "advisory"
+    assert rc.assessment_current_admitted(control_state)
+    assert control_state["triage_recommendation"]["action"] == "merge"
+    assert (
+        advisory_refusal(control, control_item) == "advisory-recovery-authority-present"
+    )
+
+    ordinary, ordinary_item = advisory_card(
+        number=1744, target=1090, basis_kind="other", check_names=None,
+        primary_error_code="",
+    )
+    ordinary_state = rc._unique_state_block(ordinary["body"])
+    assert ordinary_state[rc.TRIAGE_PRIMARY_STATUS_FIELD] == "succeeded"
+    assert ordinary_state[rc.TRIAGE_CONSUMPTION_FIELD] == "primary"
+    assert rc.assessment_current_admitted(ordinary_state)
+    assert advisory_refusal(ordinary, ordinary_item) == (
+        "advisory-recovery-primary-not-failed"
+    )
+
+    value, item = advisory_card()
+    mutations = {
+        "advisory-recovery-primary-not-failed": (
+            lambda state: state.pop(rc.TRIAGE_PRIMARY_STATUS_FIELD),
+            lambda state: state.__setitem__(rc.TRIAGE_PRIMARY_STATUS_FIELD, "succeeded"),
+            lambda state: state.pop(rc.TRIAGE_PRIMARY_ERROR_FIELD),
+            lambda state: state.__setitem__(rc.TRIAGE_PRIMARY_ERROR_FIELD, ""),
+            lambda state: state.__setitem__(
+                rc.TRIAGE_PRIMARY_ERROR_FIELD, "not a bounded code"
+            ),
+        ),
+        "advisory-recovery-consumption-not-advisory": (
+            lambda state: state.pop(rc.TRIAGE_CONSUMPTION_FIELD),
+            lambda state: state.__setitem__(rc.TRIAGE_CONSUMPTION_FIELD, "primary"),
+        ),
+        "advisory-recovery-admission-unproven": (
+            lambda state: state.pop("assessment_admission"),
+            lambda state: state.__setitem__("assessment_admission", "unavailable"),
+            lambda state: state.__setitem__(
+                "assessment_admission", {"status": "admitted", "reason": "admission.ok"}
+            ),
+            lambda state: state.__setitem__(
+                "assessment_admission",
+                {"status": "unavailable", "reason": "basis.missing_or_invalid",
+                 "extra": True},
+            ),
+            lambda state: state.__setitem__(
+                "assessment_admission", {"status": "bogus", "reason": "x"}
+            ),
+            lambda state: state.__setitem__(
+                "assessment_admission",
+                {"status": "unavailable", "reason": "Basis Missing"},
+            ),
+            lambda state: state.__setitem__(rc.ASSESSMENT_FIELD, {"forged": True}),
+        ),
+        "advisory-recovery-authority-present": (
+            lambda state: state.__setitem__(
+                "triage_recommendation", {"action": "merge", "reason": "green"}
+            ),
+        ),
+        "advisory-recovery-cache-unproven": (
+            lambda state: state.__setitem__("held", True),
+        ),
+    }
+    for expected, cases in mutations.items():
+        for index, mutate in enumerate(cases):
+            broken = with_state(value, mutate)
+            assert advisory_refusal(broken, item) == expected, (expected, index)
+
+    # The class is pr-review only: an issue-triage cache has no assessment
+    # admission to prove, so it can never enter the recovery route. (An
+    # issue-triage card is already refused upstream on its own revision shape,
+    # so the gate is asserted directly on the one owning predicate.)
+    proven = rc._unique_state_block(value["body"])
+    assert replay._advisory_recovery_refusal(proven, "pr-review", ADVISORY_REVISION) == ""
+    assert (
+        replay._advisory_recovery_refusal(
+            dict(proven, kind="issue-triage"), "issue-triage", ADVISORY_REVISION
+        )
+        == "advisory-recovery-kind-unsupported"
+    )
+    assert (
+        replay._advisory_recovery_refusal(proven, "pr-review", "deadbee")
+        == "advisory-recovery-cache-unproven"
+    )
+
+    # A moved target head still refuses before any recovery consideration.
+    moved = advisory_plan(value, item, selector="v1:%s" % value["number"])
+    assert moved["result"] is not None
+    stale = cards_file([value["number"]])
+    try:
+        output = StringIO()
+        with (
+            replay_environment(
+                {value["number"]: value},
+                {
+                    (item["repo"], item["number"], "pr-review"): source(
+                        number=item["number"], revision="f" * 40
+                    )
+                },
+            ) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                replay.run(
+                    stale,
+                    "advisory-stale-wave",
+                    1,
+                    dry_run=True,
+                    exact_cards="v1:%s" % value["number"],
+                )
+                raise AssertionError("a moved head must refuse")
+            except ValueError:
+                pass
+        assert "source-revision-moved" in output.getvalue()
+        assert not calls["edits"] and not calls["queued"]
+    finally:
+        os.unlink(stale)
+
+
+MISSING_OUTPUT_REVISION = "cf7f065de35b9e2931ec883ff650008b6ddfd39e"
+
+
+# Production shape of card #1584: a persisted ADMITTED assessment whose
+# observation binding drifted on an UNCHANGED head (a same-revision projection
+# refresh rotated `review_observation` while the head-keyed triage cache and
+# same-revision triage preservation carried the now-stale assessment and its
+# residual recommendation forward verbatim). Accept is off, G6 is unmet, the
+# advisory recovery class refuses as authority-present, and `triage_fresh`
+# blocks every automatic re-triage.
+DRIFT_REVISION = "cd10d1e97c4212b313c62b4045f22149bdee6b42"
+
+
+def drift_payload(state):
+    return {
+        "summary": "Adds opt-in forge_profiles routing.",
+        "product_implications": "Substantial new credential-routing mechanism.",
+        "recommended_action": "merge",
+        "recommended_reason": "Class C strictly opt-in; all checks green.",
+        "evidence": "target.txt: 'forge_profiles'",
+        "recommendation_basis": {
+            "kind": "other",
+            "observation_id": state["review_observation"]["observation_id"],
+            "context_id": state["decision_context"]["context_id"],
+            "check_names": [],
+        },
+        "automerge": {
+            "behavior_class": "C",
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": True,
+        },
+    }
+
+
+def _rotated_observation(
+    state, revision, *, owner=None, repo=None, number=None
+):
+    """Mint the next observation for the SAME head, mirroring the bulk-scan
+    rotation that made card #1584's admitted assessment non-current."""
+    old = state["review_observation"]
+    return rc.target_contracts.make_observation(
+        owner or old["target"]["owner"],
+        repo or old["target"]["repo"],
+        number or old["target"]["number"],
+        head_sha=revision,
+        base_sha=old["revision"]["base_sha"],
+        expected_head_sha=revision,
+        observed_at="2026-07-28T18:54:25Z",
+        source="bulk-scan",
+        completeness=old["completeness"],
+        facts={**old["facts"], "updated_at": "2026-07-27T09:21:55Z"},
+        changed_paths=old["changed_paths"],
+    )
+
+
+def drift_card(number=1584, target=548, revision=DRIFT_REVISION, rotate=True):
+    """Build card #1584's exact drifted shape through the production writers.
+
+    ``rotate=False`` returns the pre-rotation card (a current admitted
+    assessment with a live Accept control - the shape of the eight already
+    actionable cards), which the drift class must refuse.
+    """
+    item = option_b_fixtures.option_b_item(
+        repo="no-mistakes", number=target, head_sha=revision
+    )
+    rendered = rc.render(item)
+    body = rendered["body"]
+    state = rc._unique_state_block(body)
+    body = rc.body_with_triage_result(
+        body,
+        revision,
+        triage=drift_payload(state),
+        owner="owner",
+        base_sha=item["base_sha"],
+        primary_error_code="output.schema_invalid",
+    )
+    state = rc._unique_state_block(body)
+    # Before any rotation the result carries full authority, exactly like the
+    # eight already actionable cards from the nine-card census.
+    assert rc.assessment_current_admitted(state)
+    assert rc.accept_recommendation_available(state)
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": revision,
+        "count": 1,
+    }
+    if rotate:
+        # The same-revision projection refresh: rotate the observation and
+        # context on the unchanged head while every triage field is preserved.
+        new_observation = _rotated_observation(state, revision)
+        assert new_observation["observation_id"] != (
+            state["review_observation"]["observation_id"]
+        )
+        snapshot = rc.context_contracts.repository_snapshot(
+            [
+                {
+                    "owner": "o",
+                    "repo": item["repo"],
+                    "number": int(item["number"]),
+                    "head_sha": revision,
+                    "title": item["title"],
+                    "paths_complete": True,
+                    "paths": ["src/example.py"],
+                    "closing_complete": True,
+                    "closing_issues": [],
+                    "references_complete": True,
+                    "references": [],
+                    "card_issue": 0,
+                    "url": item["url"],
+                    "card_url": "",
+                }
+            ],
+            "2026-07-28T18:57:20Z",
+        )
+        new_context = rc.context_contracts.build_decision_context(
+            new_observation, snapshot
+        )
+        state["review_observation"] = new_observation
+        state["decision_context"] = new_context
+        state["decision_context_id"] = new_context["context_id"]
+    body = rc._replace_state_block(body, state)
+    return {
+        "number": number,
+        "title": rendered["title"],
+        "body": body,
+        "labels": [{"name": name} for name in rendered["labels"]],
+        "state": "OPEN",
+        "updatedAt": "2026-07-28T19:06:09Z",
+        "author": {"login": rc.CARD_AUTOMATION_AUTHOR},
+        "comments": [],
+    }, item
+
+
+def resigned_assessment(state, target=None, **field_changes):
+    """Re-sign a persisted assessment after changes so it still normalizes
+    (the id is tamper-evident, so a raw edit would not)."""
+    value = copy.deepcopy(state[rc.ASSESSMENT_FIELD])
+    value["target"].update(target or {})
+    value.update(field_changes)
+    value.pop("assessment_id")
+    value["assessment_id"] = replay.assessment_admission._identity("sha256:", value)
+    return value
+
+
+def test_observation_drift_refresh_recovers_only_through_the_exact_card_selector():
+    value, item = drift_card()
+    state = rc._unique_state_block(value["body"])
+    # The fixture is card #1584's production shape, proven field by field.
+    assert item["repo"] == "no-mistakes"
+    assert item["number"] == 548
+    assert state["triage_status"] == "succeeded"
+    assert state["triaged_sha"] == DRIFT_REVISION
+    assert state[rc.TRIAGE_PRIMARY_STATUS_FIELD] == "failed"
+    assert state[rc.TRIAGE_PRIMARY_ERROR_FIELD] == "output.schema_invalid"
+    assert state[rc.TRIAGE_CONSUMPTION_FIELD] == "advisory"
+    assessment = state[rc.ASSESSMENT_FIELD]
+    assert assessment["admission"]["status"] == "admitted"
+    assert assessment["target"]["head_sha"] == DRIFT_REVISION
+    assert (
+        assessment["target"]["observation_id"]
+        != state["review_observation"]["observation_id"]
+    )
+    assert not rc.assessment_current_admitted(state)
+    assert not rc.accept_recommendation_available(state)
+    assert state["triage_recommendation"]["action"] == "merge"
+    # Ordinary advisory replay remains unavailable for this authority-present
+    # card: the residual recommendation alone is authority residue.
+    assert replay._advisory_recovery_refusal(state, "pr-review", DRIFT_REVISION) == (
+        "advisory-recovery-authority-present"
+    )
+    # Production scan items carry the rotated observation. With that alignment,
+    # ordinary maintenance treats the head-keyed cache as stale so the shared
+    # queue path can reopen one spend-guarded attempt (card #1819).
+    aligned_item = dict(item)
+    aligned_item["target_observation"] = state["review_observation"]
+    aligned_item["review_observation"] = state["review_observation"]
+    aligned_item["decision_context"] = state["decision_context"]
+    assert rc.review_card_inputs_current(aligned_item, state)
+    assert rc.observation_drift_retriage_needed(aligned_item, state)
+    assert not rc.triage_fresh(aligned_item, state)
+    assert rc.should_auto_triage(
+        aligned_item, state, value["labels"], has_token=True
+    )
+    # A scan item still bound to the pre-rotation observation must not open
+    # ordinary spend against the rotated card (inputs / identity mismatch).
+    assert not rc.observation_drift_retriage_needed(item, state)
+    assert rc.triage_fresh(item, state)
+    assert not rc.should_auto_triage(item, state, value["labels"], has_token=True)
+
+    run = advisory_plan(value, item, revision=DRIFT_REVISION, wave="drift-wave")
+    assert run["error"] == "", run["output"]
+    assert run["result"] == {
+        "eligible": 1,
+        "planned": 1,
+        "deferred": 0,
+        "written": 0,
+    }
+    assert "clear=observation-drift" in run["output"]
+    assert (
+        "observation-drift basis: assessment=admitted head=current(%s)"
+        % DRIFT_REVISION[:12]
+        in run["output"]
+    )
+    assert "recommendation=residual attempts=1" in run["output"]
+    # The exact preview enumerates every planned card mutation and the model
+    # spend, and remains zero-write.
+    assert "planned card mutations" in run["output"]
+    assert "triage_attempts 1->2" in run["output"]
+    for effect in (
+        "queued Triage section",
+        "triaged_base_sha=",
+        "triaged_vision_sha=",
+        "reconcile-absence state plus lifecycle projection",
+        "activity_reflected_at",
+        "recomputes derived options",
+        "removing Accept recommendation while queued",
+        "Recommended action section",
+        "visible Auto-merge criteria checklist",
+        "automerge_criteria_version/automerge_criteria",
+    ):
+        assert effect in run["output"], effect
+    assert "if the exact prior triage claim comment exists" in run["output"]
+    assert "PATCH that existing bot comment" in run["output"]
+    assert "when the exact prior claim exists" in run["output"]
+    for downstream in (
+        "POSTs a new exact-event primary claim comment before model spend",
+        "may PATCH it early if target freshness fails",
+        "POSTs a schema-repair claim comment",
+        "persists the durable assessment-result comment",
+        "succeeded/error/unavailable Triage projection",
+        "outcome-bound assessment, recommendation, options",
+        "PATCHes the durable assessment-result comment as projected",
+        "POSTs or PATCHes the bounded triage-result record comment",
+        "PATCHes the primary claim comment to its final status",
+        "PATCHes the schema-repair claim comment to its final status",
+    ):
+        assert downstream in run["output"], downstream
+    assert "No label, comment, title, or target-repository writes." not in run["output"]
+    assert "No label, title, new-comment" not in run["output"]
+    assert "No label, comment, title, option," not in run["output"]
+    assert "planned model spend" in run["output"]
+    assert "at most 2 model calls" in run["output"]
+    assert "never reset" in run["output"]
+    assert "writes=0" in run["output"]
+    assert run["body"] == value["body"]
+    for channel in ("edits", "queued", "dispatched", "claims"):
+        assert not run["calls"][channel], channel
+
+    # The preview is idempotent: a second dry-run is byte-identical and still
+    # zero-write.
+    again = advisory_plan(value, item, revision=DRIFT_REVISION, wave="drift-wave")
+    assert again["result"] == run["result"]
+    assert again["output"] == run["output"]
+    assert again["body"] == value["body"]
+    for channel in ("edits", "queued", "dispatched", "claims"):
+        assert not again["calls"][channel], channel
+
+    # Generic (non-exact) discovery can never select this class.
+    generic = advisory_plan(
+        value, item, selector="", revision=DRIFT_REVISION, wave="drift-wave"
+    )
+    assert generic["result"] == {
+        "eligible": 0,
+        "planned": 0,
+        "deferred": 0,
+        "written": 0,
+    }
+    assert '{"triage-cache-not-terminal-error":1}' in generic["output"]
+    assert generic["body"] == value["body"]
+
+
+def test_observation_drift_refresh_write_run_clears_drift_residue_and_requeues():
+    value, item = drift_card()
+    before = rc._unique_state_block(value["body"])
+    path = cards_file([value["number"]])
+    try:
+        output = StringIO()
+        with (
+            advisory_environment(value, item, revision=DRIFT_REVISION) as calls,
+            redirect_stdout(output),
+        ):
+            result = replay.run(
+                path,
+                "drift-write-wave",
+                1,
+                exact_cards="v1:%s" % value["number"],
+            )
+    finally:
+        os.unlink(path)
+    assert result == {
+        "eligible": 1,
+        "planned": 1,
+        "deferred": 0,
+        "written": 1,
+        "queued": 1,
+    }
+    state = rc._unique_state_block(value["body"])
+    marker = state[replay.REPLAY_FIELD]
+    assert marker["version"] == replay.REPLAY_VERSION
+    assert marker["cleared"] == replay.OBSERVATION_DRIFT_REFRESH_CLEARED
+    assert marker["revision"] == DRIFT_REVISION
+    # A fresh, spend-guarded attempt is queued for the same exact revision,
+    # consuming exactly one more attempt under the unchanged cap.
+    assert state["triage_status"] == "queued"
+    assert state["triaged_sha"] == DRIFT_REVISION
+    assert state[rc.TRIAGE_ATTEMPTS_FIELD] == {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": DRIFT_REVISION,
+        "count": before["triage_attempts"]["count"] + 1,
+    }
+    # Every drift residue is gone: no stale-observation assessment, no
+    # residual recommendation, no stale verdict, no primary/consumption
+    # telemetry. Nothing promoted the stale assessment into authority.
+    for field in replay.TRIAGE_ADVISORY_CACHE_FIELDS:
+        if field in {"triaged_sha", "triage_status"}:
+            continue
+        assert field not in state, field
+    assert "Adds opt-in forge_profiles routing." not in value["body"]
+    assert "Automatic triage queued for this exact revision." in value["body"]
+    # Deterministic identity, observation, and context are untouched.
+    for field in (
+        "head_sha",
+        "review_observation",
+        "decision_context",
+        "decision_context_id",
+        "repo",
+    ):
+        assert state[field] == before[field]
+    assert len(calls["queued"]) == len(calls["dispatched"]) == 1
+    assert calls["claims"] and calls["claims"][0]["revision"] == DRIFT_REVISION
+    # Exactly the one exact card was read; no unrelated card was touched.
+    assert set(calls["card_reads"]) == {value["number"]}
+    # The recovered card is not replayable again.
+    second = advisory_plan(value, item, revision=DRIFT_REVISION, wave="drift-second-wave")
+    assert second["result"] is None
+    assert "already-replayed" in second["output"]
+
+    # The refreshed attempt restores trustworthy current state: a fresh
+    # result bound to the CURRENT observation re-admits and returns a valid
+    # owner control.
+    queued_state = rc._unique_state_block(value["body"])
+    healed = rc.body_with_triage_result(
+        value["body"],
+        DRIFT_REVISION,
+        triage=drift_payload(queued_state),
+        owner="owner",
+        base_sha=item["base_sha"],
+    )
+    healed_state = rc._unique_state_block(healed)
+    assert rc.assessment_current_admitted(healed_state)
+    assert rc.accept_recommendation_available(healed_state)
+    assert healed_state[rc.ASSESSMENT_FIELD]["target"]["observation_id"] == (
+        queued_state["review_observation"]["observation_id"]
+    )
+    # Or the attempt ends in an explicit trustworthy unavailable state with no
+    # residual misleading recommendation.
+    failed = rc.body_with_triage_result(
+        value["body"],
+        DRIFT_REVISION,
+        error="Auto triage unavailable for this version.",
+        owner="owner",
+    )
+    failed_state = rc._unique_state_block(failed)
+    assert failed_state["triage_status"] == "error"
+    assert "triage_recommendation" not in failed_state
+    assert rc.ASSESSMENT_FIELD not in failed_state
+    assert not rc.accept_recommendation_available(failed_state)
+
+
+def test_observation_drift_refresh_refuses_every_disconfirming_shape():
+    value, item = drift_card()
+    proven = rc._unique_state_block(value["body"])
+    assert (
+        replay._observation_drift_refresh_refusal(proven, "pr-review", DRIFT_REVISION)
+        == ""
+    )
+    # The class is pr-review only and bound to the exact current revision.
+    assert replay._observation_drift_refresh_refusal(
+        dict(proven, kind="issue-triage"), "issue-triage", DRIFT_REVISION
+    ) == "drift-refresh-kind-unsupported"
+    assert replay._observation_drift_refresh_refusal(
+        proven, "pr-review", "deadbee"
+    ) == "drift-refresh-cache-unproven"
+    # The residual recommendation is residue this class clears, not a
+    # requirement: the same drift without it is equally stuck and eligible.
+    without_recommendation = with_state(
+        value, lambda state: state.pop("triage_recommendation")
+    )
+    assert replay._observation_drift_refresh_refusal(
+        rc._unique_state_block(without_recommendation["body"]),
+        "pr-review",
+        DRIFT_REVISION,
+    ) == ""
+
+    mutations = {
+        "drift-refresh-cache-unproven": (
+            lambda state: state.__setitem__("held", True),
+            lambda state: state.__setitem__("triaged_sha", "deadbee"),
+        ),
+        "drift-refresh-assessment-not-admitted": (
+            lambda state: state.pop(rc.ASSESSMENT_FIELD),
+            lambda state: state.__setitem__(rc.ASSESSMENT_FIELD, {"forged": True}),
+            lambda state: state.__setitem__(
+                rc.ASSESSMENT_FIELD,
+                resigned_assessment(
+                    state,
+                    admission={
+                        "schema": "wheelhouse.assessment-admission/v1",
+                        "status": "stale",
+                        "reason": "binding.mismatch",
+                    },
+                ),
+            ),
+        ),
+        "drift-refresh-head-mismatch": (
+            lambda state: state.__setitem__("head_sha", "0" * 40),
+            lambda state: state.__setitem__(
+                rc.ASSESSMENT_FIELD,
+                resigned_assessment(state, target={"head_sha": "0" * 40}),
+            ),
+            lambda state: state.__setitem__(
+                "review_observation",
+                _rotated_observation(state, "0" * 40),
+            ),
+        ),
+        "drift-refresh-target-mismatch": (
+            lambda state: state.__setitem__(
+                rc.ASSESSMENT_FIELD,
+                resigned_assessment(state, target={"repo": "foreign-repo"}),
+            ),
+            lambda state: state.__setitem__(
+                rc.ASSESSMENT_FIELD,
+                resigned_assessment(state, target={"number": 999}),
+            ),
+            lambda state: state.__setitem__(
+                "review_observation",
+                _rotated_observation(state, DRIFT_REVISION, owner="foreign-owner"),
+            ),
+            lambda state: state.__setitem__(
+                "review_observation",
+                _rotated_observation(state, DRIFT_REVISION, repo="foreign-repo"),
+            ),
+            lambda state: state.__setitem__(
+                "review_observation",
+                _rotated_observation(state, DRIFT_REVISION, number=999),
+            ),
+        ),
+        "drift-refresh-observation-unproven": (
+            lambda state: state.__setitem__("review_observation", {"bogus": True}),
+        ),
+        "drift-refresh-not-observation-drift": (
+            # Non-current for a reason other than observation drift: the
+            # assessment matches the current observation but the decision
+            # context is malformed, which this class does not own.
+            lambda state: state.__setitem__(
+                rc.ASSESSMENT_FIELD,
+                resigned_assessment(
+                    state,
+                    target={
+                        "observation_id": state["review_observation"][
+                            "observation_id"
+                        ]
+                    },
+                ),
+            ),
+        ),
+    }
+    for expected, cases in mutations.items():
+        for index, mutate in enumerate(cases):
+            broken = with_state(value, mutate)
+            if expected == "drift-refresh-not-observation-drift":
+                broken = with_state(
+                    broken,
+                    lambda state: state.__setitem__("decision_context", {"bogus": 1}),
+                )
+            assert (
+                replay._observation_drift_refresh_refusal(
+                    rc._unique_state_block(broken["body"]), "pr-review", DRIFT_REVISION
+                )
+                == expected
+            ), (expected, index)
+
+    # The already-actionable shape (the nine-card census's other eight): a
+    # current admitted assessment means there is nothing to refresh, and the
+    # original advisory refusal is preserved verbatim through the full path.
+    current, current_item = drift_card(number=1735, target=1074, rotate=False)
+    current_state = rc._unique_state_block(current["body"])
+    assert rc.assessment_current_admitted(current_state)
+    assert replay._observation_drift_refresh_refusal(
+        current_state, "pr-review", DRIFT_REVISION
+    ) == "drift-refresh-assessment-current"
+    assert (
+        advisory_refusal(current, current_item, revision=DRIFT_REVISION)
+        == "advisory-recovery-authority-present"
+    )
+
+
+def test_observation_drift_refresh_never_selects_or_mutates_card_1759():
+    drift, drift_item = drift_card()
+    excluded, excluded_item = missing_output_card()
+    excluded = with_state(
+        excluded,
+        lambda state: state.update(
+            {
+                # Card #1759's current production shape: the already-replayed
+                # marker, an exhausted 2/2 attempt record, a succeeded cache
+                # whose failed primary was consumed advisory, and no
+                # assessment or recommendation.
+                "triage_status": "succeeded",
+                rc.TRIAGE_PRIMARY_STATUS_FIELD: "failed",
+                rc.TRIAGE_PRIMARY_ERROR_FIELD: "output.schema_invalid",
+                rc.TRIAGE_CONSUMPTION_FIELD: "advisory",
+                "assessment_admission": {
+                    "status": "unavailable",
+                    "reason": "basis.missing_or_invalid",
+                },
+                rc.TRIAGE_ATTEMPTS_FIELD: {
+                    "version": rc.TRIAGE_ATTEMPTS_VERSION,
+                    "kind": "pr-review",
+                    "revision": MISSING_OUTPUT_REVISION,
+                    "count": 2,
+                },
+                replay.REPLAY_FIELD: {
+                    "version": replay.REPLAY_VERSION,
+                    "wave": "card-1759-missing-triage-f1",
+                    "revision": MISSING_OUTPUT_REVISION,
+                    "cleared": "error",
+                    "at": "2026-07-28T06:58:38Z",
+                    "run_number": 390,
+                },
+            }
+        ),
+    )
+    excluded_state = rc._unique_state_block(excluded["body"])
+    # The drift class can never select it: no admitted assessment exists.
+    assert replay._observation_drift_refresh_refusal(
+        excluded_state, "pr-review", MISSING_OUTPUT_REVISION
+    ) == "drift-refresh-assessment-not-admitted"
+
+    # A wave over ONLY card 1584 reads and mutates exactly card 1584; the
+    # excluded card sitting in the same environment is never even read.
+    cards = {1584: drift, 1759: excluded}
+    sources = {
+        (drift_item["repo"], drift_item["number"], "pr-review"): source(
+            number=drift_item["number"], revision=DRIFT_REVISION
+        ),
+        (excluded_item["repo"], excluded_item["number"], "pr-review"): source(
+            number=excluded_item["number"], revision=MISSING_OUTPUT_REVISION
+        ),
+    }
+    excluded_body = excluded["body"]
+    path = cards_file([1584])
+    try:
+        with replay_environment(cards, sources) as calls:
+            result = replay.run(path, "drift-only-wave", 1, exact_cards="v1:1584")
+            assert result == {
+                "eligible": 1,
+                "planned": 1,
+                "deferred": 0,
+                "written": 1,
+                "queued": 1,
+            }
+            assert 1759 not in calls["card_reads"]
+            assert all(number != 1759 for number, *_ in calls["edits"])
+            assert all(number != 1759 for number, *_ in calls["queued"])
+        assert cards[1759]["body"] == excluded_body
+    finally:
+        os.unlink(path)
+
+    # Exact-selecting the excluded card refuses on its already-replayed
+    # marker; the drift class never substitutes, and the whole wave fails
+    # closed with zero writes when it is selected alongside.
+    refused = advisory_plan(
+        excluded,
+        excluded_item,
+        selector="v1:1759",
+        revision=MISSING_OUTPUT_REVISION,
+        wave="drift-excluded-wave",
+    )
+    assert refused["result"] is None
+    assert "already-replayed" in refused["output"]
+    assert not refused["calls"]["edits"] and not refused["calls"]["queued"]
+
+    cards = {1584: drift, 1759: excluded}
+    path = cards_file([1584, 1759])
+    output = StringIO()
+    try:
+        with (
+            replay_environment(cards, sources) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                replay.run(
+                    path,
+                    "drift-mixed-wave",
+                    2,
+                    exact_cards="v1:1584,1759",
+                )
+                raise AssertionError("a mixed wave containing 1759 must refuse")
+            except ValueError as error:
+                assert "failed validation" in str(error)
+        assert "refused card #1759: already-replayed" in output.getvalue()
+        assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+        assert cards[1584]["body"] == drift["body"]
+        assert cards[1759]["body"] == excluded_body
+    finally:
+        os.unlink(path)
+
+
+def _align_item_to_card_observation(item, state):
+    """Mirror a post-refresh scan item that already carries the card observation."""
+    aligned = dict(item)
+    observation = state.get("review_observation")
+    context = state.get("decision_context")
+    if observation is not None:
+        aligned["target_observation"] = observation
+        aligned["review_observation"] = observation
+        aligned["head_sha"] = observation["revision"]["head_sha"]
+        aligned["base_sha"] = observation["revision"].get("base_sha") or aligned.get(
+            "base_sha", ""
+        )
+    if context is not None:
+        aligned["decision_context"] = context
+    return aligned
+
+
+def test_ordinary_maintenance_self_heals_complete_observation_drift_card_1819():
+    """Card #1819 production shape: complete same-head observation drift.
+
+    Ordinary maintenance must reopen exactly one spend-guarded re-triage through
+    the existing queue writers. Incomplete / mismatched / exhausted / locked
+    shapes must not queue. A successful new admission restores Accept only via
+    the existing authority predicate.
+    """
+    value, item = drift_card(number=1819, target=1187)
+    state = rc._unique_state_block(value["body"])
+    labels = value["labels"]
+    pure = [label["name"] if isinstance(label, dict) else label for label in labels]
+    aligned = _align_item_to_card_observation(item, state)
+
+    # Proven complete drift: old admitted assessment, new complete observation,
+    # triaged_sha already equals the current head.
+    assert state["triage_status"] == "succeeded"
+    assert state["triaged_sha"] == DRIFT_REVISION
+    assert state["head_sha"] == DRIFT_REVISION
+    assert state[rc.ASSESSMENT_FIELD]["admission"]["status"] == "admitted"
+    assert (
+        state[rc.ASSESSMENT_FIELD]["target"]["observation_id"]
+        != state["review_observation"]["observation_id"]
+    )
+    assert state["review_observation"]["completeness"]["complete"] is True
+    assert not rc.assessment_current_admitted(state)
+    assert not rc.accept_recommendation_available(state)
+    assert rc.observation_drift_refresh_refusal(
+        state, "pr-review", DRIFT_REVISION
+    ) == ""
+    assert rc.observation_drift_retriage_needed(aligned, state)
+    assert not rc.triage_fresh(aligned, state)
+    assert rc.should_auto_triage(aligned, state, pure, has_token=True)
+
+    # Shared queue writer clears residue and reserves one attempt without a
+    # second admission path.
+    queued_body = rc.body_with_triage_queued(value["body"], aligned)
+    assert queued_body != value["body"]
+    queued_state = rc._unique_state_block(queued_body)
+    assert queued_state["triage_status"] == "queued"
+    assert queued_state["triaged_sha"] == DRIFT_REVISION
+    assert queued_state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+    assert rc.ASSESSMENT_FIELD not in queued_state
+    assert "triage_recommendation" not in queued_state
+    assert "automerge_verdict" not in queued_state
+    assert "### Recommended action" not in queued_body
+    assert "opt:accept-recommendation" not in queued_body
+    assert "Automatic triage queued for this exact revision." in queued_body
+    # Idempotent / race-safe: a second ordinary pass buys no further spend.
+    assert rc.triage_fresh(aligned, queued_state)
+    assert not rc.observation_drift_retriage_needed(aligned, queued_state)
+    assert not rc.should_auto_triage(aligned, queued_state, pure, has_token=True)
+    assert rc.body_with_triage_queued(queued_body, aligned) == queued_body
+
+    # Incomplete current observation never opens ordinary spend.
+    incomplete_state = copy.deepcopy(state)
+    old_obs = state["review_observation"]
+    incomplete_obs = rc.target_contracts.make_observation(
+        old_obs["target"]["owner"],
+        old_obs["target"]["repo"],
+        old_obs["target"]["number"],
+        head_sha=old_obs["revision"]["head_sha"],
+        base_sha=old_obs["revision"]["base_sha"],
+        expected_head_sha=old_obs["revision"]["head_sha"],
+        observed_at=old_obs["observed_at"],
+        source=old_obs["source"],
+        completeness={
+            **old_obs["completeness"],
+            "complete": False,
+            "mergeability": "unknown",
+        },
+        facts=old_obs["facts"],
+        changed_paths=old_obs["changed_paths"],
+    )
+    assert incomplete_obs["completeness"]["complete"] is False
+    assert (
+        incomplete_obs["observation_id"]
+        != state[rc.ASSESSMENT_FIELD]["target"]["observation_id"]
+    )
+    incomplete_state["review_observation"] = incomplete_obs
+    incomplete_item = _align_item_to_card_observation(item, incomplete_state)
+    assert rc.observation_drift_refresh_refusal(
+        incomplete_state, "pr-review", DRIFT_REVISION
+    ) == ""
+    assert not rc.observation_drift_retriage_needed(incomplete_item, incomplete_state)
+    assert rc.triage_fresh(incomplete_item, incomplete_state)
+    assert not rc.should_auto_triage(
+        incomplete_item, incomplete_state, pure, has_token=True
+    )
+
+    # Matching (non-drifted) observation, wrong head, non-refreshable labels,
+    # and exhausted attempts never queue.
+    current_value, current_item = drift_card(
+        number=1819, target=1187, rotate=False
+    )
+    current_state = rc._unique_state_block(current_value["body"])
+    current_aligned = _align_item_to_card_observation(current_item, current_state)
+    assert rc.assessment_current_admitted(current_state)
+    assert not rc.observation_drift_retriage_needed(current_aligned, current_state)
+    assert rc.triage_fresh(current_aligned, current_state)
+    assert not rc.should_auto_triage(
+        current_aligned, current_state, pure, has_token=True
+    )
+
+    wrong_head = dict(aligned)
+    wrong_head["head_sha"] = "deadbeef" + DRIFT_REVISION[8:]
+    assert not rc.observation_drift_retriage_needed(wrong_head, state)
+
+    locked = list(pure) + ["processing"]
+    assert not rc.is_refreshable(locked)
+    assert not rc.should_auto_triage(aligned, state, locked, has_token=True)
+
+    exhausted_state = copy.deepcopy(state)
+    exhausted_state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": DRIFT_REVISION,
+        "count": 2,
+    }
+    assert rc.observation_drift_retriage_needed(aligned, exhausted_state)
+    assert not rc.triage_fresh(aligned, exhausted_state)
+    assert not rc.should_auto_triage(
+        aligned, exhausted_state, pure, has_token=True
+    )
+    assert rc.body_with_triage_queued(
+        rc._replace_state_block(value["body"], exhausted_state), aligned
+    ) == rc._replace_state_block(value["body"], exhausted_state)
+
+    # Successful new admission against the CURRENT observation restores Accept
+    # only through the existing authority predicate - never by rebinding the
+    # old assessment.
+    healed_body = rc.body_with_triage_result(
+        queued_body,
+        DRIFT_REVISION,
+        triage=drift_payload(queued_state),
+        owner="owner",
+        base_sha=aligned.get("base_sha", ""),
+    )
+    healed_state = rc._unique_state_block(healed_body)
+    assert healed_state["triage_status"] == "succeeded"
+    assert rc.assessment_current_admitted(healed_state)
+    assert rc.accept_recommendation_available(healed_state)
+    assert (
+        healed_state[rc.ASSESSMENT_FIELD]["target"]["observation_id"]
+        == healed_state["review_observation"]["observation_id"]
+    )
+    assert "### Recommended action" in healed_body
+    assert "opt:accept-recommendation" in healed_body
+    assert not rc.observation_drift_retriage_needed(
+        _align_item_to_card_observation(aligned, healed_state), healed_state
+    )
+    assert rc.triage_fresh(
+        _align_item_to_card_observation(aligned, healed_state), healed_state
+    )
+    assert not rc.should_auto_triage(
+        _align_item_to_card_observation(aligned, healed_state),
+        healed_state,
+        pure,
+        has_token=True,
+    )
+
+
+def missing_output_card(number=1759, target=594, revision=MISSING_OUTPUT_REVISION):
+    """Card #1759's exact production shape after run 30248637187.
+
+    The reusable model job's 6-minute timeout - measured from job start, with
+    no allowance for the measured ~30-40s pre-model setup - killed the
+    claude-code-action mid-execution before it could commit its execution
+    file, so the consumer recorded a terminal ``triage_status: error`` with
+    the honest "Auto triage unavailable for this version." note, one consumed
+    attempt, a durable result id, and no primary telemetry: the
+    ``consumer.committed.primary.output.missing`` class. Unlike the advisory
+    class above, this cache recovers through the ORDINARY terminal-error
+    replay path - no #1749 advisory exception is involved or required.
+    """
+    item = option_b_fixtures.option_b_item(
+        number=target, head_sha=revision, repo="no-mistakes"
+    )
+    rendered = rc.render(item)
+    body = rendered["body"]
+    state = rc._unique_state_block(body)
+    state = rc._state_with_triage(
+        state,
+        revision,
+        "error",
+        error="Auto triage unavailable for this version.",
+        base_sha="e279099c51a667f3d82b3025db88f6ba4736be15",
+        vision_sha="08077197b28d5f6b5b74b405d4617f066f620e33",
+    )
+    state["assessment_result_id"] = "sha256:73404a2bc99b8e394162f7905bbffad8d4ebd0e2b05246080030a3736e67a7be"
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": revision,
+        "count": 1,
+    }
+    body = rc._replace_state_block(body, state)
+    return {
+        "number": number,
+        "title": rendered["title"],
+        "body": body,
+        "labels": [{"name": name} for name in rendered["labels"]],
+        "state": "OPEN",
+        "updatedAt": "2026-07-27T17:30:59Z",
+        "author": {"login": rc.CARD_AUTOMATION_AUTHOR},
+        "comments": [],
+    }, item
+
+
+def missing_output_plan(value, item, selector=None, dry_run=True, wave="missing-output-wave"):
+    """Run one replay over a single missing-output-class card."""
+    selector = "v1:%s" % value["number"] if selector is None else selector
+    path = cards_file([value["number"]])
+    output = StringIO()
+    try:
+        with (
+            advisory_environment(value, item, revision=MISSING_OUTPUT_REVISION) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                result = replay.run(
+                    path,
+                    wave,
+                    1,
+                    dry_run=dry_run,
+                    exact_cards=selector,
+                )
+                error = ""
+            except ValueError as failure:
+                result, error = None, str(failure)
+            return {
+                "result": result,
+                "error": error,
+                "output": output.getvalue(),
+                "calls": dict(calls),
+                "body": value["body"],
+            }
+    finally:
+        os.unlink(path)
+
+
+def test_missing_output_cache_recovers_through_the_existing_error_path():
+    value, item = missing_output_card()
+    state = rc._unique_state_block(value["body"])
+    assert state["triage_status"] == "error"
+    assert state["triage_error"] == "Auto triage unavailable for this version."
+    assert state["triaged_sha"] == MISSING_OUTPUT_REVISION
+    assert rc.TRIAGE_PRIMARY_STATUS_FIELD not in state
+    assert state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 1
+
+    # Dry-run: eligible through the ordinary terminal-error path, zero writes.
+    run = missing_output_plan(value, item)
+    assert run["error"] == "", run["output"]
+    assert run["result"] == {"eligible": 1, "planned": 1, "deferred": 0, "written": 0}
+    assert "DRY-RUN card #1759" in run["output"]
+    assert "clear=error revision=%s" % MISSING_OUTPUT_REVISION in run["output"]
+    assert (
+        not run["calls"]["edits"]
+        and not run["calls"]["queued"]
+        and not run["calls"]["dispatched"]
+    )
+
+    # Write run: the cache is cleared exactly once and re-queued under the
+    # same revision, consuming the remaining attempt budget.
+    cards = {value["number"]: value}
+    sources = {
+        (item["repo"], item["number"], "pr-review"): source(
+            number=item["number"], revision=MISSING_OUTPUT_REVISION
+        )
+    }
+    path = cards_file([value["number"]])
+    try:
+        with replay_environment(cards, sources) as calls:
+            first = replay.run(path, "missing-output-wave", 1, exact_cards="v1:1759")
+            assert first == {
+                "eligible": 1,
+                "planned": 1,
+                "deferred": 0,
+                "written": 1,
+                "queued": 1,
+            }
+            new_state = rc._unique_state_block(cards[1759]["body"])
+            assert new_state[replay.REPLAY_FIELD]["cleared"] == "error"
+            assert new_state["triage_status"] == "queued"
+            assert new_state["triaged_sha"] == MISSING_OUTPUT_REVISION
+            assert new_state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 1
+    finally:
+        os.unlink(path)
+    # Repeated run: the durable replay marker refuses re-entry exactly.
+    second = missing_output_plan(value, item, wave="missing-output-second-wave")
+    assert second["result"] is None
+    assert "already-replayed" in second["output"]
+    assert not second["calls"]["edits"] and not second["calls"]["queued"]
+
+
+def test_missing_output_replay_refuses_a_moved_head_without_writes():
+    value, item = missing_output_card()
+    path = cards_file([value["number"]])
+    output = StringIO()
+    try:
+        with (
+            replay_environment(
+                {value["number"]: value},
+                {
+                    (item["repo"], item["number"], "pr-review"): source(
+                        number=item["number"], revision="f" * 40
+                    )
+                },
+            ) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                replay.run(path, "missing-output-stale-wave", 1, dry_run=True, exact_cards="v1:1759")
+                raise AssertionError("a moved head must refuse")
+            except ValueError:
+                pass
+        assert "source-revision-moved" in output.getvalue()
+        assert not calls["edits"] and not calls["queued"] and not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_missing_output_replay_refuses_exhausted_attempt_budget():
+    value, item = missing_output_card()
+    state = rc._unique_state_block(value["body"])
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": MISSING_OUTPUT_REVISION,
+        "count": 2,
+    }
+    value["body"] = rc._replace_state_block(value["body"], state)
+    run = missing_output_plan(value, item)
+    assert run["result"] is None, run["output"]
+    assert "attempt-cap-exhausted" in run["output"]
+    assert not run["calls"]["edits"] and not run["calls"]["queued"]
+
+
+def test_missing_output_healthy_primary_control_stays_closed():
+    """The proven-good control shape: a same-revision successful primary with
+    an admitted assessment and persisted recommendation (production card
+    #1789) must never be selected - not by the ordinary path, not by the
+    #1749 advisory recovery, and not by generic discovery."""
+    value, item = advisory_card(
+        number=1789,
+        target=1136,
+        basis_kind="other",
+        check_names=[],
+        primary_error_code="",
+    )
+    state = rc._unique_state_block(value["body"])
+    assert state["triage_status"] == "succeeded"
+    assert state[rc.TRIAGE_PRIMARY_STATUS_FIELD] == "succeeded"
+    assert state[rc.TRIAGE_CONSUMPTION_FIELD] == "primary"
+    assert rc.assessment_current_admitted(state)
+    assert "triage_recommendation" in state
+
+    # Exact selector: the advisory recovery refuses because the primary never
+    # failed (there is no advisory cache to recover).
+    reason = advisory_refusal(value, item)
+    assert reason == "advisory-recovery-primary-not-failed", reason
+
+    # Generic discovery: a current succeeded cache is never a replay candidate.
+    path = cards_file([value["number"]])
+    output = StringIO()
+    try:
+        with (
+            advisory_environment(value, item) as calls,
+            redirect_stdout(output),
+        ):
+            result = replay.run(path, "healthy-control-wave", 25, dry_run=True)
+            assert result == {"eligible": 0, "planned": 0, "deferred": 0, "written": 0}
+            assert "triage-cache-not-terminal-error" in output.getvalue()
+            assert not calls["edits"] and not calls["queued"] and not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_terminal_error_is_cleared_and_queued_once_then_second_wave_noops():
+    cards = {42: card()}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    try:
+        with replay_environment(cards, sources) as calls:
+            first = replay.run(path, "wave-one", 25)
+            first_state = rc._unique_state_block(cards[42]["body"])
+            assert first == {
+                "eligible": 1,
+                "planned": 1,
+                "deferred": 0,
+                "written": 1,
+                "queued": 1,
+            }
+            assert first_state[replay.REPLAY_FIELD]["version"] == 1
+            assert first_state[replay.REPLAY_FIELD]["cleared"] == "error"
+            assert first_state["triage_status"] == "queued"
+            assert first_state["triage_attempts"]["count"] == 2
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 1
+            second = replay.run(path, "wave-two", 25)
+            assert second["eligible"] == second["written"] == second["queued"] == 0
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 1
+            assert all(number == 42 for number in calls["card_reads"])
+            assert all(read[2:] == (17, "pr-review") for read in calls["source_reads"])
+    finally:
+        os.unlink(path)
+
+
+def test_sanctioned_attempt_reset_grants_exact_cohort_one_reentry():
+    cards, sources, supplied = attempt_reset_fixture()
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            result = replay.run(
+                path,
+                replay.ATTEMPT_RESET_WAVE,
+                len(replay.ATTEMPT_RESET_COHORT),
+                attempts_reset_cards=supplied,
+            )
+            assert result == {
+                "eligible": 19,
+                "planned": 19,
+                "deferred": 0,
+                "written": 19,
+                "queued": 19,
+            }
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 19
+            for number, value in cards.items():
+                state = rc._unique_state_block(value["body"])
+                assert state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+                assert state[replay.REPLAY_FIELD] == {
+                    "version": replay.ATTEMPT_RESET_REPLAY_VERSION,
+                    "wave": replay.ATTEMPT_RESET_WAVE,
+                    "revision": replay.ATTEMPT_RESET_COHORT[number]["revision"],
+                    "cleared": "error",
+                    "at": state[replay.REPLAY_FIELD]["at"],
+                    "run_number": 77,
+                    "attempt_reset": True,
+                }
+            assert config()["triage_attempt_cap_per_revision"] == 2
+            assert config()["triage_attempt_caps"]["wheelhouse"] == 2
+            try:
+                replay.run(
+                    path,
+                    replay.ATTEMPT_RESET_WAVE,
+                    len(replay.ATTEMPT_RESET_COHORT),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset was reusable")
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 19
+    finally:
+        os.unlink(path)
+
+
+def test_array_recovery_attempt_reset_grants_exact_cohort_one_reentry():
+    cohort = replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT
+    wave = replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE
+    cards, sources, supplied = attempt_reset_fixture(cohort)
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            result = replay.run(
+                path,
+                wave,
+                len(cohort),
+                attempts_reset_cards=supplied,
+            )
+            assert result == {
+                "eligible": 15,
+                "planned": 15,
+                "deferred": 0,
+                "written": 15,
+                "queued": 15,
+            }
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 15
+            for number, value in cards.items():
+                state = rc._unique_state_block(value["body"])
+                assert state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+                assert state[replay.REPLAY_FIELD] == {
+                    "version": replay.ATTEMPT_RESET_REPLAY_VERSION,
+                    "wave": wave,
+                    "revision": cohort[number]["revision"],
+                    "cleared": "error",
+                    "at": state[replay.REPLAY_FIELD]["at"],
+                    "run_number": 77,
+                    "attempt_reset": True,
+                }
+            try:
+                replay.run(
+                    path,
+                    wave,
+                    len(cohort),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("array recovery attempt reset was reusable")
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 15
+    finally:
+        os.unlink(path)
+
+
+def test_array_recovery_attempt_reset_requires_exact_wave_cohort_and_limit():
+    cohort = replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT
+    wave = replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE
+    cards, sources, supplied = attempt_reset_fixture(cohort)
+    invalid_inputs = (
+        ("wrong-wave", supplied),
+        (replay.ATTEMPT_RESET_WAVE, supplied),
+        (wave, supplied + ",9999"),
+        (wave, ",".join(supplied.split(",")[:-1])),
+        (wave, supplied + ",154"),
+    )
+    for candidate_wave, value in invalid_inputs:
+        try:
+            replay._attempt_reset_scope(candidate_wave, value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((candidate_wave, value))
+
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            try:
+                replay.run(
+                    path,
+                    wave,
+                    len(cohort) - 1,
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset accepted a non-cohort limit")
+            assert not calls["card_reads"] and not calls["source_reads"]
+            assert not calls["edits"] and not calls["queued"]
+            assert not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_array_recovery_attempt_reset_mismatches_are_atomic_zero_write():
+    cohort = replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT
+    wave = replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE
+
+    cards, sources, supplied = attempt_reset_fixture(cohort)
+    changed = min(cards)
+    state = rc._unique_state_block(cards[changed]["body"])
+    state[replay.REPLAY_FIELD]["at"] = "2026-07-17T20:00:00Z"
+    cards[changed]["body"] = rc._replace_state_block(cards[changed]["body"], state)
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            try:
+                replay.run(
+                    path,
+                    wave,
+                    len(cohort),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset accepted a wrong prior marker")
+            assert not calls["claims"]
+            assert not calls["edits"] and not calls["queued"]
+            assert not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+    cards, sources, supplied = attempt_reset_fixture(cohort)
+    changed = max(cards)
+
+    def race_card(number, read_count, live_cards):
+        if read_count == len(cohort) + len(live_cards):
+            state = rc._unique_state_block(live_cards[number]["body"])
+            state["triage_status"] = "queued"
+            live_cards[number]["body"] = rc._replace_state_block(
+                live_cards[number]["body"], state
+            )
+
+    path = cards_file([])
+    before = {number: value["body"] for number, value in cards.items()}
+    try:
+        with replay_environment(cards, sources, card_read_hook=race_card) as calls:
+            try:
+                replay.run(
+                    path,
+                    wave,
+                    len(cohort),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset mutated before full preflight")
+            assert len(calls["card_reads"]) >= len(cohort) * 2
+            assert not calls["claims"]
+            assert not calls["edits"] and not calls["queued"]
+            assert not calls["dispatched"]
+            changed_only = {
+                number: value["body"]
+                for number, value in cards.items()
+                if value["body"] != before[number]
+            }
+            assert set(changed_only) == {changed}
+    finally:
+        os.unlink(path)
+
+
+def test_attempt_reset_later_race_pauses_then_resumes_exact_cohort():
+    cohort = replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT
+    wave = replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE
+    cards, sources, supplied = attempt_reset_fixture(cohort)
+    changed = max(cards)
+    race_read = len(cohort) * 2 + 3 * (len(cohort) - 1) + 1
+    raced = False
+
+    def race_card(number, read_count, live_cards):
+        nonlocal raced
+        if not raced and number == changed and read_count == race_read:
+            state = rc._unique_state_block(live_cards[number]["body"])
+            state["triage_status"] = "queued"
+            live_cards[number]["body"] = rc._replace_state_block(
+                live_cards[number]["body"], state
+            )
+            raced = True
+
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources, card_read_hook=race_card) as calls:
+            try:
+                replay.run(
+                    path,
+                    wave,
+                    len(cohort),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset continued after a later-card race")
+            assert raced
+            assert len(calls["queued"]) == len(cohort) - 1
+            for number, value in cards.items():
+                state = rc._unique_state_block(value["body"])
+                if number == changed:
+                    assert state[replay.REPLAY_FIELD] == cohort[number]
+                    state["triage_status"] = "error"
+                    value["body"] = rc._replace_state_block(value["body"], state)
+                else:
+                    assert state[replay.REPLAY_FIELD]["version"] == (
+                        replay.ATTEMPT_RESET_REPLAY_VERSION
+                    )
+            resumed = replay.run(
+                path,
+                wave,
+                len(cohort),
+                attempts_reset_cards=supplied,
+            )
+            assert resumed == {
+                "eligible": len(cohort),
+                "planned": len(cohort),
+                "deferred": 0,
+                "written": 1,
+                "queued": 1,
+            }
+            assert len(calls["queued"]) == len(cohort)
+            assert all(
+                rc._unique_state_block(value["body"])[replay.REPLAY_FIELD]["version"]
+                == replay.ATTEMPT_RESET_REPLAY_VERSION
+                for value in cards.values()
+            )
+    finally:
+        os.unlink(path)
+
+
+def test_attempt_reset_resume_requires_only_pending_budget():
+    cohort = replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT
+    wave = replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE
+    cards, sources, supplied = attempt_reset_fixture(cohort)
+    pending = max(cards)
+    for number, value in cards.items():
+        if number == pending:
+            continue
+        state = rc._unique_state_block(value["body"])
+        revision = cohort[number]["revision"]
+        for field in replay.TRIAGE_NON_SUCCESS_FIELDS:
+            state.pop(field, None)
+        state["triaged_sha"] = revision
+        state["triage_status"] = "queued"
+        state[replay.REPLAY_FIELD] = replay._marker(
+            wave, revision, "error", 77, attempt_reset=True
+        )
+        value["body"] = rc._replace_state_block(value["body"], state)
+
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources, remaining=1) as calls:
+            result = replay.run(
+                path,
+                wave,
+                len(cohort),
+                attempts_reset_cards=supplied,
+            )
+            assert result == {
+                "eligible": len(cohort),
+                "planned": len(cohort),
+                "deferred": 0,
+                "written": 1,
+                "queued": 1,
+            }
+            assert len(calls["queued"]) == len(calls["dispatched"]) == 1
+            assert calls["queued"][0][0] == pending
+            assert all(
+                rc._unique_state_block(value["body"])[replay.REPLAY_FIELD]["version"]
+                == replay.ATTEMPT_RESET_REPLAY_VERSION
+                for value in cards.values()
+            )
+    finally:
+        os.unlink(path)
+
+
+def test_attempt_reset_refuses_outside_scope_and_any_state_mismatch():
+    _, _, supplied = attempt_reset_fixture()
+    assert (
+        replay._attempt_reset_count(
+            {
+                rc.TRIAGE_ATTEMPTS_FIELD: {
+                    "version": True,
+                    "kind": "pr-review",
+                    "revision": "abcdef1",
+                    "count": 2,
+                }
+            },
+            "pr-review",
+            "abcdef1",
+            2,
+        )
+        is None
+    )
+    invalid_inputs = (
+        ("wrong-wave", supplied),
+        (replay.ATTEMPT_RESET_WAVE, supplied + ",9999"),
+        (
+            replay.ATTEMPT_RESET_WAVE,
+            ",".join(supplied.split(",")[:-1]),
+        ),
+        (replay.ATTEMPT_RESET_WAVE, supplied + ",1367"),
+    )
+    for wave, value in invalid_inputs:
+        try:
+            replay._attempt_reset_scope(wave, value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((wave, value))
+
+    cards, sources, supplied = attempt_reset_fixture()
+    moved = min(cards)
+    state = rc._unique_state_block(cards[moved]["body"])
+    old_revision = replay.ATTEMPT_RESET_COHORT[moved]["revision"]
+    kind = state["kind"]
+    moved_revision = "2026-07-18T00:00:00Z" if kind == "issue-triage" else "f" * 40
+    state["updated_at" if kind == "issue-triage" else "head_sha"] = moved_revision
+    state["triaged_sha"] = moved_revision
+    state[rc.TRIAGE_ATTEMPTS_FIELD]["revision"] = moved_revision
+    state[replay.REPLAY_FIELD]["revision"] = moved_revision
+    cards[moved]["body"] = rc._replace_state_block(cards[moved]["body"], state)
+    target = state["number"]
+    sources.pop(("wheelhouse", target, kind))
+    sources[("wheelhouse", target, kind)] = source(
+        number=target,
+        kind=kind,
+        revision=moved_revision,
+    )
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            try:
+                replay.run(
+                    path,
+                    replay.ATTEMPT_RESET_WAVE,
+                    len(replay.ATTEMPT_RESET_COHORT),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError((moved, old_revision, moved_revision))
+            assert not calls["edits"] and not calls["queued"]
+            assert not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_attempt_reset_binds_complete_prior_marker_identity():
+    cards, sources, supplied = attempt_reset_fixture()
+    changed = min(cards)
+    state = rc._unique_state_block(cards[changed]["body"])
+    state[replay.REPLAY_FIELD]["at"] = "2026-07-17T20:00:00Z"
+    cards[changed]["body"] = rc._replace_state_block(cards[changed]["body"], state)
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            try:
+                replay.run(
+                    path,
+                    replay.ATTEMPT_RESET_WAVE,
+                    len(replay.ATTEMPT_RESET_COHORT),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset accepted wrong prior marker")
+            assert not calls["claims"]
+            assert not calls["edits"] and not calls["queued"]
+            assert not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_attempt_reset_second_read_mismatch_is_atomic_zero_write():
+    cards, sources, supplied = attempt_reset_fixture()
+    changed = max(cards)
+
+    def race_card(number, read_count, live_cards):
+        if read_count == len(replay.ATTEMPT_RESET_COHORT) + len(live_cards):
+            state = rc._unique_state_block(live_cards[number]["body"])
+            state["triage_status"] = "queued"
+            live_cards[number]["body"] = rc._replace_state_block(
+                live_cards[number]["body"], state
+            )
+
+    path = cards_file([])
+    before = {number: value["body"] for number, value in cards.items()}
+    try:
+        with replay_environment(cards, sources, card_read_hook=race_card) as calls:
+            try:
+                replay.run(
+                    path,
+                    replay.ATTEMPT_RESET_WAVE,
+                    len(replay.ATTEMPT_RESET_COHORT),
+                    attempts_reset_cards=supplied,
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("attempt reset mutated before full preflight")
+            assert len(calls["card_reads"]) >= len(replay.ATTEMPT_RESET_COHORT) * 2
+            assert not calls["claims"]
+            assert not calls["edits"] and not calls["queued"]
+            assert not calls["dispatched"]
+            changed_only = {
+                number: value["body"]
+                for number, value in cards.items()
+                if value["body"] != before[number]
+            }
+            assert set(changed_only) == {changed}
+    finally:
+        os.unlink(path)
+
+
+def test_v2_reset_marker_is_never_ordinary_replay_evidence():
+    parked = card(status="queued")
+    state = rc._unique_state_block(parked["body"])
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "abcdef1",
+        "count": 2,
+    }
+    state[replay.REPLAY_FIELD] = {
+        "version": replay.ATTEMPT_RESET_REPLAY_VERSION,
+        "wave": replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE,
+        "revision": "abcdef1",
+        "cleared": "error",
+        "at": "2026-07-17T20:00:00Z",
+        "run_number": 77,
+        "attempt_reset": True,
+    }
+    parked["body"] = rc._replace_state_block(parked["body"], state)
+    cards = {42: parked}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    calls = {"duplicate": 0}
+
+    def duplicate(**kwargs):
+        calls["duplicate"] += 1
+        return True
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False) as replay_calls,
+            patched(
+                replay.agent_claim,
+                {
+                    "supersede_triage_claim": lambda **kwargs: {
+                        "event_key": "a" * 64,
+                        "superseded": False,
+                    },
+                    "triage_replay_duplicate_only_evidence": duplicate,
+                },
+            ),
+        ):
+            result = replay.run(path, "ordinary-wave", 25)
+            assert result["eligible"] == result["written"] == result["queued"] == 0
+            assert calls["duplicate"] == 0
+            assert not replay_calls["edits"] and not replay_calls["queued"]
+            assert not replay_calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_queue_failure_does_not_unlock_card_for_later_schedule():
+    cards = {42: card()}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    before = cards[42]["body"]
+    try:
+        with replay_environment(cards, sources, stub_queue=False) as calls:
+            with patched(
+                rc,
+                {"reserve_triage_budget": lambda number, item, ceiling: False},
+            ):
+                result = replay.run(path, "wave-one", 25)
+            state = rc._unique_state_block(cards[42]["body"])
+            assert result == {
+                "eligible": 1,
+                "planned": 1,
+                "deferred": 0,
+                "written": 0,
+                "queued": 0,
+            }
+            assert cards[42]["body"] == before
+            assert replay.REPLAY_FIELD not in state
+            assert state["triage_status"] == "error"
+            assert (
+                not calls["edits"] and not calls["queued"] and not calls["dispatched"]
+            )
+    finally:
+        os.unlink(path)
+
+
+def test_claim_tombstone_failure_refuses_replay_before_attempt_or_reservation():
+    cards = {42: card()}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    before = cards[42]["body"]
+
+    def fail_tombstone(**kwargs):
+        raise RuntimeError("simulated claim PATCH failure")
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False) as calls,
+            patched(
+                replay.agent_claim,
+                {"supersede_triage_claim": fail_tombstone},
+            ),
+        ):
+            result = replay.run(path, "claim-write-failure", 25)
+        state = rc._unique_state_block(cards[42]["body"])
+        assert result["eligible"] == 1
+        assert result["written"] == result["queued"] == 0
+        assert cards[42]["body"] == before
+        assert state["triage_status"] == "error"
+        assert replay.REPLAY_FIELD not in state
+        assert not calls["edits"] and not calls["queued"] and not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_absent_cache_gets_absent_marker_and_one_queued_attempt():
+    revision = "2026-07-16T10:00:00Z"
+    cards = {42: card(kind="issue-triage", revision=revision, status=None)}
+    sources = {
+        ("wheelhouse", 17, "issue-triage"): source(
+            kind="issue-triage", revision=revision
+        )
+    }
+    path = cards_file([42])
+    try:
+        with replay_environment(cards, sources) as calls:
+            result = replay.run(path, "absent-wave", 25)
+            state = rc._unique_state_block(cards[42]["body"])
+            assert result["queued"] == 1
+            assert state[replay.REPLAY_FIELD]["cleared"] == "absent"
+            assert state["triage_attempts"]["count"] == 1
+            assert len(calls["edits"]) == 1
+            assert calls["source_reads"] == [
+                ("owner", "wheelhouse", 17, "issue-triage"),
+                ("owner", "wheelhouse", 17, "issue-triage"),
+            ]
+    finally:
+        os.unlink(path)
+
+
+def test_same_revision_refresh_preserves_replay_marker():
+    value = card()
+    state = rc._unique_state_block(value["body"])
+    state[replay.REPLAY_FIELD] = valid_marker()
+    marked = rc._replace_state_block(value["body"], state)
+    refreshed = rc.render(base_item())["body"]
+    preserved = rc._preserve_same_revision_triage(
+        refreshed, marked, base_item(), state, owner="owner"
+    )
+    new_state = rc._unique_state_block(preserved)
+    assert new_state[replay.REPLAY_FIELD] == valid_marker()
+
+
+def inspect(card_value, source_value=None):
+    cards = {42: card_value}
+    sources = {
+        ("wheelhouse", 17, "pr-review"): source_value
+        if source_value is not None
+        else source()
+    }
+    with replay_environment(cards, sources):
+        return replay.inspect_candidate(42, config(), "owner", True)
+
+
+def with_state(card_value, mutate):
+    value = copy.deepcopy(card_value)
+    state = rc._unique_state_block(value["body"])
+    mutate(state)
+    value["body"] = rc._replace_state_block(value["body"], state)
+    return value
+
+
+def test_never_cleared_matrix_fails_closed():
+    queued = card(status="queued")
+    succeeded = card(status="succeeded")
+    stale = with_state(
+        card(), lambda state: state.__setitem__("triaged_sha", "deadbee")
+    )
+    closed = copy.deepcopy(card())
+    closed["state"] = "CLOSED"
+    held_queued = with_state(queued, lambda state: state.__setitem__("held", True))
+    non_refreshable = copy.deepcopy(card())
+    non_refreshable["labels"].append({"name": "processing"})
+    wrong_kind = with_state(
+        card(), lambda state: state.__setitem__("kind", "ci-approval")
+    )
+    wrong_kind["labels"] = [
+        {"name": "kind:ci-approval"} if row["name"].startswith("kind:") else row
+        for row in wrong_kind["labels"]
+    ]
+    malformed = copy.deepcopy(card())
+    malformed["body"] += "\n<!-- wheelhouse-state: {} -->"
+    unparseable_status = with_state(
+        card(), lambda state: state.__setitem__("triage_status", {"bad": True})
+    )
+    cases = [
+        (queued, source(), "queued"),
+        (succeeded, source(), "succeeded"),
+        (stale, source(), "stale revision"),
+        (closed, source(), "closed card"),
+        (held_queued, source(), "held queued"),
+        (non_refreshable, source(), "non-refreshable"),
+        (wrong_kind, source(), "wrong kind"),
+        (card(), source(state="closed"), "source closed"),
+        (card(), RuntimeError("404"), "source 404"),
+        (card(), source(revision="deadbee"), "source moved"),
+        (malformed, source(), "malformed state"),
+        (unparseable_status, source(), "unparseable status"),
+    ]
+    for value, live, label in cases:
+        plan, reason = inspect(value, live)
+        assert plan is None, (label, reason)
+
+
+def valid_marker(revision="abcdef1"):
+    return {
+        "version": 1,
+        "wave": "old-wave",
+        "revision": revision,
+        "cleared": "error",
+        "at": "2026-07-16T10:00:00Z",
+        "run_number": 12,
+    }
+
+
+def test_marker_mismatch_matrix_never_clears_or_resets_cap():
+    markers = []
+    wrong_version = valid_marker()
+    wrong_version["version"] = 2
+    markers.append(wrong_version)
+    markers.append(valid_marker("deadbee"))
+    forged = valid_marker()
+    forged["extra"] = "forged"
+    markers.append(forged)
+    malformed = "not-an-object"
+    markers.append(malformed)
+    for marker in markers:
+        value = with_state(
+            card(), lambda state: state.__setitem__(replay.REPLAY_FIELD, marker)
+        )
+        before = value["body"]
+        state_before = rc._unique_state_block(before)
+        plan, reason = inspect(value)
+        assert plan is None
+        assert reason == "replay-marker-untrusted"
+        assert value["body"] == before
+        assert rc.triage_attempt_count(state_before, "pr-review", "abcdef1", 2) == 1
+
+
+def test_replay_applies_scan_author_filter_to_live_source():
+    cases = [
+        (source(author_login="owner"), "owner"),
+        (source(author_login="co-maintainer"), "maintainer"),
+        (source(author_login="github-actions[bot]"), "bot suffix"),
+        (source(author_login="app", author_type="Bot"), "bot type"),
+    ]
+    for live, label in cases:
+        plan, reason = inspect(card(), live)
+        assert plan is None, label
+        assert reason == "source-author-excluded", (label, reason)
+
+
+def test_dry_run_and_budget_bound_list_plans_with_zero_writes():
+    cards = {42: card(number=42, target=17), 43: card(number=43, target=18)}
+    sources = {
+        ("wheelhouse", 17, "pr-review"): source(17),
+        ("wheelhouse", 18, "pr-review"): source(18),
+    }
+    path = cards_file([43, 42])
+    before = {number: value["body"] for number, value in cards.items()}
+    try:
+        output = StringIO()
+        with (
+            replay_environment(cards, sources, remaining=1) as calls,
+            redirect_stdout(output),
+        ):
+            result = replay.run(path, "dry-wave", 25, dry_run=True)
+            assert result == {"eligible": 2, "planned": 1, "deferred": 1, "written": 0}
+            assert (
+                not calls["edits"] and not calls["queued"] and not calls["dispatched"]
+            )
+            assert before == {number: value["body"] for number, value in cards.items()}
+            assert "DRY-RUN card #42" in output.getvalue()
+            assert "replay deferred 1 candidates" in output.getvalue()
+            assert "writes=0" in output.getvalue()
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_source_binding_rebuilds_exact_review_identity():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    binding = permit["source_binding"]
+    before = source(number=binding["number"], revision=binding["target_head_sha"])
+    target_bytes = base64.b64decode(
+        b"".join(
+            (ROOT / "tests/fixtures/card-1585-target.txt.b64").read_bytes().split()
+        ),
+        validate=True,
+    )
+    target_text = target_bytes.decode("utf-8")
+    source_text = target_text.split("\n", 1)[1].split("\n## Diff\n", 1)[0]
+    title, body = source_text[2:].split("\n\n", 1)
+    before.update(
+        {
+            "title": title,
+            "body": body[:-1],
+            "updated_at": binding["source_updated_at"],
+            "changed_files": 5,
+            "base": {
+                "sha": binding["base_sha"],
+                "ref": "main",
+                "repo": {"full_name": "%s/%s" % (INCIDENT_OWNER, INCIDENT_REPO)},
+            },
+        }
+    )
+    after = copy.deepcopy(before)
+    paths = json.loads(
+        (ROOT / "tests/fixtures/card-1585-target-facts.json").read_text()
+    )["paths"]
+    comparison = {
+        "base_commit": {"sha": binding["base_sha"]},
+        "commits": [{"sha": binding["target_head_sha"]}],
+        "total_commits": 1,
+        "files": [{"filename": path} for path in paths],
+    }
+    vision_bytes = (ROOT / "tests/fixtures/card-1585-vision.md").read_bytes()
+    vision = {
+        "name": "VISION.md",
+        "path": "VISION.md",
+        "type": "file",
+        "sha": binding["vision_sha"],
+        "size": len(vision_bytes),
+        "content": base64.b64encode(vision_bytes).decode("ascii"),
+    }
+
+    def fleet_read(endpoint):
+        if "/compare/" in endpoint:
+            return copy.deepcopy(comparison)
+        if endpoint.endswith("/contents/VISION.md"):
+            return copy.deepcopy(vision)
+        raise AssertionError(endpoint)
+
+    def binding_reason():
+        return replay._incident_source_binding_reason(
+            INCIDENT_OWNER,
+            INCIDENT_REPO,
+            binding["number"],
+            permit["kind"],
+            permit,
+            before,
+        )
+
+    with (
+        patched(replay, {"_fleet_json": fleet_read}),
+        patched(replay, {"_source_json": lambda *args: copy.deepcopy(after)}),
+    ):
+        assert binding_reason() == ""
+        comparison["files"][0]["filename"] = "substituted/path.go"
+        assert binding_reason() == "incident-source-binding-mismatch"
+        comparison["files"][0]["filename"] = paths[0]
+        vision["content"] = base64.b64encode(vision_bytes + b"changed").decode(
+            "ascii"
+        )
+        vision["size"] += len(b"changed")
+        assert binding_reason() == "incident-source-binding-mismatch"
+    assert hashlib.sha256(vision_bytes).hexdigest() == binding[
+        "vision_content_sha256"
+    ]
+
+
+def test_card_1585_incident_permit_binds_prior_claim_and_result():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    marker = agent_claim.event_claim_marker(permit["event_key"])
+    claim = {
+        **permit["prior_claim"],
+        "body": "Agent triage event finished with consumer.committed. %s" % marker,
+    }
+    claim.pop("status")
+    result = {
+        "id": permit["prior_result"]["id"],
+        "created_at": permit["prior_result"]["created_at"],
+        "updated_at": permit["prior_result"]["updated_at"],
+        "record": {
+            "status": permit["prior_result"]["status"],
+            "code": permit["prior_result"]["code"],
+        },
+    }
+    with (
+        patched(
+            agent_claim,
+            {
+                "list_claims": lambda *args: [copy.deepcopy(claim)],
+                "list_triage_records": lambda *args: [copy.deepcopy(result)],
+            },
+        ),
+        patched(replay, {"_card_repo_slug": lambda owner: "%s/wheelhouse" % owner}),
+    ):
+        assert replay._incident_prior_evidence_reason(INCIDENT_OWNER, permit) == ""
+        result["updated_at"] = "2026-07-23T06:38:24Z"
+        assert replay._incident_prior_evidence_reason(
+            INCIDENT_OWNER, permit
+        ) == "incident-prior-evidence-mismatch"
+
+
+def test_card_1585_incident_permit_dry_run_consumption_and_second_use():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as calls, redirect_stdout(StringIO()) as output:
+            dry = replay.run(
+                path,
+                permit["wave"],
+                1,
+                dry_run=True,
+                exact_cards=selector,
+            )
+        assert dry == {"eligible": 1, "planned": 1, "deferred": 0, "written": 0}
+        assert "triage_replay v3 incident_permit=%s" % permit["id"] in output.getvalue()
+        assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+
+        write_output = StringIO()
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as calls, redirect_stdout(write_output):
+            written = replay.run(path, permit["wave"], 1, exact_cards=selector)
+            assert exact_plan_lines(output.getvalue()) == exact_plan_lines(
+                write_output.getvalue()
+            )
+            assert written == {
+                "eligible": 1,
+                "planned": 1,
+                "deferred": 0,
+                "written": 1,
+                "queued": 1,
+            }
+            state = rc._unique_state_block(cards[permit["card"]]["body"])
+            assert state[replay.REPLAY_FIELD]["version"] == (
+                replay.INCIDENT_PERMIT_REPLAY_VERSION
+            )
+            assert state[replay.REPLAY_FIELD]["incident_permit"] == permit["id"]
+            assert state[replay.REPLAY_FIELD]["wave"] == permit["wave"]
+            assert state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+            assert state["triage_status"] == "queued"
+            assert len(calls["claims"]) == len(calls["queued"]) == 1
+            assert calls["claims"][0]["issue"] == permit["card"]
+            before_second = {key: len(value) for key, value in calls.items()}
+            try:
+                replay.run(path, permit["wave"], 1, exact_cards=selector)
+            except ValueError as error:
+                assert "requested card(s) failed validation" in str(error)
+            else:
+                raise AssertionError("consumed incident permit was reused")
+            assert len(calls["edits"]) == before_second["edits"]
+            assert len(calls["queued"]) == before_second["queued"]
+            assert len(calls["claims"]) == before_second["claims"]
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_marker_failure_preserves_prior_claim_and_retryability():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+            edit_error=RuntimeError("simulated marker failure"),
+        ) as calls:
+            try:
+                replay.run(path, permit["wave"], 1, exact_cards=selector)
+            except ValueError as error:
+                assert "permit consumption failed" in str(error)
+            else:
+                raise AssertionError("incident continued after marker failure")
+        state = rc._unique_state_block(cards[permit["card"]]["body"])
+        assert state[replay.REPLAY_FIELD] == permit["prior_marker"]
+        assert calls["events"] == ["marker-write"]
+        assert not calls["claims"] and not calls["queued"] and not calls["dispatched"]
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as scheduler_calls:
+            assert_card_1585_residual_state_is_scheduler_inert(cards, permit)
+            assert not scheduler_calls["queued"] and not scheduler_calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_tombstone_failure_leaves_consumed_marker():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+            stub_claim=False,
+        ) as calls:
+            def fail_tombstone(**kwargs):
+                calls["events"].append("tombstone")
+                raise RuntimeError("simulated tombstone failure")
+
+            with patched(
+                replay.agent_claim,
+                {"supersede_triage_claim": fail_tombstone},
+            ):
+                try:
+                    replay.run(path, permit["wave"], 1, exact_cards=selector)
+                except ValueError as error:
+                    assert "could not be claimed" in str(error)
+                else:
+                    raise AssertionError("incident continued after tombstone failure")
+        state = rc._unique_state_block(cards[permit["card"]]["body"])
+        assert state[replay.REPLAY_FIELD]["version"] == (
+            replay.INCIDENT_PERMIT_REPLAY_VERSION
+        )
+        assert calls["events"] == ["marker-write", "tombstone"]
+        assert not calls["queued"] and not calls["dispatched"]
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as second_calls:
+            assert_card_1585_residual_state_is_scheduler_inert(cards, permit)
+            assert_card_1585_incident_second_use_rejected(path, permit, selector)
+            assert (
+                not second_calls["claims"]
+                and not second_calls["queued"]
+                and not second_calls["dispatched"]
+            )
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_reservation_failure_leaves_consumed_marker():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    try:
+        with (
+            replay_environment(
+                cards,
+                sources,
+                has_readonly_token=True,
+                repository_owner="kunchenguid",
+                stub_queue=False,
+            ) as calls,
+            patched(
+                rc,
+                {"reserve_triage_budget": lambda number, item, ceiling: False},
+            ),
+        ):
+            try:
+                replay.run(path, permit["wave"], 1, exact_cards=selector)
+            except ValueError as error:
+                assert "could not be queued" in str(error)
+            else:
+                raise AssertionError("incident continued after reservation failure")
+        state = rc._unique_state_block(cards[permit["card"]]["body"])
+        assert state[replay.REPLAY_FIELD]["version"] == (
+            replay.INCIDENT_PERMIT_REPLAY_VERSION
+        )
+        assert state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+        assert state["triage_status"] == "error"
+        assert calls["events"] == ["marker-write", "tombstone"]
+        assert not calls["queued"] and not calls["dispatched"]
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as second_calls:
+            assert_card_1585_residual_state_is_scheduler_inert(cards, permit)
+            assert_card_1585_incident_second_use_rejected(path, permit, selector)
+            assert (
+                not second_calls["claims"]
+                and not second_calls["queued"]
+                and not second_calls["dispatched"]
+            )
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_queue_failure_leaves_consumed_marker():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+            queue_error=RuntimeError("simulated queue failure"),
+        ) as calls:
+            try:
+                replay.run(path, permit["wave"], 1, exact_cards=selector)
+            except ValueError as error:
+                assert "could not be queued" in str(error)
+            else:
+                raise AssertionError("incident continued after queue failure")
+        state = rc._unique_state_block(cards[permit["card"]]["body"])
+        assert state[replay.REPLAY_FIELD]["version"] == (
+            replay.INCIDENT_PERMIT_REPLAY_VERSION
+        )
+        assert state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+        assert state["triage_status"] == "error"
+        assert calls["events"] == ["marker-write", "tombstone", "queue"]
+        assert not calls["queued"] and not calls["dispatched"]
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as second_calls:
+            assert_card_1585_residual_state_is_scheduler_inert(cards, permit)
+            assert_card_1585_incident_second_use_rejected(path, permit, selector)
+            assert (
+                not second_calls["claims"]
+                and not second_calls["queued"]
+                and not second_calls["dispatched"]
+            )
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_dispatch_failure_consumes_and_rejects_second_use():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+            dispatch_error=RuntimeError("simulated dispatch failure"),
+        ) as calls:
+            try:
+                replay.run(path, permit["wave"], 1, exact_cards=selector)
+            except ValueError as error:
+                assert "could not be queued" in str(error)
+            else:
+                raise AssertionError("incident reported a failed dispatch as queued")
+            state = rc._unique_state_block(cards[permit["card"]]["body"])
+            assert state[replay.REPLAY_FIELD]["version"] == (
+                replay.INCIDENT_PERMIT_REPLAY_VERSION
+            )
+            assert calls["events"][:4] == [
+                "marker-write",
+                "tombstone",
+                "queue",
+                "dispatch",
+            ]
+            before_scheduler = {key: len(value) for key, value in calls.items()}
+            assert_card_1585_residual_state_is_scheduler_inert(cards, permit)
+            assert len(calls["queued"]) == before_scheduler["queued"]
+            assert len(calls["dispatched"]) == before_scheduler["dispatched"]
+            before_second = {key: len(value) for key, value in calls.items()}
+            assert_card_1585_incident_second_use_rejected(path, permit, selector)
+            assert len(calls["claims"]) == before_second["claims"]
+            assert len(calls["queued"]) == before_second["queued"]
+            assert len(calls["dispatched"]) == before_second["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_permit_rejects_wrong_scope_and_bindings():
+    permit = replay.CARD_1585_INCIDENT_PERMIT
+    selector = replay._canonical_exact_selector(permit["selector"])
+    cards, sources = card_1585_incident_fixture()
+    path = cards_file([])
+    cases = []
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as calls:
+            for wave, exact in (
+                (permit["wave"], "v1:1584"),
+                ("card-1585-wrong-wave", selector),
+            ):
+                try:
+                    replay.run(path, wave, 1, exact_cards=exact)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError((wave, exact))
+            try:
+                replay.run(
+                    path,
+                    permit["wave"],
+                    1,
+                    exact_cards=selector,
+                    attempts_reset_cards="1585",
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incident accepted a reset-input combination")
+            assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=False,
+            repository_owner="kunchenguid",
+        ) as calls:
+            try:
+                replay.run(path, permit["wave"], 1, exact_cards=selector)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("incident changed its bound action/token mode")
+            assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+
+        binding = permit["source_binding"]
+        moved_sources = copy.deepcopy(sources)
+        moved_sources[(INCIDENT_REPO, binding["number"], permit["kind"])][
+            "head"
+        ]["sha"] = "1" * 40
+        cases.append((moved_sources, ""))
+        cases.append((sources, "incident-source-binding-mismatch"))
+        for candidate_sources, binding_reason in cases:
+            with replay_environment(
+                copy.deepcopy(cards),
+                candidate_sources,
+                has_readonly_token=True,
+                incident_binding_reason=binding_reason,
+                repository_owner="kunchenguid",
+            ) as calls:
+                try:
+                    replay.run(path, permit["wave"], 1, exact_cards=selector)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("incident accepted a moved source binding")
+                assert not calls["edits"]
+                assert not calls["queued"]
+                assert not calls["claims"]
+
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            repository_owner="kunchenguid",
+        ) as calls:
+            with patched(replay, {"_incident_anchor_fix_present": lambda value: False}):
+                try:
+                    replay.run(path, permit["wave"], 1, exact_cards=selector)
+                except ValueError as error:
+                    assert "anchor fix" in str(error)
+                else:
+                    raise AssertionError("incident permit ran without the landed fix")
+            assert not calls["card_reads"] and not calls["source_reads"]
+    finally:
+        os.unlink(path)
+
+
+def test_card_1585_incident_permit_leaves_normal_attempt_cap_unchanged():
+    revision = "abcdef1"
+    value = card(number=42, target=17, revision=revision)
+    state = rc._unique_state_block(value["body"])
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": revision,
+        "count": 2,
+    }
+    value["body"] = rc._replace_state_block(value["body"], state)
+    cards = {42: value}
+    sources = {("wheelhouse", 17, "pr-review"): source(revision=revision)}
+    path = cards_file([])
+    try:
+        with replay_environment(cards, sources) as calls:
+            try:
+                replay.run(path, "ordinary-exhausted", 1, exact_cards="v1:42")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("ordinary replay exceeded the normal cap")
+            assert config()["triage_attempt_cap_per_revision"] == 2
+            assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+    finally:
+        os.unlink(path)
+
+
+def test_exact_selector_isolates_non_prefix_cohort_and_emits_revisions():
+    all_numbers = [
+        508,
+        1421,
+        1454,
+        1460,
+        1483,
+        1532,
+        1537,
+        1567,
+        1579,
+        1580,
+        1581,
+        1582,
+        1584,
+        1585,
+        1586,
+        1587,
+        1588,
+        1589,
+        1590,
+        1591,
+        1592,
+        1593,
+        1594,
+        1595,
+        1596,
+        1597,
+        1598,
+        1599,
+        1600,
+        1601,
+        1602,
+    ]
+    requested = (1483, 1584, 1585, 1586, 1594, 1598)
+    selector = "v1:" + ",".join(str(number) for number in requested)
+    cards, sources, revisions = exact_fixture(all_numbers)
+    path = cards_file(list(reversed(all_numbers)))
+    try:
+        output = StringIO()
+        with (
+            replay_environment(cards, sources) as calls,
+            redirect_stdout(output),
+        ):
+            result = replay.run(
+                path,
+                "missing-re-recovery-r2",
+                len(requested),
+                dry_run=True,
+                exact_cards=selector,
+            )
+        assert result == {
+            "eligible": len(requested),
+            "planned": len(requested),
+            "deferred": 0,
+            "written": 0,
+        }
+        assert calls["card_reads"] == list(requested) * 2
+        assert [read[2] for read in calls["source_reads"]] == [
+            cards[number]["number"] + 20_000 for number in requested
+        ] * 2
+        assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+        assert "canonical=%s count=6" % selector in output.getvalue()
+        assert exact_plan_lines(output.getvalue()) == [
+            "replay exact-selector/v1 admitted card #%s: revision=%s clear=error"
+            % (number, revisions[number])
+            for number in requested
+        ]
+        assert "card #508" not in output.getvalue()
+    finally:
+        os.unlink(path)
+
+
+def test_exact_selector_dry_run_and_write_plans_are_identical():
+    requested = (1483, 1584, 1585, 1586, 1594, 1598)
+    selector = "v1:" + ",".join(str(number) for number in requested)
+
+    def execute(dry_run):
+        cards, sources, revisions = exact_fixture(requested)
+        path = cards_file([1, *reversed(requested)])
+        output = StringIO()
+        try:
+            with (
+                replay_environment(cards, sources) as calls,
+                redirect_stdout(output),
+            ):
+                result = replay.run(
+                    path,
+                    "missing-re-recovery-r2",
+                    len(requested),
+                    dry_run=dry_run,
+                    exact_cards=selector,
+                )
+            return result, calls, output.getvalue(), revisions, cards
+        finally:
+            os.unlink(path)
+
+    dry_result, dry_calls, dry_output, revisions, _ = execute(True)
+    write_result, write_calls, write_output, _, written_cards = execute(False)
+    expected_plans = [
+        "replay exact-selector/v1 admitted card #%s: revision=%s clear=error"
+        % (number, revisions[number])
+        for number in requested
+    ]
+    assert exact_plan_lines(dry_output) == exact_plan_lines(write_output)
+    assert exact_plan_lines(write_output) == expected_plans
+    assert dry_result["planned"] == write_result["planned"] == len(requested)
+    assert dry_result["written"] == 0
+    assert write_result["written"] == write_result["queued"] == len(requested)
+    assert not dry_calls["edits"] and not dry_calls["queued"]
+    assert [entry[0] for entry in write_calls["queued"]] == list(requested)
+    assert all(
+        rc._unique_state_block(written_cards[number]["body"])[replay.REPLAY_FIELD][
+            "revision"
+        ]
+        == revisions[number]
+        for number in requested
+    )
+
+
+def test_exact_selector_contract_rejects_malformed_and_limit_mismatches_before_reads():
+    assert replay._exact_card_scope("") == ()
+    assert replay._exact_card_scope("v1:3,1,2") == (1, 2, 3)
+    malformed = (
+        "v1:",
+        "v1:1,",
+        "v1:,1",
+        "v1:1,,2",
+        "v1:1-2",
+        "v1:*",
+        "v1:1x",
+        "v1:01",
+        "v1:1,1",
+        "v2:1",
+        " v1:1",
+        "v1:1 ",
+        "v1:" + ",".join(str(number) for number in range(1, 27)),
+        "v1:9007199254740992",
+        "v1:" + "9" * replay.EXACT_SELECTOR_MAX_BYTES,
+    )
+    path = cards_file([])
+    try:
+        with replay_environment({}, {}) as calls:
+            for value in malformed:
+                try:
+                    replay.run(path, "exact-contract", 1, exact_cards=value)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("accepted malformed selector %r" % value)
+            try:
+                replay.run(path, "exact-contract", 1, exact_cards="v1:1,2")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("accepted limit-inconsistent selector")
+            assert not calls["card_reads"] and not calls["source_reads"]
+            assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+            assert not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_exact_selector_requested_rejections_are_atomic_and_never_substitute():
+    requested = (42, 43)
+    selector = "v1:42,43"
+
+    def attempt(mutator):
+        cards, sources, _ = exact_fixture((1, *requested))
+        mutator(cards, sources)
+        path = cards_file([1, *requested])
+        output = StringIO()
+        try:
+            with (
+                replay_environment(cards, sources) as calls,
+                redirect_stdout(output),
+            ):
+                try:
+                    replay.run(
+                        path,
+                        "exact-rejection",
+                        len(requested),
+                        exact_cards=selector,
+                    )
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("exact selector accepted rejected request")
+            assert 1 not in calls["card_reads"]
+            assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+            assert not calls["dispatched"]
+            assert "refused card #43" in output.getvalue()
+        finally:
+            os.unlink(path)
+
+    attempt(lambda cards, sources: cards.pop(43))
+
+    def non_refreshable(cards, sources):
+        cards[43]["labels"].append({"name": "processing"})
+
+    attempt(non_refreshable)
+
+    def head_moved(cards, sources):
+        sources[("wheelhouse", 20_043, "pr-review")]["head"]["sha"] = "deadbee"
+
+    attempt(head_moved)
+
+    def already_recovered(cards, sources):
+        state = rc._unique_state_block(cards[43]["body"])
+        state["triage_status"] = "succeeded"
+        cards[43]["body"] = rc._replace_state_block(cards[43]["body"], state)
+
+    attempt(already_recovered)
+
+    def already_replayed(cards, sources):
+        state = rc._unique_state_block(cards[43]["body"])
+        state[replay.REPLAY_FIELD] = valid_marker("%07x" % 43)
+        state["triage_status"] = "queued"
+        cards[43]["body"] = rc._replace_state_block(cards[43]["body"], state)
+
+    attempt(already_replayed)
+
+    def attempt_exhausted(cards, sources):
+        state = rc._unique_state_block(cards[43]["body"])
+        state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+            "version": rc.TRIAGE_ATTEMPTS_VERSION,
+            "kind": "pr-review",
+            "revision": "%07x" % 43,
+            "count": 2,
+        }
+        cards[43]["body"] = rc._replace_state_block(cards[43]["body"], state)
+
+    attempt(attempt_exhausted)
+
+
+def test_exact_selector_refuses_budget_and_preflight_races_before_writes():
+    requested = (42, 43)
+    selector = "v1:42,43"
+    cards, sources, _ = exact_fixture(requested)
+    path = cards_file([1, *requested])
+    try:
+        output = StringIO()
+        with (
+            replay_environment(cards, sources, remaining=1) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                replay.run(path, "exact-budget", 2, exact_cards=selector)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("exact selector accepted partial budget")
+        assert "refused cards #42,#43: insufficient-budget" in output.getvalue()
+        assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+    finally:
+        os.unlink(path)
+
+    cards, sources, _ = exact_fixture(requested)
+
+    def race_card(number, read_count, live_cards):
+        if number == 43 and read_count == 4:
+            live_cards[number]["labels"].append({"name": "processing"})
+
+    path = cards_file([1, *requested])
+    try:
+        output = StringIO()
+        with (
+            replay_environment(cards, sources, card_read_hook=race_card) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                replay.run(path, "exact-race", 2, exact_cards=selector)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("exact selector mutated after preflight race")
+        assert "refused card #43: card-not-refreshable" in output.getvalue()
+        assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+    finally:
+        os.unlink(path)
+
+
+def test_exact_selector_never_replaces_reviewed_revision_during_write():
+    cards, sources, revisions = exact_fixture((42,))
+    path = cards_file([42])
+    output = StringIO()
+
+    def advance_card_and_target(number, read_count, live_cards):
+        if read_count != 3:
+            return
+        replacement_revision = "deadbee"
+        live_cards[number] = card(
+            number=number,
+            target=20_042,
+            revision=replacement_revision,
+        )
+        sources[("wheelhouse", 20_042, "pr-review")] = source(
+            number=20_042,
+            revision=replacement_revision,
+        )
+
+    try:
+        with (
+            replay_environment(
+                cards,
+                sources,
+                card_read_hook=advance_card_and_target,
+            ) as calls,
+            redirect_stdout(output),
+        ):
+            try:
+                replay.run(
+                    path,
+                    "exact-revision-race",
+                    1,
+                    exact_cards="v1:42",
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("exact selector replaced the reviewed revision")
+        assert (
+            "replay exact-selector/v1 admitted card #42: revision=%s clear=error"
+            % revisions[42]
+            in output.getvalue()
+        )
+        assert "card-raced-before-replay" in output.getvalue()
+        assert not calls["edits"] and not calls["queued"] and not calls["claims"]
+        assert not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_exact_selector_keeps_claim_tombstone_authoritative():
+    cards, sources, _ = exact_fixture((42,))
+    path = cards_file([1, 42])
+
+    def fail_tombstone(**kwargs):
+        raise RuntimeError("simulated claim PATCH failure")
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False) as calls,
+            patched(replay.agent_claim, {"supersede_triage_claim": fail_tombstone}),
+        ):
+            try:
+                replay.run(path, "exact-claim", 1, exact_cards="v1:42")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("exact selector bypassed claim tombstone")
+        assert not calls["edits"] and not calls["queued"] and not calls["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_no_exact_selector_preserves_legacy_sorted_prefix():
+    numbers = (5, 2, 9)
+    cards, sources, _ = exact_fixture(numbers)
+    path = cards_file(numbers)
+    try:
+        output = StringIO()
+        with replay_environment(cards, sources) as calls, redirect_stdout(output):
+            result = replay.run(path, "legacy-prefix", 2, dry_run=True)
+        assert result == {"eligible": 3, "planned": 2, "deferred": 1, "written": 0}
+        assert "DRY-RUN card #2" in output.getvalue()
+        assert "DRY-RUN card #5" in output.getvalue()
+        assert "DRY-RUN card #9" not in output.getvalue()
+        assert calls["card_reads"] == [2, 5, 9]
+    finally:
+        os.unlink(path)
+
+
+def test_entry_conditions_reject_schedule_non_owner_bad_wave_and_bad_limit():
+    old_env = dict(os.environ)
+    valid = {
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REPOSITORY_OWNER": "owner",
+        "GITHUB_REPOSITORY": "owner/wheelhouse",
+        "GITHUB_ACTOR": "owner",
+        "GITHUB_RUN_NUMBER": "77",
+        "WHEELHOUSE_AUTO_TRIAGE_HAS_READONLY_TOKEN": "false",
+    }
+    try:
+        os.environ.update(valid)
+        assert replay._entry("valid-wave", 25) == ("owner", 77)
+        cases = [
+            ({"GITHUB_EVENT_NAME": "schedule"}, "valid-wave", 25),
+            ({"GITHUB_ACTOR": "someone-else"}, "valid-wave", 25),
+            ({}, "Bad_Wave", 25),
+            ({}, "", 25),
+            ({}, "valid-wave", 0),
+            ({}, "valid-wave", 26),
+            ({"GITHUB_RUN_NUMBER": "not-a-number"}, "valid-wave", 25),
+        ]
+        for env_overrides, wave, limit in cases:
+            os.environ.update(valid)
+            os.environ.update(env_overrides)
+            try:
+                replay._entry(wave, limit)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError((env_overrides, wave, limit))
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+class FakeRecordGh:
+    def __init__(self):
+        self.comments = []
+        self.next_id = 1
+        self.writes = []
+
+    def __call__(self, *args):
+        if "--paginate" in args:
+            return [copy.deepcopy(self.comments)]
+        method = args[args.index("--method") + 1] if "--method" in args else "GET"
+        endpoint = next(value for value in args if value.startswith("repos/"))
+        if method in {"POST", "PATCH"}:
+            body = next(value[5:] for value in args if value.startswith("body="))
+            self.writes.append((method, endpoint, body))
+            if method == "POST":
+                row = {
+                    "id": self.next_id,
+                    "body": body,
+                    "user": {"login": "github-actions[bot]"},
+                }
+                self.next_id += 1
+                self.comments.append(row)
+                return copy.deepcopy(row)
+            comment_id = int(endpoint.rsplit("/", 1)[-1])
+            row = next(row for row in self.comments if row["id"] == comment_id)
+            row["body"] = body
+            return copy.deepcopy(row)
+        comment_id = int(endpoint.rsplit("/", 1)[-1])
+        return copy.deepcopy(
+            next(row for row in self.comments if row["id"] == comment_id)
+        )
+
+
+class FakeClaimGh:
+    def __init__(self):
+        self.comments = []
+        self.next_id = 1
+
+    def __call__(self, *args):
+        if "--paginate" in args:
+            return [copy.deepcopy(self.comments)]
+        method = args[args.index("--method") + 1] if "--method" in args else "GET"
+        endpoint = next(value for value in args if value.startswith("repos/"))
+        if method in {"POST", "PATCH"}:
+            body = next(value[5:] for value in args if value.startswith("body="))
+            if method == "POST":
+                row = {
+                    "id": self.next_id,
+                    "body": body,
+                    "user": {"login": "github-actions[bot]"},
+                    "created_at": "2026-07-16T09:00:00Z",
+                    "updated_at": "2026-07-16T09:00:00Z",
+                }
+                self.next_id += 1
+                self.comments.append(row)
+                return copy.deepcopy(row)
+            comment_id = int(endpoint.rsplit("/", 1)[-1])
+            row = next(row for row in self.comments if row["id"] == comment_id)
+            row["body"] = body
+            row["updated_at"] = "2026-07-16T11:00:00Z"
+            return copy.deepcopy(row)
+        comment_id = int(endpoint.rsplit("/", 1)[-1])
+        return copy.deepcopy(
+            next(row for row in self.comments if row["id"] == comment_id)
+        )
+
+
+def triage_claim_args():
+    return argparse.Namespace(
+        action="triage.pr.local",
+        owner="owner",
+        repo="wheelhouse",
+        number=17,
+        issue=42,
+        revision="abcdef1",
+        event_id="",
+        review_context="a" * 64,
+        recovery_context="",
+        repo_slug="owner/wheelhouse",
+    )
+
+
+def test_duplicate_only_evidence_requires_a_terminal_pre_replay_claim_and_record():
+    args = triage_claim_args()
+    identity = agent_claim.normalized_event_identity(
+        action=args.action,
+        owner=args.owner,
+        repo=args.repo,
+        number=args.number,
+        card_issue=args.issue,
+        revision=args.revision,
+    )
+    event_key = agent_claim.event_key_sha256(identity)
+    marker = agent_claim.event_claim_marker(event_key)
+    fake = FakeClaimGh()
+    fake.comments.append(
+        {
+            "id": 1,
+            "body": "Agent triage event finished with consumer.committed. %s" % marker,
+            "user": {"login": "github-actions[bot]"},
+            "created_at": "2026-07-16T09:00:00Z",
+            "updated_at": "2026-07-16T09:00:00Z",
+        }
+    )
+    evidence = dict(
+        action=args.action,
+        owner=args.owner,
+        repo=args.repo,
+        number=args.number,
+        issue=args.issue,
+        revision=args.revision,
+        repo_slug=args.repo_slug,
+        replayed_at="2026-07-16T10:00:00Z",
+    )
+    with patched(agent_claim, {"gh_json": fake}):
+        assert agent_claim.triage_replay_duplicate_only_evidence(**evidence)
+        fake.comments[0]["body"] = (
+            "Agent event admitted and is being processed.\n\n%s" % marker
+        )
+        assert not agent_claim.triage_replay_duplicate_only_evidence(**evidence)
+        fake.comments[0]["body"] = (
+            "Agent triage event finished with consumer.committed. %s" % marker
+        )
+        fake.comments[0]["updated_at"] = "2026-07-16T11:00:00Z"
+        assert not agent_claim.triage_replay_duplicate_only_evidence(**evidence)
+        fake.comments[0]["updated_at"] = "2026-07-16T09:00:00Z"
+        fake.comments.append(
+            {
+                "id": 2,
+                "body": agent_claim.triage_record_body(
+                    event_key, "abcdef1", "error", "consumer.rejected"
+                ),
+                "user": {"login": "github-actions[bot]"},
+                "created_at": "2026-07-16T11:00:00Z",
+                "updated_at": "2026-07-16T11:00:00Z",
+            }
+        )
+        assert not agent_claim.triage_replay_duplicate_only_evidence(**evidence)
+
+
+def test_replay_supersedes_failed_attempt_claim_before_exact_revision_readmission():
+    cards = {42: card()}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    fake = FakeClaimGh()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "output"
+            old_output = os.environ.get("GITHUB_OUTPUT")
+            os.environ["GITHUB_OUTPUT"] = str(output_path)
+            try:
+                with (
+                    patched(agent_claim, {"gh_json": fake}),
+                    patched(replay.agent_claim, {"gh_json": fake}),
+                ):
+                    assert agent_claim.claim(triage_claim_args()) == 0
+                    first_outputs = output_path.read_text(encoding="utf-8")
+                    assert "admitted=true" in first_outputs
+                    marker = next(
+                        line.split("=", 1)[1]
+                        for line in first_outputs.splitlines()
+                        if line.startswith("marker=")
+                    )
+                    fake.comments[0]["body"] = (
+                        "Agent triage event finished with consumer.committed. %s"
+                        % marker
+                    )
+
+                    with replay_environment(cards, sources, stub_claim=False):
+                        replayed = replay.run(path, "claim-gap", 25)
+                    assert replayed["queued"] == 1
+                    assert (
+                        rc._unique_state_block(cards[42]["body"])["triage_status"]
+                        == "queued"
+                    )
+
+                    output_path.write_text("", encoding="utf-8")
+                    assert agent_claim.claim(triage_claim_args()) == 0
+                    second_outputs = output_path.read_text(encoding="utf-8")
+                    assert "admitted=true" in second_outputs
+                    assert marker not in fake.comments[0]["body"]
+            finally:
+                if old_output is None:
+                    os.environ.pop("GITHUB_OUTPUT", None)
+                else:
+                    os.environ["GITHUB_OUTPUT"] = old_output
+    finally:
+        os.unlink(path)
+
+
+def test_duplicate_only_parked_replay_does_not_consume_cap_or_once_marker():
+    parked = card()
+    state = rc._unique_state_block(parked["body"])
+    state = rc._state_with_triage(state, "abcdef1", "queued")
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "abcdef1",
+        "count": 2,
+    }
+    state[replay.REPLAY_FIELD] = valid_marker()
+    parked["body"] = rc._replace_state_block(parked["body"], state)
+    cards = {42: parked}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    fake = FakeClaimGh()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "output"
+            old_output = os.environ.get("GITHUB_OUTPUT")
+            os.environ["GITHUB_OUTPUT"] = str(output_path)
+            try:
+                with (
+                    patched(agent_claim, {"gh_json": fake}),
+                    patched(replay.agent_claim, {"gh_json": fake}),
+                ):
+                    assert agent_claim.claim(triage_claim_args()) == 0
+                    claim_outputs = output_path.read_text(encoding="utf-8")
+                    event_key = next(
+                        line.split("=", 1)[1]
+                        for line in claim_outputs.splitlines()
+                        if line.startswith("event_key=")
+                    )
+                    marker = next(
+                        line.split("=", 1)[1]
+                        for line in claim_outputs.splitlines()
+                        if line.startswith("marker=")
+                    )
+                    fake.comments[0]["body"] = (
+                        "Agent triage event finished with consumer.committed. %s"
+                        % marker
+                    )
+                    agent_claim.record_triage_result(
+                        record_args(event_key, "error", "consumer.committed")
+                    )
+
+                    with (
+                        replay_environment(cards, sources, stub_claim=False),
+                        patched(
+                            replay.agent_claim,
+                            {"triage_replay_duplicate_only_evidence": lambda **kwargs: True},
+                        ),
+                    ):
+                        result = replay.run(path, "cohort-reentry", 25)
+
+                    new_state = rc._unique_state_block(cards[42]["body"])
+                    assert result["eligible"] == result["queued"] == 1
+                    assert new_state["triage_status"] == "queued"
+                    assert new_state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+                    assert new_state[replay.REPLAY_FIELD]["wave"] == "cohort-reentry"
+                    assert marker not in fake.comments[0]["body"]
+            finally:
+                if old_output is None:
+                    os.environ.pop("GITHUB_OUTPUT", None)
+                else:
+                    os.environ["GITHUB_OUTPUT"] = old_output
+    finally:
+        os.unlink(path)
+
+
+def _tombstone_body(event_key, original_updated_at="2026-07-16T09:00:00Z"):
+    marker = replay.agent_claim.triage_claim_superseded_marker(
+        event_key, original_updated_at
+    )
+    return (
+        "Agent triage event finished with consumer.committed. %s\n\n"
+        "Superseded by an operator-approved exact-revision auto-triage replay."
+        % marker
+    )
+
+
+def _get_card_tombstone_comment(issue, comment_id, event_key):
+    return {
+        "id": "IC_lag_%s" % comment_id,
+        "url": (
+            "https://github.com/owner/wheelhouse/issues/%s#issuecomment-%s"
+            % (issue, comment_id)
+        ),
+        "author": {"login": "github-actions"},
+        "body": _tombstone_body(event_key),
+        "createdAt": "2026-07-16T09:00:00Z",
+        "updatedAt": "2026-07-16T11:00:00Z",
+    }
+
+
+def test_card_shows_superseded_claim_requires_exact_id_and_marker():
+    event_key = "ab" * 32
+    comment = _get_card_tombstone_comment(42, 77, event_key)
+    card_row = {"number": 42, "comments": [comment]}
+    assert replay.card_shows_superseded_claim(
+        card_row, comment_id=77, event_key=event_key
+    )
+    assert not replay.card_shows_superseded_claim(
+        card_row, comment_id=78, event_key=event_key
+    )
+    assert not replay.card_shows_superseded_claim(
+        card_row, comment_id=77, event_key="cd" * 32
+    )
+    stale = copy.deepcopy(card_row)
+    stale["comments"][0]["body"] = "Agent triage event finished with consumer.committed."
+    assert not replay.card_shows_superseded_claim(
+        stale, comment_id=77, event_key=event_key
+    )
+    # Any comments change without the exact tombstone is insufficient.
+    foreign = {"number": 42, "comments": [{"id": 1, "body": "owner note"}]}
+    assert not replay.card_shows_superseded_claim(
+        foreign, comment_id=77, event_key=event_key
+    )
+    assert not replay.card_shows_superseded_claim(
+        {"number": 42, "comments": 3}, comment_id=77, event_key=event_key
+    )
+
+
+def test_tombstone_visibility_poll_waits_then_queues_without_false_race():
+    """Production self-race shape: first get_card is pre-tombstone, later visible."""
+    cards = {
+        42: card(),
+        43: card(number=43, target=18, revision="bbcdef2"),
+    }
+    sources = {
+        ("wheelhouse", 17, "pr-review"): source(),
+        ("wheelhouse", 18, "pr-review"): source(number=18, revision="bbcdef2"),
+    }
+    path = cards_file([42, 43])
+    event_keys = {}
+    comment_ids = {42: 501, 43: 502}
+    visibility_polls = []
+    sleeps = []
+    poll_counts = {42: 0, 43: 0}
+
+    def supersede(**kwargs):
+        identity = replay.agent_claim.normalized_event_identity(
+            action=kwargs["action"],
+            owner=kwargs["owner"],
+            repo=kwargs["repo"],
+            number=kwargs["number"],
+            card_issue=kwargs["issue"],
+            revision=kwargs["revision"],
+        )
+        event_key = replay.agent_claim.event_key_sha256(identity)
+        issue = kwargs["issue"]
+        event_keys[issue] = event_key
+        # Deliberately do NOT mirror into get_card yet - the poll must wait.
+        cards[issue]["comments"] = []
+        return {
+            "event_key": event_key,
+            "superseded": True,
+            "comment_id": comment_ids[issue],
+            "body": _tombstone_body(event_key),
+        }
+
+    def get_card_with_lag(number):
+        value = cards.get(number)
+        if value is None:
+            return None
+        # After supersede records the event key, empty comments mean the
+        # visibility poll is still waiting on GitHub replication.
+        if (
+            number in event_keys
+            and value.get("comments") == []
+            and not replay.card_shows_superseded_claim(
+                value,
+                comment_id=comment_ids[number],
+                event_key=event_keys[number],
+            )
+        ):
+            poll_counts[number] += 1
+            visibility_polls.append(number)
+            if poll_counts[number] >= 2:
+                value = copy.deepcopy(value)
+                value["comments"] = [
+                    _get_card_tombstone_comment(
+                        number, comment_ids[number], event_keys[number]
+                    )
+                ]
+                value["updatedAt"] = "2026-07-16T11:00:00Z"
+                cards[number]["comments"] = value["comments"]
+                cards[number]["updatedAt"] = value["updatedAt"]
+                return value
+        return copy.deepcopy(value)
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False) as calls,
+            patched(
+                replay.agent_claim,
+                {"supersede_triage_claim": supersede},
+            ),
+            patched(rc, {"get_card": get_card_with_lag}),
+            patched(
+                replay, {"_tombstone_sleep": lambda seconds: sleeps.append(seconds)}
+            ),
+        ):
+            result = replay.run(path, "visibility-wave", 2, exact_cards="v1:42,43")
+        assert result["eligible"] == result["queued"] == 2
+        assert result["written"] == 2
+        assert poll_counts[42] >= 2 and poll_counts[43] >= 2
+        assert sleeps  # deterministic injected sleep, no wall clock
+        assert all(
+            delay == replay.TOMBSTONE_VISIBILITY_DELAY_SECONDS for delay in sleeps
+        )
+        for number in (42, 43):
+            state = rc._unique_state_block(cards[number]["body"])
+            assert state["triage_status"] == "queued"
+            assert state[replay.REPLAY_FIELD]["wave"] == "visibility-wave"
+        # Multi-card order: first card's visibility polls complete before second.
+        assert visibility_polls[0] == 42
+        assert 42 in visibility_polls and 43 in visibility_polls
+        first_43 = visibility_polls.index(43)
+        assert all(n == 42 for n in visibility_polls[:first_43])
+    finally:
+        os.unlink(path)
+
+
+def test_tombstone_visibility_waits_for_updated_at_after_comment_arrives():
+    event_key = "ab" * 32
+    comment_id = 503
+    value = card()
+    value["comments"] = [
+        _get_card_tombstone_comment(value["number"], comment_id, event_key)
+    ]
+    stale_updated_at = value["updatedAt"]
+    settled_updated_at = "2026-07-16T11:00:00Z"
+    reads = []
+    sleeps = []
+
+    def get_card_with_staggered_snapshot(number):
+        row = copy.deepcopy(value)
+        if len(reads) >= 1:
+            row["updatedAt"] = settled_updated_at
+        reads.append(replay.projection_writer.card_snapshot(row))
+        return row
+
+    with (
+        patched(rc, {"get_card": get_card_with_staggered_snapshot}),
+        patched(replay, {"_tombstone_sleep": lambda seconds: sleeps.append(seconds)}),
+    ):
+        assert replay.wait_for_claim_tombstone_visibility(
+            value["number"],
+            {
+                "event_key": event_key,
+                "superseded": True,
+                "comment_id": comment_id,
+            },
+        )
+
+    assert len(reads) == 3
+    assert reads[0]["updated_at"] == stale_updated_at
+    assert reads[1]["updated_at"] == reads[2]["updated_at"] == settled_updated_at
+    assert reads[0]["comments"] == reads[1]["comments"] == reads[2]["comments"]
+    assert len(sleeps) == 2
+
+
+def test_tombstone_visibility_timeout_pauses_with_zero_queue_or_budget_writes():
+    cards = {
+        42: card(),
+        43: card(number=43, target=18, revision="bbcdef2"),
+    }
+    sources = {
+        ("wheelhouse", 17, "pr-review"): source(),
+        ("wheelhouse", 18, "pr-review"): source(number=18, revision="bbcdef2"),
+    }
+    path = cards_file([42, 43])
+    before = {number: value["body"] for number, value in cards.items()}
+    sleeps = []
+    budget_calls = []
+
+    tombstones = []
+
+    def supersede(**kwargs):
+        identity = replay.agent_claim.normalized_event_identity(
+            action=kwargs["action"],
+            owner=kwargs["owner"],
+            repo=kwargs["repo"],
+            number=kwargs["number"],
+            card_issue=kwargs["issue"],
+            revision=kwargs["revision"],
+        )
+        event_key = replay.agent_claim.event_key_sha256(identity)
+        # Tombstone authorized, but get_card never observes it.
+        cards[kwargs["issue"]]["comments"] = []
+        tombstones.append(kwargs["issue"])
+        return {
+            "event_key": event_key,
+            "superseded": True,
+            "comment_id": 777,
+            "body": _tombstone_body(event_key),
+        }
+
+    def reserve(number, item, ceiling):
+        budget_calls.append(number)
+        raise AssertionError("budget reserved before tombstone visibility")
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False, stub_queue=False) as calls,
+            patched(replay.agent_claim, {"supersede_triage_claim": supersede}),
+            patched(
+                rc,
+                {
+                    "reserve_triage_budget": reserve,
+                    "_configured_triage_spend_limits": lambda item: (2, 1200, 2),
+                },
+            ),
+            patched(
+                replay, {"_tombstone_sleep": lambda seconds: sleeps.append(seconds)}
+            ),
+        ):
+            try:
+                replay.run(path, "visibility-timeout", 2, exact_cards="v1:42,43")
+            except ValueError as error:
+                assert "could not be queued" in str(error)
+            else:
+                raise AssertionError("visibility timeout did not pause the wave")
+        assert len(sleeps) == replay.TOMBSTONE_VISIBILITY_ATTEMPTS - 1
+        assert not budget_calls
+        assert not calls["queued"] and not calls["dispatched"]
+        # Authorized tombstone only - no replay marker / queued cache body write.
+        assert "queue" not in calls["events"] and not calls["edits"]
+        assert cards[42]["body"] == before[42]
+        assert cards[43]["body"] == before[43]
+        # Partial-progress semantics: first card blocked visibility; second never
+        # reached claim mutation.
+        assert tombstones == [42]
+    finally:
+        os.unlink(path)
+
+
+def test_tombstone_visibility_absent_claim_skips_poll_without_invented_success():
+    cards = {42: card()}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    sleeps = []
+    supersedes = []
+
+    def supersede(**kwargs):
+        supersedes.append(kwargs["issue"])
+        identity = replay.agent_claim.normalized_event_identity(
+            action=kwargs["action"],
+            owner=kwargs["owner"],
+            repo=kwargs["repo"],
+            number=kwargs["number"],
+            card_issue=kwargs["issue"],
+            revision=kwargs["revision"],
+        )
+        return {
+            "event_key": replay.agent_claim.event_key_sha256(identity),
+            "superseded": False,
+        }
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False) as calls,
+            patched(replay.agent_claim, {"supersede_triage_claim": supersede}),
+            patched(
+                replay, {"_tombstone_sleep": lambda seconds: sleeps.append(seconds)}
+            ),
+        ):
+            result = replay.run(path, "absent-claim-wave", 25)
+        assert result["queued"] == 1
+        assert not sleeps  # no visibility poll when supersede is a no-op
+        assert supersedes == [42]
+        assert "queue" in calls["events"]
+    finally:
+        os.unlink(path)
+
+
+def test_tombstone_visibility_malformed_supersede_pauses_without_queue():
+    cards = {42: card()}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    before = cards[42]["body"]
+    sleeps = []
+
+    def supersede(**kwargs):
+        # superseded True without comment_id must not invent visibility success.
+        return {"event_key": "ab" * 32, "superseded": True}
+
+    try:
+        with (
+            replay_environment(cards, sources, stub_claim=False) as calls,
+            patched(replay.agent_claim, {"supersede_triage_claim": supersede}),
+            patched(replay, {"_tombstone_sleep": lambda seconds: sleeps.append(seconds)}),
+        ):
+            try:
+                replay.run(path, "malformed-tombstone", 1, exact_cards="v1:42")
+            except ValueError as error:
+                assert "could not be queued" in str(error)
+            else:
+                raise AssertionError("malformed supersede did not pause")
+        assert not sleeps
+        assert not calls["queued"]
+        assert cards[42]["body"] == before
+    finally:
+        os.unlink(path)
+
+
+def test_post_visibility_foreign_mutation_still_fails_projection_cas():
+    """Visibility success must not weaken the projection writer's race CAS."""
+    value = card()
+    state = rc._unique_state_block(value["body"])
+    state[rc.PROJECTION_OWNER_FIELD] = rc.PROJECTION_OWNER
+    value["body"] = rc._replace_state_block(value["body"], state)
+    cards = {42: value}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    phase = {"name": "pre", "event_key": "", "queue_reads": 0}
+    cas_deferred = []
+
+    def supersede(**kwargs):
+        identity = replay.agent_claim.normalized_event_identity(
+            action=kwargs["action"],
+            owner=kwargs["owner"],
+            repo=kwargs["repo"],
+            number=kwargs["number"],
+            card_issue=kwargs["issue"],
+            revision=kwargs["revision"],
+        )
+        event_key = replay.agent_claim.event_key_sha256(identity)
+        phase["event_key"] = event_key
+        phase["name"] = "visible"
+        comment_id = 888
+        cards[42]["comments"] = [
+            _get_card_tombstone_comment(42, comment_id, event_key)
+        ]
+        cards[42]["updatedAt"] = "2026-07-16T11:00:00Z"
+        return {
+            "event_key": event_key,
+            "superseded": True,
+            "comment_id": comment_id,
+            "body": _tombstone_body(event_key),
+        }
+
+    original_wait = replay.wait_for_claim_tombstone_visibility
+
+    def wait_then_queue_phase(number, superseded):
+        ok = original_wait(number, superseded)
+        if ok:
+            phase["name"] = "queue"
+        return ok
+
+    def get_card_foreign_race(number):
+        row = copy.deepcopy(cards.get(number))
+        if phase["name"] != "queue" or row is None:
+            return row
+        # mark_triage_queued prewrite snapshot vs later post-reservation /
+        # projection CAS reread: inject a genuine foreign body+comments mutation.
+        phase["queue_reads"] += 1
+        if phase["queue_reads"] == 1:
+            return row
+        row["body"] = row["body"] + "\n\n<!-- owner edit -->\n"
+        row["updatedAt"] = "2026-07-16T11:05:00Z"
+        row["comments"] = list(row.get("comments") or []) + [
+            {
+                "id": "IC_owner",
+                "author": {"login": "owner"},
+                "body": "I am deciding this now",
+                "url": (
+                    "https://github.com/owner/wheelhouse/issues/42"
+                    "#issuecomment-999"
+                ),
+            }
+        ]
+        return row
+
+    import projection_writer
+
+    original_commit = projection_writer.commit_preplanned
+
+    def commit_tracking(*args, **kwargs):
+        outcome = original_commit(*args, **kwargs)
+        cas_deferred.append(outcome)
+        return outcome
+
+    try:
+        with (
+            replay_environment(
+                cards, sources, stub_claim=False, stub_queue=False
+            ) as calls,
+            patched(replay.agent_claim, {"supersede_triage_claim": supersede}),
+            patched(
+                replay,
+                {
+                    "wait_for_claim_tombstone_visibility": wait_then_queue_phase,
+                    "_tombstone_sleep": lambda seconds: None,
+                },
+            ),
+            patched(
+                rc,
+                {
+                    "get_card": get_card_foreign_race,
+                    "reserve_triage_budget": lambda number, item, ceiling: True,
+                    "_configured_triage_spend_limits": lambda item: (2, 1200, 2),
+                    # This focused legacy replay-CAS fixture predates the v2
+                    # observation contract. The production-shaped admission
+                    # lifecycle is covered separately below.
+                    "_triage_admission_context_record": lambda state, item, revision: {
+                        "version": rc.TRIAGE_ADMISSION_CONTEXT_VERSION,
+                        "kind": "pr-review",
+                        "revision": revision,
+                        "observation_id": "sha256:" + "a" * 64,
+                        "base_sha": "b" * 40,
+                        "vision_sha": None,
+                    },
+                },
+            ),
+            patched(projection_writer, {"commit_preplanned": commit_tracking}),
+        ):
+            try:
+                replay.run(path, "foreign-race-wave", 1, exact_cards="v1:42")
+            except ValueError as error:
+                assert "could not be queued" in str(error)
+            else:
+                raise AssertionError("foreign mutation did not fail closed")
+        state = rc._unique_state_block(cards[42]["body"])
+        assert state.get("triage_status") == "error"
+        assert replay.REPLAY_FIELD not in state
+        assert not calls["dispatched"]
+        assert phase["queue_reads"] >= 2
+        # Either post-reservation snapshot mismatch or projection CAS deferred -
+        # both are the preserved fail-closed race path, never a committed queue.
+        assert not cas_deferred or cas_deferred == ["deferred"]
+    finally:
+        os.unlink(path)
+
+
+def test_duplicate_only_replay_retry_survives_post_tombstone_queue_deferral():
+    parked = card()
+    state = rc._unique_state_block(parked["body"])
+    state = rc._state_with_triage(state, "abcdef1", "queued")
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "abcdef1",
+        "count": 2,
+    }
+    state[replay.REPLAY_FIELD] = valid_marker()
+    parked["body"] = rc._replace_state_block(parked["body"], state)
+    cards = {42: parked}
+    sources = {("wheelhouse", 17, "pr-review"): source()}
+    path = cards_file([42])
+    fake = FakeClaimGh()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "output"
+            old_output = os.environ.get("GITHUB_OUTPUT")
+            os.environ["GITHUB_OUTPUT"] = str(output_path)
+            try:
+                with (
+                    patched(agent_claim, {"gh_json": fake}),
+                    patched(replay.agent_claim, {"gh_json": fake}),
+                ):
+                    assert agent_claim.claim(triage_claim_args()) == 0
+                    claim_outputs = output_path.read_text(encoding="utf-8")
+                    event_key = next(
+                        line.split("=", 1)[1]
+                        for line in claim_outputs.splitlines()
+                        if line.startswith("event_key=")
+                    )
+                    marker = next(
+                        line.split("=", 1)[1]
+                        for line in claim_outputs.splitlines()
+                        if line.startswith("marker=")
+                    )
+                    fake.comments[0]["body"] = (
+                        "Agent triage event finished with consumer.committed. %s"
+                        % marker
+                    )
+                    agent_claim.record_triage_result(
+                        record_args(event_key, "error", "consumer.committed")
+                    )
+                    before = cards[42]["body"]
+
+                    with replay_environment(
+                        cards, sources, stub_queue=False, stub_claim=False
+                    ), patched(
+                        replay.agent_claim,
+                        {"triage_replay_duplicate_only_evidence": lambda **kwargs: True},
+                    ):
+                        with patched(
+                            rc,
+                            {
+                                "_configured_triage_spend_limits": lambda item: (
+                                    2,
+                                    1200,
+                                    2,
+                                ),
+                                "reserve_triage_budget": (
+                                    lambda number, item, ceiling: False
+                                ),
+                            },
+                        ):
+                            failed = replay.run(path, "failed-reentry", 25)
+
+                    assert failed["eligible"] == 1
+                    assert failed["written"] == failed["queued"] == 0
+                    assert cards[42]["body"] == before
+                    assert marker not in fake.comments[0]["body"]
+                    assert (
+                        agent_claim.TRIAGE_CLAIM_SUPERSEDED_PREFIX
+                        in fake.comments[0]["body"]
+                    )
+
+                    with replay_environment(cards, sources, stub_claim=False), patched(
+                        replay.agent_claim,
+                        {"triage_replay_duplicate_only_evidence": lambda **kwargs: True},
+                    ):
+                        retried = replay.run(path, "retry-reentry", 25)
+
+                    new_state = rc._unique_state_block(cards[42]["body"])
+                    assert retried["eligible"] == retried["queued"] == 1
+                    assert new_state["triage_status"] == "queued"
+                    assert new_state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 2
+                    assert new_state[replay.REPLAY_FIELD]["wave"] == "retry-reentry"
+            finally:
+                if old_output is None:
+                    os.environ.pop("GITHUB_OUTPUT", None)
+                else:
+                    os.environ["GITHUB_OUTPUT"] = old_output
+    finally:
+        os.unlink(path)
+
+
+def test_admission_denial_terminalizes_only_the_exact_queued_revision():
+    cards = {42: card(kind="issue-triage", status="queued")}
+
+    def get_card(number):
+        return copy.deepcopy(cards.get(number))
+
+    def edit(number, body, remove_labels=None):
+        cards[number]["body"] = body
+
+    with patched(rc, {"get_card": get_card, "_edit_issue_body": edit}):
+        assert rc.update_card_triage(
+            42,
+            "abcdef1",
+            error="Exact-revision admission denied (admission.duplicate).",
+            require_queued=True,
+        )
+        terminal = rc._unique_state_block(cards[42]["body"])
+        assert terminal["triaged_sha"] == "abcdef1"
+        assert terminal["triage_status"] == "error"
+        assert terminal["triage_error"].endswith("(admission.duplicate).")
+        assert "### Triage" in cards[42]["body"]
+        before = cards[42]["body"]
+        assert not rc.update_card_triage(
+            42,
+            "abcdef1",
+            error="duplicate late write",
+            require_queued=True,
+        )
+        assert cards[42]["body"] == before
+
+
+def record_args(event_key, status, code="consumer.committed"):
+    return argparse.Namespace(
+        issue=42,
+        repo_slug="owner/wheelhouse",
+        event_key=event_key,
+        revision="abcdef1",
+        status=status,
+        code=code,
+    )
+
+
+def test_result_records_cover_success_failure_bound_and_duplicate_editing():
+    fake = FakeRecordGh()
+    success_key = "a" * 64
+    failure_key = "b" * 64
+    with patched(agent_claim, {"gh_json": fake}):
+        agent_claim.record_triage_result(record_args(success_key, "succeeded"))
+        agent_claim.record_triage_result(record_args(success_key, "succeeded"))
+        agent_claim.record_triage_result(
+            record_args(failure_key, "error", "consumer.rejected")
+        )
+        agent_claim.record_triage_result(
+            record_args(success_key, "error", "consumer.rejected")
+        )
+    assert len(fake.comments) == 2
+    assert [method for method, _, _ in fake.writes] == ["POST", "POST", "PATCH"]
+    records = [agent_claim.parse_triage_record(row["body"]) for row in fake.comments]
+    assert {record["status"] for record in records} == {"error"}
+    assert all(len(row["body"].encode("utf-8")) < 512 for row in fake.comments)
+    assert all(
+        "target" not in row["body"] and "comment" not in row["body"]
+        for row in fake.comments
+    )
+
+
+def _scan_workflow_step_plan(
+    event_name, wave="", dry_run=False, exact_cards="", backfill_policy=""
+):
+    """Evaluate the scan workflow's production step conditions for one event."""
+    document = yaml.safe_load(
+        (ROOT / ".github/workflows/scan-backstop.yml").read_text(encoding="utf-8")
+    )
+    values = {
+        "github.event_name": event_name,
+        "inputs.replay_wave": wave,
+        "inputs.replay_dry_run": dry_run,
+        "inputs.replay_exact_cards": exact_cards,
+        "inputs.replay_backfill_policy": backfill_policy,
+    }
+    planned = []
+    for step in document["jobs"]["reconcile"]["steps"]:
+        condition = str(step.get("if", "true")).strip()
+        if condition.startswith("${{") and condition.endswith("}}"):
+            condition = condition[3:-2].strip()
+        for name, value in values.items():
+            condition = condition.replace(name, repr(value))
+        expression = (
+            condition.replace("always()", "True")
+            .replace("&&", " and ")
+            .replace("||", " or ")
+            .replace("!(", "not (")
+            .replace("true", "True")
+            .replace("false", "False")
+        )
+        if eval(expression, {"__builtins__": {}}, {}):
+            planned.append(step.get("name") or step.get("uses"))
+    return planned
+
+
+def test_workflow_exact_selector_replay_only_posture_matrix():
+    prerequisites = {
+        "actions/checkout@v4",
+        "actions/setup-python@v5",
+        "Install deps",
+    }
+    replay_step = "Replay one bounded auto-triage wave"
+    ordinary_steps = {
+        "List open cards",
+        "Scan the fleet",
+        "Evaluate auto-merge candidates before claim",
+        "Claim auto-merge decision cards",
+        "Validate auto-merge decision cards",
+        "Auto-merge eligible PRs",
+        "Record auto-merges",
+        "Reconcile the queue",
+        "Check fleet-scan health",
+    }
+
+    # A raw non-empty selector isolates the run before selector validation.
+    # The exact replay owner is the only project command that can act in either
+    # write or dry-run mode; its script tests below retain exact-cohort and
+    # writes=0 enforcement respectively.
+    for dry_run in (False, True):
+        planned = set(
+            _scan_workflow_step_plan(
+                "workflow_dispatch",
+                wave="reviewed-wave",
+                dry_run=dry_run,
+                exact_cards="v1:41,42",
+            )
+        )
+        assert planned == prerequisites | {replay_step}
+        assert planned.isdisjoint(ordinary_steps)
+
+    # The sanctioned incident wave is replay-only even when its exact selector
+    # is missing, malformed, or wrong. Script-level refusal cannot fall through
+    # to ordinary maintenance first.
+    for exact_cards in ("", "not-a-selector", "v1:1584"):
+        planned = set(
+            _scan_workflow_step_plan(
+                "workflow_dispatch",
+                wave=replay.CARD_1585_INCIDENT_WAVE,
+                dry_run=False,
+                exact_cards=exact_cards,
+            )
+        )
+        assert planned == prerequisites | {replay_step}
+        assert planned.isdisjoint(ordinary_steps)
+
+    # Even malformed or incomplete raw input cannot fall through to ordinary
+    # scan/backstop acting. It reaches the replay owner, which rejects it before
+    # any exact-card read or write.
+    malformed = set(
+        _scan_workflow_step_plan(
+            "workflow_dispatch",
+            wave="",
+            dry_run=False,
+            exact_cards="not-a-selector",
+        )
+    )
+    incomplete = set(
+        _scan_workflow_step_plan(
+            "workflow_dispatch",
+            wave="",
+            dry_run=False,
+            exact_cards="v1:41,42",
+        )
+    )
+    assert malformed == incomplete == prerequisites | {replay_step}
+    try:
+        replay._exact_card_scope("not-a-selector")
+        assert False, "malformed exact selector accepted"
+    except ValueError:
+        pass
+
+    # A raw checked-in-policy input is replay-only before selector validation,
+    # so malformed/incomplete policy waves never fall through to maintenance.
+    policy_only = set(
+        _scan_workflow_step_plan(
+            "workflow_dispatch", backfill_policy="admission-context-v1"
+        )
+    )
+    assert policy_only == prerequisites | {replay_step}
+
+    # Empty exact-selector input preserves all prior owners: scheduled and
+    # ordinary manual maintenance, generic write replay, and generic dry-run.
+    scheduled = set(_scan_workflow_step_plan("schedule"))
+    manual = set(_scan_workflow_step_plan("workflow_dispatch"))
+    generic_write = set(
+        _scan_workflow_step_plan(
+            "workflow_dispatch", wave="reviewed-wave", dry_run=False
+        )
+    )
+    generic_dry_run = set(
+        _scan_workflow_step_plan(
+            "workflow_dispatch", wave="reviewed-wave", dry_run=True
+        )
+    )
+    assert scheduled == prerequisites | ordinary_steps
+    assert manual == prerequisites | ordinary_steps
+    assert generic_write == prerequisites | ordinary_steps | {replay_step}
+    assert generic_dry_run == prerequisites | {"List open cards", replay_step}
+
+
+def test_workflow_is_inert_and_reuses_existing_queue_and_record_boundaries():
+    scan_text = (ROOT / ".github/workflows/scan-backstop.yml").read_text(
+        encoding="utf-8"
+    )
+    scan = yaml.safe_load(scan_text)
+    on_doc = scan.get(True) or scan.get("on")
+    dispatch_inputs = on_doc["workflow_dispatch"]["inputs"]
+    assert dispatch_inputs["replay_wave"]["default"] == ""
+    assert dispatch_inputs["replay_limit"]["default"] == "25"
+    assert "1..25" in dispatch_inputs["replay_limit"]["description"]
+    assert dispatch_inputs["replay_dry_run"]["default"] is True
+    assert dispatch_inputs["replay_exact_cards"]["default"] == ""
+    assert "v1:N,N" in dispatch_inputs["replay_exact_cards"]["description"]
+    assert "replay_limit" in dispatch_inputs["replay_exact_cards"]["description"]
+    assert dispatch_inputs["replay_attempts_reset_cards"]["default"] == ""
+    assert dispatch_inputs["replay_backfill_policy"]["default"] == ""
+    dry_run_guard = (
+        "github.event_name == 'workflow_dispatch' && "
+        "inputs.replay_wave != '' && inputs.replay_dry_run"
+    )
+    exact_isolation_guard = "inputs.replay_exact_cards != ''"
+    incident_isolation_guard = (
+        "inputs.replay_wave == '%s'" % replay.CARD_1585_INCIDENT_WAVE
+    )
+    assert scan["permissions"] == {
+        "contents": "read",
+        "issues": "write",
+        "actions": "write",
+    }
+    assert scan["jobs"]["reconcile"]["if"] == (
+        "github.event_name == 'schedule' || github.actor == github.repository_owner"
+    )
+    list_step = next(
+        value
+        for value in scan["jobs"]["reconcile"]["steps"]
+        if value.get("name") == "List open cards"
+    )
+    assert exact_isolation_guard in list_step["if"]
+    assert incident_isolation_guard in list_step["if"]
+    assert "!" in list_step["if"]
+    write_capable_steps = {
+        "Scan the fleet",
+        "Evaluate auto-merge candidates before claim",
+        "Claim auto-merge decision cards",
+        "Validate auto-merge decision cards",
+        "Auto-merge eligible PRs",
+        "Record auto-merges",
+        "Reconcile the queue",
+        "Check fleet-scan health",
+    }
+    for guarded in write_capable_steps:
+        guarded_step = next(
+            value
+            for value in scan["jobs"]["reconcile"]["steps"]
+            if value.get("name") == guarded
+        )
+        condition = guarded_step.get("if", "")
+        assert dry_run_guard in condition, guarded
+        assert exact_isolation_guard in condition, guarded
+        assert incident_isolation_guard in condition, guarded
+        assert "!" in condition, guarded
+    step = next(
+        value
+        for value in scan["jobs"]["reconcile"]["steps"]
+        if value.get("name") == "Replay one bounded auto-triage wave"
+    )
+    assert "github.event_name == 'workflow_dispatch'" in step["if"]
+    assert "inputs.replay_wave != ''" in step["if"]
+    assert "inputs.replay_exact_cards != ''" in step["if"]
+    assert "||" in step["if"]
+    assert "scripts/triage_replay.py" in step["run"]
+    assert "REPLAY_DRY_RUN" in step["run"]
+    assert "args+=(--dry-run)" in step["run"]
+    assert "REPLAY_EXACT_CARDS" in step["run"]
+    assert 'args+=(--exact-cards "$REPLAY_EXACT_CARDS")' in step["run"]
+    assert step["env"]["REPLAY_EXACT_CARDS"] == "${{ inputs.replay_exact_cards }}"
+    assert "REPLAY_ATTEMPTS_RESET_CARDS" in step["run"]
+    assert "--attempts-reset-cards" in step["run"]
+    assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert step["env"]["FLEET_TOKEN"] == "${{ secrets.FLEET_TOKEN }}"
+    assert step["env"]["WHEELHOUSE_FLEET_TOKEN"] == "${{ secrets.FLEET_TOKEN }}"
+    assert (
+        step["env"]["WHEELHOUSE_AUTOMERGE_HAS_TOKEN"]
+        == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}"
+    )
+    assert "--dry-run" in (ROOT / "scripts/triage_replay.py").read_text(
+        encoding="utf-8"
+    )
+    replay_text = (ROOT / "scripts/triage_replay.py").read_text(encoding="utf-8")
+    assert replay.REPLAY_LIMIT_MAX == 25
+    assert replay.EXACT_SELECTOR_VERSION == 1
+    assert "v1:N[,N...]" in replay.parser().format_help()
+    # Replay eligibility has exactly one owner: the workflow passes inputs
+    # through and never restates a cache predicate of its own.
+    scan_text = (ROOT / ".github/workflows/scan-backstop.yml").read_text(
+        encoding="utf-8"
+    )
+    for predicate in (
+        "triage_primary_status",
+        "triage_consumption",
+        "assessment_admission",
+        replay.ADVISORY_RECOVERY_CLEARED + "-recovery",
+    ):
+        assert predicate not in scan_text, predicate
+    runtime_doc = (ROOT / "docs/AGENT_RUNTIME.md").read_text(encoding="utf-8")
+    assert "replay_exact_cards" in runtime_doc
+    assert "Advisory-cache recovery for a failed primary" in runtime_doc
+    assert "advisory-recovery-authority-present" in runtime_doc
+    assert "drift-refresh-target-mismatch" in runtime_doc
+    assert "triage-cache-not-terminal-error" in runtime_doc
+    assert "v1:1483,1584,1585,1586,1594,1598" in runtime_doc
+    assert "no other card is substituted" in runtime_doc
+    assert replay.CARD_1585_INCIDENT_WAVE in runtime_doc
+    assert "replay_exact_cards='v1:1585'" in runtime_doc
+    assert replay.CARD_1585_INCIDENT_PERMIT["selector"] == (1585,)
+    assert replay.CARD_1585_INCIDENT_PERMIT["source_binding"][
+        "target_head_sha"
+    ] == "0f29152c44b808064f9a2a2621c9bde6456f6262"
+    assert len(replay.ATTEMPT_RESET_COHORT) == 19
+    assert replay.ATTEMPT_RESET_WAVE == "evidence-empty-e7-final"
+    assert len(replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT) == 15
+    assert set(replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT) == {
+        154,
+        481,
+        572,
+        907,
+        951,
+        1266,
+        1275,
+        1428,
+        1430,
+        1435,
+        1436,
+        1437,
+        1441,
+        1442,
+        1443,
+    }
+    assert replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE == "array-recovery-g1-final"
+    assert replay.ATTEMPT_RESET_COHORTS == {
+        replay.ATTEMPT_RESET_WAVE: replay.ATTEMPT_RESET_COHORT,
+        replay.ARRAY_RECOVERY_ATTEMPT_RESET_WAVE: (
+            replay.ARRAY_RECOVERY_ATTEMPT_RESET_COHORT
+        ),
+    }
+    wheelhouse_config = yaml.safe_load(
+        (ROOT / "wheelhouse.config.yml").read_text(encoding="utf-8")
+    )
+    assert wheelhouse_config["triage_attempt_cap_per_revision"] == 2
+    assert wheelhouse_config["triage_daily_ceiling"] == 1200
+    assert "reconcile.maybe_queue_auto_triage" in replay_text
+    assert "dispatch_triage_workflow" not in replay_text
+    # Single owner: write-loop call order is supersede -> visibility -> queue.
+    write_loop = replay_text.split("def run(", 1)[1]
+    supersede_at = write_loop.index("agent_claim.supersede_triage_claim(")
+    visibility_at = write_loop.index("wait_for_claim_tombstone_visibility(")
+    queue_at = write_loop.index("reconcile.maybe_queue_auto_triage(")
+    assert supersede_at < visibility_at < queue_at
+    assert "_tombstone_sleep" in replay_text
+    assert "claim-tombstone-not-visible" in replay_text
+    assert replay.REPLAY_FIELD not in rc.MATERIAL_FIELDS
+    triage_text = (ROOT / ".github/workflows/triage.yml").read_text(encoding="utf-8")
+    assert "triage_queued_for_head" in triage_text
+    assert "agent_claim.py record" in triage_text
+    assert "wheelhouse-triage-record" in (ROOT / "scripts/agent_claim.py").read_text(
+        encoding="utf-8"
+    )
+    denial = next(
+        value
+        for value in yaml.safe_load(triage_text)["jobs"]["triage"]["steps"]
+        if value.get("id") == "admission-denial-consumer"
+    )
+    assert "steps.event-claim.outputs.admitted == 'false'" in denial["if"]
+    assert "triage-fail" in denial["run"]
+    assert "admission.duplicate" in denial["run"]
+    assert "--queued-only" in denial["run"]
+    assert "ADMISSION_DENIED" in triage_text
+
+
+def test_generic_policy_backfill_dry_run_is_exact_bounded_and_zero_write():
+    cards, sources, _revisions = exact_fixture([42])
+    state = rc._unique_state_block(cards[42]["body"])
+    state = rc._state_with_triage(
+        state,
+        "000002a",
+        "error",
+        error=(
+            "Auto triage did not run because exact-revision admission was denied "
+            "(admission.duplicate)."
+        ),
+    )
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "000002a",
+        "count": 2,
+    }
+    cards[42]["body"] = rc._replace_state_block(cards[42]["body"], state)
+    path = cards_file([42])
+    try:
+        with replay_environment(cards, sources) as run:
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    dry_run=True,
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError as error:
+                assert "requires an exact card selector" in str(error)
+            else:
+                raise AssertionError("policy backfill accepted no exact selector")
+            assert not run["source_reads"] and not run["edits"]
+
+        output = StringIO()
+        with replay_environment(cards, sources) as run, redirect_stdout(output):
+            result = replay.run(
+                path,
+                "admission-context-backfill",
+                1,
+                dry_run=True,
+                exact_cards="v1:42",
+                backfill_policy="admission-context-v1",
+            )
+        assert result == {"eligible": 1, "planned": 1, "deferred": 0, "written": 0}
+        assert not run["edits"] and not run["claims"] and not run["dispatched"]
+        text = output.getvalue()
+        assert "policy=admission-context-v1" in text
+        assert "head=000002a" in text and "writes=0" in text
+
+        with (
+            replay_environment(cards, sources) as run,
+            patched(
+                replay.agent_claim,
+                {
+                    "triage_claim_recovery_state": lambda **kwargs: {
+                        "event_key": "a" * 64,
+                        "status": "missing",
+                    }
+                },
+            ),
+        ):
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    exact_cards="v1:42",
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError as error:
+                assert "every exact prior claim" in str(error)
+            else:
+                raise AssertionError("policy backfill queued without a claim tombstone")
+            assert not run["claims"]
+            assert not run["edits"] and not run["queued"] and not run["dispatched"]
+
+        # A policy cannot overwrite a separately constrained replay marker,
+        # and unknown policy IDs fail before candidate reads.
+        state = rc._unique_state_block(cards[42]["body"])
+        state[replay.REPLAY_FIELD] = valid_marker(revision="000002a")
+        cards[42]["body"] = rc._replace_state_block(cards[42]["body"], state)
+        with replay_environment(cards, sources) as run:
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    dry_run=True,
+                    exact_cards="v1:42",
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError as error:
+                assert "exact card selector refused" in str(error)
+            else:
+                raise AssertionError("policy backfill accepted an existing replay marker")
+            assert not run["edits"] and not run["claims"]
+        with replay_environment(cards, sources) as run:
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    1,
+                    dry_run=True,
+                    exact_cards="v1:42",
+                    backfill_policy="not-checked-in",
+                )
+            except ValueError as error:
+                assert "not registered" in str(error)
+            else:
+                raise AssertionError("unknown policy backfill was accepted")
+            assert not run["source_reads"] and not run["edits"]
+    finally:
+        os.unlink(path)
+
+
+def test_policy_backfill_recovers_prior_claim_across_search_mode_change():
+    cards, sources, _revisions = exact_fixture([42])
+    state = rc._unique_state_block(cards[42]["body"])
+    state = rc._state_with_triage(
+        state,
+        "000002a",
+        "error",
+        error=(
+            "Auto triage did not run because exact-revision admission was denied "
+            "(admission.duplicate)."
+        ),
+    )
+    state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+        "version": rc.TRIAGE_ATTEMPTS_VERSION,
+        "kind": "pr-review",
+        "revision": "000002a",
+        "count": 1,
+    }
+    cards[42]["body"] = rc._replace_state_block(cards[42]["body"], state)
+    path = cards_file([42])
+    try:
+        with replay_environment(
+            cards,
+            sources,
+            has_readonly_token=True,
+            prior_claim_action="triage.pr.local",
+        ) as run:
+            result = replay.run(
+                path,
+                "admission-context-backfill",
+                1,
+                exact_cards="v1:42",
+                backfill_policy="admission-context-v1",
+            )
+        assert result["queued"] == 1
+        assert result["written"] > 0
+        assert len(run["claims"]) == 1
+        assert run["claims"][0]["action"] == "triage.pr.local"
+        assert len(run["dispatched"]) == 1
+    finally:
+        os.unlink(path)
+
+
+def test_policy_backfill_preflights_complete_claim_cohort_before_mutation():
+    cards, sources, _revisions = exact_fixture([42, 43])
+    for number in cards:
+        state = rc._unique_state_block(cards[number]["body"])
+        revision = "%07x" % number
+        state = rc._state_with_triage(
+            state,
+            revision,
+            "error",
+            error=(
+                "Auto triage did not run because exact-revision admission was denied "
+                "(admission.duplicate)."
+            ),
+        )
+        state[rc.TRIAGE_ATTEMPTS_FIELD] = {
+            "version": rc.TRIAGE_ATTEMPTS_VERSION,
+            "kind": "pr-review",
+            "revision": revision,
+            "count": 2,
+        }
+        cards[number]["body"] = rc._replace_state_block(cards[number]["body"], state)
+    path = cards_file([42, 43])
+
+    def claim_state(**kwargs):
+        if kwargs["issue"] == 43 or kwargs["action"] != "triage.pr.local":
+            return {"event_key": "b" * 64, "status": "missing"}
+        return {
+            "event_key": "a" * 64,
+            "status": "active",
+            "claim": {"id": 9042, "body": "trusted"},
+        }
+
+    try:
+        with (
+            replay_environment(cards, sources) as run,
+            patched(replay.agent_claim, {"triage_claim_recovery_state": claim_state}),
+        ):
+            try:
+                replay.run(
+                    path,
+                    "admission-context-backfill",
+                    2,
+                    exact_cards="v1:42,43",
+                    backfill_policy="admission-context-v1",
+                )
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("partial policy claim cohort reached mutation")
+            assert not run["claims"] and not run["edits"] and not run["queued"]
+            assert not run["dispatched"]
+    finally:
+        os.unlink(path)
+
+
+def test_superseded_policy_claim_is_resumable_after_queue_deferral():
+    identity = agent_claim.normalized_event_identity(
+        action="triage.pr.local",
+        owner="owner",
+        repo="wheelhouse",
+        number=17,
+        card_issue=42,
+        revision="abcdef1",
+        review_context="a" * 64,
+    )
+    event_key = agent_claim.event_key_sha256(identity)
+    marker = agent_claim.event_claim_marker(event_key)
+    comments = [{
+        "id": 7,
+        "body": "Agent triage event finished with consumer.committed. %s" % marker,
+        "user": {"login": "github-actions[bot]"},
+        "created_at": "2026-07-16T09:00:00Z",
+        "updated_at": "2026-07-16T09:00:00Z",
+    }]
+
+    def gh_json(*args):
+        if "--paginate" in args:
+            return [copy.deepcopy(comments)]
+        if "--method" in args and "PATCH" in args:
+            body = next(value[5:] for value in args if value.startswith("body="))
+            comments[0]["body"] = body
+            comments[0]["updated_at"] = "2026-07-16T09:01:00Z"
+            return copy.deepcopy(comments[0])
+        return copy.deepcopy(comments[0])
+
+    kwargs = {
+        "action": "triage.pr.local",
+        "owner": "owner",
+        "repo": "wheelhouse",
+        "number": 17,
+        "issue": 42,
+        "revision": "abcdef1",
+        "repo_slug": "owner/wheelhouse",
+        "review_context": "a" * 64,
+    }
+    with patched(agent_claim, {"gh_json": gh_json}):
+        first = agent_claim.supersede_triage_claim(**kwargs)
+        second = agent_claim.supersede_triage_claim(**kwargs)
+    assert first["superseded"] is True
+    assert second == {
+        "event_key": event_key,
+        "superseded": True,
+        "comment_id": 7,
+        "body": comments[0]["body"],
+        "already_superseded": True,
+    }
+
+
+TESTS = [
+    test_advisory_cache_recovers_only_through_the_exact_card_selector,
+    test_advisory_cache_write_run_clears_only_the_dead_advisory_state,
+    test_advisory_recovery_refuses_every_disconfirming_shape,
+    test_observation_drift_refresh_recovers_only_through_the_exact_card_selector,
+    test_observation_drift_refresh_write_run_clears_drift_residue_and_requeues,
+    test_observation_drift_refresh_refuses_every_disconfirming_shape,
+    test_observation_drift_refresh_never_selects_or_mutates_card_1759,
+    test_ordinary_maintenance_self_heals_complete_observation_drift_card_1819,
+    test_missing_output_cache_recovers_through_the_existing_error_path,
+    test_missing_output_replay_refuses_a_moved_head_without_writes,
+    test_missing_output_replay_refuses_exhausted_attempt_budget,
+    test_missing_output_healthy_primary_control_stays_closed,
+    test_terminal_error_is_cleared_and_queued_once_then_second_wave_noops,
+    test_sanctioned_attempt_reset_grants_exact_cohort_one_reentry,
+    test_array_recovery_attempt_reset_grants_exact_cohort_one_reentry,
+    test_array_recovery_attempt_reset_requires_exact_wave_cohort_and_limit,
+    test_array_recovery_attempt_reset_mismatches_are_atomic_zero_write,
+    test_attempt_reset_later_race_pauses_then_resumes_exact_cohort,
+    test_attempt_reset_resume_requires_only_pending_budget,
+    test_attempt_reset_refuses_outside_scope_and_any_state_mismatch,
+    test_attempt_reset_binds_complete_prior_marker_identity,
+    test_attempt_reset_second_read_mismatch_is_atomic_zero_write,
+    test_v2_reset_marker_is_never_ordinary_replay_evidence,
+    test_absent_cache_gets_absent_marker_and_one_queued_attempt,
+    test_same_revision_refresh_preserves_replay_marker,
+    test_queue_failure_does_not_unlock_card_for_later_schedule,
+    test_claim_tombstone_failure_refuses_replay_before_attempt_or_reservation,
+    test_card_shows_superseded_claim_requires_exact_id_and_marker,
+    test_tombstone_visibility_poll_waits_then_queues_without_false_race,
+    test_tombstone_visibility_waits_for_updated_at_after_comment_arrives,
+    test_tombstone_visibility_timeout_pauses_with_zero_queue_or_budget_writes,
+    test_tombstone_visibility_absent_claim_skips_poll_without_invented_success,
+    test_tombstone_visibility_malformed_supersede_pauses_without_queue,
+    test_post_visibility_foreign_mutation_still_fails_projection_cas,
+    test_never_cleared_matrix_fails_closed,
+    test_marker_mismatch_matrix_never_clears_or_resets_cap,
+    test_replay_applies_scan_author_filter_to_live_source,
+    test_dry_run_and_budget_bound_list_plans_with_zero_writes,
+    test_card_1585_incident_source_binding_rebuilds_exact_review_identity,
+    test_card_1585_incident_permit_binds_prior_claim_and_result,
+    test_card_1585_incident_permit_dry_run_consumption_and_second_use,
+    test_card_1585_incident_marker_failure_preserves_prior_claim_and_retryability,
+    test_card_1585_incident_tombstone_failure_leaves_consumed_marker,
+    test_card_1585_incident_reservation_failure_leaves_consumed_marker,
+    test_card_1585_incident_queue_failure_leaves_consumed_marker,
+    test_card_1585_incident_dispatch_failure_consumes_and_rejects_second_use,
+    test_card_1585_incident_permit_rejects_wrong_scope_and_bindings,
+    test_card_1585_incident_permit_leaves_normal_attempt_cap_unchanged,
+    test_exact_selector_isolates_non_prefix_cohort_and_emits_revisions,
+    test_exact_selector_dry_run_and_write_plans_are_identical,
+    test_exact_selector_contract_rejects_malformed_and_limit_mismatches_before_reads,
+    test_exact_selector_requested_rejections_are_atomic_and_never_substitute,
+    test_exact_selector_refuses_budget_and_preflight_races_before_writes,
+    test_exact_selector_never_replaces_reviewed_revision_during_write,
+    test_exact_selector_keeps_claim_tombstone_authoritative,
+    test_no_exact_selector_preserves_legacy_sorted_prefix,
+    test_entry_conditions_reject_schedule_non_owner_bad_wave_and_bad_limit,
+    test_result_records_cover_success_failure_bound_and_duplicate_editing,
+    test_duplicate_only_evidence_requires_a_terminal_pre_replay_claim_and_record,
+    test_replay_supersedes_failed_attempt_claim_before_exact_revision_readmission,
+    test_duplicate_only_parked_replay_does_not_consume_cap_or_once_marker,
+    test_duplicate_only_replay_retry_survives_post_tombstone_queue_deferral,
+    test_admission_denial_terminalizes_only_the_exact_queued_revision,
+    test_workflow_exact_selector_replay_only_posture_matrix,
+    test_workflow_is_inert_and_reuses_existing_queue_and_record_boundaries,
+    test_generic_policy_backfill_dry_run_is_exact_bounded_and_zero_write,
+    test_policy_backfill_recovers_prior_claim_across_search_mode_change,
+    test_policy_backfill_preflights_complete_claim_cohort_before_mutation,
+    test_superseded_policy_claim_is_resumable_after_queue_deferral,
+]
+
+
+if __name__ == "__main__":
+    for test in TESTS:
+        test()
+        print("ok - %s" % test.__name__)

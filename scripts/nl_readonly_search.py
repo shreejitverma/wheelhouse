@@ -4,18 +4,30 @@
 The workflow installs this file as `wheelhouse-search` only when the optional
 READONLY_TOKEN secret is present. Claude can write a JSON request to
 `search-request.json` and run that wrapper, but the wrapper controls the actual
-`gh` command shape: no writes, no arbitrary repository scope, and bounded output.
-Allowed repositories are the target repo plus owner-scoped repos from
-`wheelhouse.config.yml`.
+command shape: authenticated `gh` operations are read-only and all output is
+bounded. Those operations stay limited to the target repo plus owner-scoped
+repos from `wheelhouse.config.yml`. The separate `public_clone` operation is
+the bounded local-temporary exception: it accepts a complete public HTTPS Git
+URL, validates its current addresses, and invokes stock Git anonymously in an
+isolated temporary directory. Only the exact `nl-decision.search` and
+`triage.pr.search` actions expose it. It removes Git administration before a
+post-clone retained-tree audit and never executes cloned content.
 """
 
+import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import signal
+import socket
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
@@ -30,6 +42,36 @@ DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 PART_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 SCOPE_QUALIFIER_RE = re.compile(r"(^|\s)(repo|org|user):", re.I)
+HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+REF_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f~^:?*\\[]")
+SENSITIVE_ENV_RE = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|CREDENTIAL|COOKIE|OAUTH|"
+    r"^GH_|^GITHUB_|^ACTIONS_|^AWS_|^AZURE_|^GOOGLE_|^CLAUDE_)",
+    re.I,
+)
+
+PUBLIC_CLONE_DIR = "wheelhouse-public-clones"
+PUBLIC_CLONE_ACTIONS = frozenset({"nl-decision.search", "triage.pr.search"})
+PUBLIC_CLONE_PROVENANCE_VERSION = 1
+PUBLIC_CLONE_CLAIM_VERSION = 1
+PUBLIC_CLONE_VERIFY_DIR = "wheelhouse-public-clone-verify"
+MAX_PUBLIC_CLONE_ATTEMPTS = 8
+MAX_PUBLIC_CLONE_PROVENANCE_BYTES = 262144
+MAX_PUBLIC_CLONE_CLAIM_BYTES = 65536
+MAX_PUBLIC_URL_CHARS = 2048
+MAX_PUBLIC_REF_CHARS = 255
+PUBLIC_CLONE_TIMEOUT_SECONDS = 90
+PUBLIC_GIT_LOCAL_TIMEOUT_SECONDS = 10
+PUBLIC_DNS_TIMEOUT_SECONDS = 5
+MAX_PUBLIC_DNS_ANSWERS = 32
+MAX_PUBLIC_GIT_OUTPUT_CHARS = 8000
+MAX_PUBLIC_CLONE_FILES = 20000
+MAX_PUBLIC_CLONE_ENTRIES = 30000
+MAX_PUBLIC_CLONE_BYTES = 100 * 1024 * 1024
+MAX_PUBLIC_MANIFEST_ENTRIES = 200
+MAX_PUBLIC_MANIFEST_PATH_BYTES = 20000
+MAX_PUBLIC_OBSERVATIONS = 96
+MAX_PUBLIC_SYMLINK_BYTES = 4096
 
 PR_LIST_FIELDS = "number,title,state,author,url,updatedAt,headRefName,baseRefName"
 PR_VIEW_FIELDS = "number,title,state,author,body,url,updatedAt,headRefName,baseRefName"
@@ -116,7 +158,9 @@ def _resolve_repo(value, allowed):
     by_slug = {repo.casefold(): repo for repo in allowed}
     if raw.casefold() in by_slug:
         return by_slug[raw.casefold()]
-    matches = [repo for repo in allowed if repo.rsplit("/", 1)[1].casefold() == raw.casefold()]
+    matches = [
+        repo for repo in allowed if repo.rsplit("/", 1)[1].casefold() == raw.casefold()
+    ]
     if len(matches) == 1:
         return matches[0]
     raise ValueError("repo is not in the allowed search scope: %s" % raw)
@@ -190,6 +234,1005 @@ def _cap(text):
     return text[:MAX_OUTPUT_CHARS] + "\n[output truncated]\n"
 
 
+def _canonical_public_git_url(value):
+    if not isinstance(value, str):
+        raise ValueError("url must be a complete HTTPS Git URL")
+    raw = value.strip()
+    if not raw or len(raw) > MAX_PUBLIC_URL_CHARS or raw != value:
+        raise ValueError("url must be a complete HTTPS Git URL")
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in raw):
+        raise ValueError("url contains whitespace or control characters")
+    if "\\" in raw:
+        raise ValueError("url must not contain backslashes")
+
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("url has a malformed host or port") from exc
+    if parsed.scheme.casefold() != "https" or not parsed.netloc:
+        raise ValueError("url must use HTTPS")
+    if (
+        parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+    ):
+        raise ValueError("url must not contain embedded credentials or userinfo")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("url has a malformed HTTPS port")
+    if parsed.query or parsed.fragment:
+        raise ValueError("url must not contain a query or fragment")
+    if not parsed.path or parsed.path == "/" or not parsed.path.startswith("/"):
+        raise ValueError("url must include a Git repository path")
+    if re.search(r"%(?![0-9A-Fa-f]{2})", parsed.path):
+        raise ValueError("url path contains malformed percent encoding")
+    try:
+        decoded_path = unquote(parsed.path, errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("url path must be valid UTF-8") from exc
+    if any(part in {".", ".."} for part in decoded_path.split("/")):
+        raise ValueError("url path must not contain traversal segments")
+    if any(ord(char) <= 0x20 or ord(char) == 0x7F for char in decoded_path):
+        raise ValueError("url path contains whitespace or control characters")
+
+    host = parsed.hostname or ""
+    host = host[:-1] if host.endswith(".") else host
+    if not host:
+        raise ValueError("url has a malformed host")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ascii_host = host.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError("url has a malformed host") from exc
+        labels = ascii_host.split(".")
+        if len(ascii_host) > 253 or any(
+            not label or not HOST_LABEL_RE.fullmatch(label) for label in labels
+        ):
+            raise ValueError("url has a malformed host")
+        canonical_host = ascii_host
+    else:
+        canonical_host = address.compressed
+
+    authority = "[%s]" % canonical_host if ":" in canonical_host else canonical_host
+    if port not in (None, 443):
+        authority += ":%s" % port
+    canonical_path = re.sub(
+        r"%([0-9A-Fa-f]{2})",
+        lambda match: "%" + match.group(1).upper(),
+        parsed.path,
+    )
+    return (
+        urlunsplit(("https", authority, canonical_path, "", "")),
+        canonical_host,
+        port or 443,
+    )
+
+
+def _public_addresses(host, port=443, resolver=socket.getaddrinfo):
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        timed_out = False
+
+        def timeout_handler(_signum, _frame):
+            raise TimeoutError
+
+        can_alarm = threading.current_thread() is threading.main_thread() and hasattr(
+            signal, "setitimer"
+        )
+        previous_handler = None
+        try:
+            if can_alarm:
+                previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                signal.setitimer(signal.ITIMER_REAL, PUBLIC_DNS_TIMEOUT_SECONDS)
+            rows = resolver(host, port, type=socket.SOCK_STREAM)
+        except TimeoutError:
+            timed_out = True
+            rows = []
+        except (OSError, socket.gaierror) as exc:
+            raise ValueError("public Git host could not be resolved") from exc
+        finally:
+            if can_alarm:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+        if timed_out:
+            raise ValueError(
+                "public Git host resolution timed out after %s seconds"
+                % PUBLIC_DNS_TIMEOUT_SECONDS
+            )
+        if len(rows) > MAX_PUBLIC_DNS_ANSWERS:
+            raise ValueError("public Git host returned too many addresses")
+        raw_addresses = [row[4][0].split("%", 1)[0] for row in rows if row[4]]
+    else:
+        raw_addresses = [str(literal)]
+
+    addresses = []
+    for raw in raw_addresses:
+        try:
+            address = ipaddress.ip_address(raw)
+        except ValueError as exc:
+            raise ValueError("public Git host resolved to a malformed address") from exc
+        if address.version == 6 and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if (
+            not address.is_global
+            or address.is_private
+            or address.is_multicast
+            or address.is_reserved
+            or address.is_unspecified
+            or address.is_loopback
+            or address.is_link_local
+            or getattr(address, "is_site_local", False)
+        ):
+            raise ValueError("public Git host resolved to a non-public address")
+        normalized = address.compressed
+        if normalized not in addresses:
+            addresses.append(normalized)
+    if not addresses:
+        raise ValueError("public Git host did not resolve to an address")
+    return addresses
+
+
+def validate_public_git_url(value, resolver=socket.getaddrinfo):
+    """Validate the anonymous public target without consulting the gh allowlist."""
+    canonical, host, port = _canonical_public_git_url(value)
+    return canonical, _public_addresses(host, port=port, resolver=resolver)
+
+
+def _safe_public_ref(value):
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or value != value.strip():
+        raise ValueError("ref must be a branch or tag name")
+    ref = value
+    if (
+        not ref
+        or len(ref) > MAX_PUBLIC_REF_CHARS
+        or ref.startswith("-")
+        or ref.startswith("/")
+        or ref.endswith("/")
+        or ref.endswith(".")
+        or ref == "@"
+        or ".." in ref
+        or "@{" in ref
+        or "//" in ref
+        or REF_FORBIDDEN_RE.search(ref)
+    ):
+        raise ValueError("ref must be a safe branch or tag name")
+    for part in ref.split("/"):
+        if not part or part.startswith(".") or part.endswith(".lock"):
+            raise ValueError("ref must be a safe branch or tag name")
+    return ref
+
+
+def _path_within(path, parent):
+    try:
+        return os.path.commonpath(
+            [os.path.realpath(path), os.path.realpath(parent)]
+        ) == os.path.realpath(parent)
+    except ValueError:
+        return False
+
+
+def _public_clone_root(explicit=None):
+    if explicit is None:
+        base = os.environ.get("RUNNER_TEMP", "").strip() or tempfile.gettempdir()
+        root = os.path.join(os.path.realpath(base), PUBLIC_CLONE_DIR)
+    else:
+        root = os.path.realpath(explicit)
+    if not os.path.isabs(root) or os.path.basename(root) != PUBLIC_CLONE_DIR:
+        raise ValueError("public clone root is not a bounded temporary location")
+    workspace = os.environ.get("GITHUB_WORKSPACE", "").strip() or os.getcwd()
+    if _path_within(root, workspace):
+        raise ValueError("public clone root must be outside the target workspace")
+    return root
+
+
+def cleanup_public_clones(clone_root=None):
+    root = _public_clone_root(clone_root)
+    if not os.path.lexists(root):
+        return False
+    st = os.lstat(root)
+    if stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
+        shutil.rmtree(root)
+    else:
+        os.unlink(root)
+    return True
+
+
+def _prepare_public_clone_root(clone_root=None):
+    root = _public_clone_root(clone_root)
+    try:
+        cleanup_public_clones(root)
+        os.makedirs(root, mode=stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        runtime = os.path.join(root, "runtime")
+        home = os.path.join(runtime, "home")
+        tmp = os.path.join(runtime, "tmp")
+        config = os.path.join(home, "config")
+        for path in (runtime, home, tmp, config):
+            os.makedirs(
+                path, mode=stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR, exist_ok=True
+            )
+        return root, runtime, home, tmp, config
+    except Exception:
+        cleanup_public_clones(root)
+        raise
+
+
+def _public_git_env(home, tmp, config):
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": home,
+        "TMPDIR": tmp,
+        "XDG_CONFIG_HOME": config,
+        "LC_ALL": "C",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_LFS_SKIP_SMUDGE": "1",
+        "GIT_PROTOCOL_FROM_USER": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    leaked = [name for name in env if SENSITIVE_ENV_RE.search(name)]
+    if leaked:
+        raise RuntimeError("sensitive environment name reached anonymous Git")
+    return env
+
+
+def _kill_public_git_process(process):
+    if process.poll() is not None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    else:
+        process.kill()
+
+
+def _read_public_git_stream(stream, captured, truncated):
+    while True:
+        chunk = stream.read(8192)
+        if not chunk:
+            return
+        remaining = MAX_PUBLIC_GIT_OUTPUT_CHARS - len(captured)
+        if remaining > 0:
+            captured.extend(chunk[:remaining])
+        if len(chunk) > remaining:
+            truncated.append(True)
+
+
+def run_public_git(
+    args,
+    *,
+    env,
+    cwd=None,
+    timeout=PUBLIC_CLONE_TIMEOUT_SECONDS,
+):
+    process = subprocess.Popen(
+        list(args),
+        cwd=cwd,
+        env=dict(env),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=os.name == "posix",
+    )
+    stdout_data = bytearray()
+    stderr_data = bytearray()
+    stdout_truncated = []
+    stderr_truncated = []
+    readers = [
+        threading.Thread(
+            target=_read_public_git_stream,
+            args=(process.stdout, stdout_data, stdout_truncated),
+            name="wheelhouse-public-git-stdout",
+        ),
+        threading.Thread(
+            target=_read_public_git_stream,
+            args=(process.stderr, stderr_data, stderr_truncated),
+            name="wheelhouse-public-git-stderr",
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = None
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = exc
+        _kill_public_git_process(process)
+        process.wait()
+    for reader in readers:
+        reader.join()
+    if timed_out is not None:
+        raise ValueError(
+            "public Git operation timed out after %s seconds" % timeout
+        ) from timed_out
+
+    stdout = bytes(stdout_data).decode("utf-8", errors="replace")
+    stderr = bytes(stderr_data).decode("utf-8", errors="replace")
+    if stdout_truncated:
+        stdout += "\n[git stdout truncated]"
+    if stderr_truncated:
+        stderr += "\n[git stderr truncated]"
+    return subprocess.CompletedProcess(list(args), process.returncode, stdout, stderr)
+
+
+def _git_output(result, limit=MAX_PUBLIC_GIT_OUTPUT_CHARS):
+    output = str(getattr(result, "stdout", "") or "")
+    stderr = str(getattr(result, "stderr", "") or "")
+    if stderr:
+        output += "\n" + stderr
+    if len(output) > limit:
+        output = output[:limit] + "\n[git output truncated]"
+    return output.strip()
+
+
+def _run_public_git_checked(
+    runner,
+    args,
+    env,
+    timeout,
+    cwd=None,
+    error_limit=MAX_PUBLIC_GIT_OUTPUT_CHARS,
+):
+    try:
+        result = runner(args, env=env, cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            "public Git operation timed out after %s seconds" % timeout
+        ) from exc
+    except OSError as exc:
+        raise ValueError("public Git operation could not start") from exc
+    if getattr(result, "returncode", 1) != 0:
+        detail = _git_output(result, limit=error_limit)
+        message = "public Git operation failed"
+        if detail:
+            message += ": " + detail
+        raise ValueError(message)
+    return _git_output(result)
+
+
+def _public_git_args(git):
+    return [
+        git,
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.interactive=never",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.version=2",
+        "-c",
+        "transfer.bundleURI=false",
+        "-c",
+        "fetch.bundleURI=",
+        "-c",
+        "fetch.fsckObjects=true",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        "fetch.recurseSubmodules=false",
+        "-c",
+        "http.followRedirects=false",
+    ]
+
+
+def _public_clone_args(git, canonical_url, source, ref):
+    args = _public_git_args(git) + [
+        "clone",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--depth=1",
+        "--single-branch",
+        "--filter=blob:limit=%s" % MAX_PUBLIC_CLONE_BYTES,
+    ]
+    if ref:
+        args.extend(["--branch", ref])
+    args.extend([canonical_url, source])
+    return args
+
+
+def _remove_git_admin(source):
+    git_admin = os.path.join(source, ".git")
+    if not os.path.lexists(git_admin):
+        return
+    info = os.lstat(git_admin)
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        shutil.rmtree(git_admin)
+    else:
+        os.unlink(git_admin)
+
+
+def _bounded_clone_manifest(source):
+    source = os.path.realpath(source)
+    st = os.lstat(source)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        raise ValueError("public clone did not produce a directory")
+
+    stack = [("", source)]
+    entry_count = 0
+    file_count = 0
+    retained_bytes = 0
+    paths = []
+    observations = []
+    path_bytes = 0
+    while stack:
+        prefix, directory = stack.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise ValueError("public clone manifest could not be read") from exc
+        child_dirs = []
+        for entry in entries:
+            rel = "%s/%s" % (prefix, entry.name) if prefix else entry.name
+            try:
+                rel_bytes = len(json.dumps(rel, ensure_ascii=True).encode("utf-8"))
+                child = entry.stat(follow_symlinks=False)
+            except (OSError, UnicodeError) as exc:
+                raise ValueError("public clone contains an unreadable path") from exc
+            entry_count += 1
+            if entry_count > MAX_PUBLIC_CLONE_ENTRIES:
+                raise ValueError("public clone exceeds the retained entry limit")
+            if stat.S_ISDIR(child.st_mode):
+                child_dirs.append((rel, entry.path))
+                continue
+            if not (stat.S_ISREG(child.st_mode) or stat.S_ISLNK(child.st_mode)):
+                raise ValueError("public clone contains a special file")
+            if stat.S_ISLNK(child.st_mode):
+                try:
+                    target = os.readlink(entry.path)
+                    target_bytes = os.fsencode(target)
+                except (OSError, UnicodeError) as exc:
+                    raise ValueError(
+                        "public clone contains an unreadable symlink"
+                    ) from exc
+                if len(target_bytes) > MAX_PUBLIC_SYMLINK_BYTES:
+                    raise ValueError("public clone contains an oversized symlink")
+                if "\x00" in os.fsdecode(target_bytes):
+                    raise ValueError("public clone contains an invalid symlink")
+                if not _path_within(entry.path, source):
+                    raise ValueError("public clone contains an escaping symlink")
+            file_count += 1
+            retained_bytes += child.st_size
+            if file_count > MAX_PUBLIC_CLONE_FILES:
+                raise ValueError("public clone exceeds the retained file limit")
+            if retained_bytes > MAX_PUBLIC_CLONE_BYTES:
+                raise ValueError("public clone exceeds the retained byte limit")
+            if (
+                len(paths) < MAX_PUBLIC_MANIFEST_ENTRIES
+                and path_bytes + rel_bytes <= MAX_PUBLIC_MANIFEST_PATH_BYTES
+            ):
+                paths.append(rel)
+                path_bytes += rel_bytes
+                if stat.S_ISREG(child.st_mode) and len(observations) < MAX_PUBLIC_OBSERVATIONS:
+                    digest = hashlib.sha256()
+                    try:
+                        with open(entry.path, "rb") as handle:
+                            for chunk in iter(lambda: handle.read(1048576), b""):
+                                digest.update(chunk)
+                    except OSError as exc:
+                        raise ValueError(
+                            "public clone contains an unreadable file"
+                        ) from exc
+                    observations.append(
+                        {"path": rel, "sha256": digest.hexdigest(), "bytes": child.st_size}
+                    )
+        stack.extend(reversed(child_dirs))
+    return {
+        "entry_count": entry_count,
+        "file_count": file_count,
+        "retained_bytes": retained_bytes,
+        "paths": paths,
+        "paths_truncated": len(paths) < file_count,
+        "observations": observations,
+    }
+
+
+def _canonical_sha256(value):
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def public_clone_context_from_task(task):
+    if not isinstance(task, dict):
+        raise ValueError("public clone task context is invalid")
+    metadata = task.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("action") not in PUBLIC_CLONE_ACTIONS:
+        raise ValueError("public clone task action is invalid")
+    target = metadata.get("target")
+    if not isinstance(target, dict):
+        raise ValueError("public clone task target is invalid")
+    required_target = {"owner", "repo", "number", "kind", "revision"}
+    if set(target) != required_target:
+        raise ValueError("public clone task target is invalid")
+    event_key = metadata.get("idempotencyKey")
+    if not isinstance(event_key, str) or not re.fullmatch(r"[0-9a-f]{64}", event_key):
+        raise ValueError("public clone task event binding is invalid")
+    source_review = metadata.get("sourceReview")
+    if source_review is not None:
+        if not isinstance(source_review, dict) or set(source_review) != {
+            "baseSha",
+            "visionSha",
+            "visionContentSha256",
+            "targetFactsSha256",
+            "targetRepositoryCommit",
+        }:
+            raise ValueError("public clone source-review binding is invalid")
+        if (
+            metadata.get("action") != "triage.pr.search"
+            or target.get("kind") != "pr-review"
+            or not re.fullmatch(r"[0-9a-f]{7,64}", source_review.get("baseSha", ""))
+            or not re.fullmatch(r"[0-9a-f]{7,64}", source_review.get("visionSha", ""))
+            or not re.fullmatch(r"[0-9a-f]{64}", source_review.get("visionContentSha256", ""))
+            or not re.fullmatch(r"[0-9a-f]{64}", source_review.get("targetFactsSha256", ""))
+            or not re.fullmatch(r"[0-9a-f]{40}", source_review.get("targetRepositoryCommit", ""))
+            or source_review["targetRepositoryCommit"] != str(target.get("revision", "")).lower()
+        ):
+            raise ValueError("public clone source-review binding is invalid")
+    return {
+        "version": PUBLIC_CLONE_PROVENANCE_VERSION,
+        "taskSha256": _canonical_sha256(task),
+        "action": metadata["action"],
+        "eventKeySha256": event_key,
+        "target": target,
+        "sourceReview": source_review,
+    }
+
+
+def _write_public_clone_records(path, records):
+    if not path:
+        return
+    if len(records) > MAX_PUBLIC_CLONE_ATTEMPTS:
+        raise ValueError("public clone provenance exceeds the attempt limit")
+    encoded = (json.dumps(records, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_PUBLIC_CLONE_PROVENANCE_BYTES:
+        raise ValueError("public clone provenance exceeds the byte limit")
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".public-clone-provenance-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        os.chmod(temporary, 0o400)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _public_clone_claim(*, status, url, requested_ref, commit=None, failure=None):
+    """One UNTRUSTED in-turn attempt claim.
+
+    The broker shares a uid (and a `Write` tool) with the model, so nothing it
+    writes during the model's turn can be trusted on its own. A successful claim
+    is only a worklist entry naming what to re-clone; failed claims yield only
+    trusted failure records from re-validated source values. See "Nothing in a
+    model turn may require privilege" in AGENTS.md.
+    """
+    return {
+        "version": PUBLIC_CLONE_CLAIM_VERSION,
+        "status": status,
+        "source": {
+            "url": url,
+            "requestedRef": requested_ref,
+            "resolvedCommit": commit,
+        },
+        "failure": failure,
+    }
+
+
+def _write_public_clone_claims(path, claims):
+    if len(claims) > MAX_PUBLIC_CLONE_ATTEMPTS:
+        raise ValueError("public clone claims exceed the attempt limit")
+    encoded = (
+        json.dumps(claims, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if len(encoded) > MAX_PUBLIC_CLONE_CLAIM_BYTES:
+        raise ValueError("public clone claims exceed the byte limit")
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".public-clone-claims-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _record_public_clone_attempt(
+    claims_path,
+    *,
+    status,
+    url,
+    requested_ref,
+    commit=None,
+    failure=None,
+):
+    if not claims_path:
+        return
+    claim = _public_clone_claim(
+        status=status,
+        url=url,
+        requested_ref=requested_ref,
+        commit=commit,
+        failure=failure,
+    )
+    claims = []
+    if os.path.isfile(claims_path) and not os.path.islink(claims_path):
+        if os.path.getsize(claims_path) > MAX_PUBLIC_CLONE_CLAIM_BYTES:
+            raise ValueError("public clone claims exceed the byte limit")
+        with open(claims_path, encoding="utf-8") as handle:
+            claims = json.load(handle)
+        if not isinstance(claims, list):
+            raise ValueError("public clone claim log is invalid")
+    claims.append(claim)
+    _write_public_clone_claims(claims_path, claims)
+
+
+def _record_public_clone_attempt_best_effort(claims_path, **claim):
+    try:
+        _record_public_clone_attempt(claims_path, **claim)
+    except Exception as error:
+        print(
+            "wheelhouse-search: public clone claim not recorded: %s"
+            % type(error).__name__,
+            file=sys.stderr,
+        )
+
+
+def validate_public_clone_provenance(records, task):
+    expected_context = public_clone_context_from_task(task)
+    if not isinstance(records, list) or not 1 <= len(records) <= MAX_PUBLIC_CLONE_ATTEMPTS:
+        raise ValueError("public clone provenance attempts are invalid")
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {
+            "version", "context", "status", "source", "manifest", "failure"
+        }:
+            raise ValueError("public clone provenance record is invalid")
+        if record.get("version") != PUBLIC_CLONE_PROVENANCE_VERSION or record.get("context") != expected_context:
+            raise ValueError("public clone provenance task binding mismatch")
+        if record.get("status") not in {"succeeded", "failed"}:
+            raise ValueError("public clone provenance status is invalid")
+        source = record.get("source")
+        if not isinstance(source, dict) or set(source) != {"url", "requestedRef", "resolvedCommit"}:
+            raise ValueError("public clone provenance source is invalid")
+        if not isinstance(source.get("url"), str) or len(source["url"]) > MAX_PUBLIC_URL_CHARS:
+            raise ValueError("public clone provenance URL is invalid")
+        requested_ref = source.get("requestedRef")
+        if requested_ref is not None and (not isinstance(requested_ref, str) or len(requested_ref) > MAX_PUBLIC_REF_CHARS):
+            raise ValueError("public clone provenance ref is invalid")
+        if record["status"] == "succeeded":
+            if record.get("failure") is not None or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source.get("resolvedCommit") or ""):
+                raise ValueError("public clone success provenance is invalid")
+            manifest = record.get("manifest")
+            if not isinstance(manifest, dict) or set(manifest) != {"entry_count", "file_count", "retained_bytes", "paths", "paths_truncated", "observations"}:
+                raise ValueError("public clone manifest provenance is invalid")
+            if (
+                isinstance(manifest.get("entry_count"), bool)
+                or not isinstance(manifest.get("entry_count"), int)
+                or not 0 <= manifest["entry_count"] <= MAX_PUBLIC_CLONE_ENTRIES
+                or isinstance(manifest.get("file_count"), bool)
+                or not isinstance(manifest.get("file_count"), int)
+                or not 0 <= manifest["file_count"] <= MAX_PUBLIC_CLONE_FILES
+                or isinstance(manifest.get("retained_bytes"), bool)
+                or not isinstance(manifest.get("retained_bytes"), int)
+                or not 0 <= manifest["retained_bytes"] <= MAX_PUBLIC_CLONE_BYTES
+                or not isinstance(manifest.get("paths"), list)
+                or len(manifest["paths"]) > MAX_PUBLIC_MANIFEST_ENTRIES
+                or any(not isinstance(path, str) or not path or len(path.encode("utf-8")) > MAX_PUBLIC_MANIFEST_PATH_BYTES for path in manifest["paths"])
+                or not isinstance(manifest.get("paths_truncated"), bool)
+                or not isinstance(manifest.get("observations"), list)
+                or len(manifest["observations"]) > MAX_PUBLIC_OBSERVATIONS
+                or any(
+                    not isinstance(row, dict)
+                    or set(row) != {"path", "sha256", "bytes"}
+                    or row.get("path") not in manifest["paths"]
+                    or not re.fullmatch(r"[0-9a-f]{64}", row.get("sha256", ""))
+                    or isinstance(row.get("bytes"), bool)
+                    or not isinstance(row.get("bytes"), int)
+                    or not 0 <= row["bytes"] <= MAX_PUBLIC_CLONE_BYTES
+                    for row in manifest["observations"]
+                )
+            ):
+                raise ValueError("public clone manifest provenance is invalid")
+        elif (
+            record.get("manifest") is not None
+            or not isinstance(record.get("failure"), str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", record["failure"])
+        ):
+            raise ValueError("public clone failure provenance is invalid")
+    return records
+
+
+def export_public_clone_provenance(task_path, provenance_path, output_path):
+    if not provenance_path or not os.path.isfile(provenance_path) or os.path.islink(provenance_path):
+        return False
+    if os.path.getsize(provenance_path) > MAX_PUBLIC_CLONE_PROVENANCE_BYTES:
+        raise ValueError("public clone provenance exceeds the byte limit")
+    with open(task_path, encoding="utf-8") as handle:
+        task = json.load(handle)
+    with open(provenance_path, encoding="utf-8") as handle:
+        records = json.load(handle)
+    validate_public_clone_provenance(records, task)
+    _write_public_clone_records(output_path, records)
+    return True
+
+
+def parse_public_clone_claims(claims_path):
+    """Read the UNTRUSTED in-turn claim log; fail closed on anything malformed."""
+    if (
+        not claims_path
+        or os.path.islink(claims_path)
+        or not os.path.isfile(claims_path)
+    ):
+        return []
+    if os.path.getsize(claims_path) > MAX_PUBLIC_CLONE_CLAIM_BYTES:
+        raise ValueError("public clone claims exceed the byte limit")
+    with open(claims_path, encoding="utf-8") as handle:
+        claims = json.load(handle)
+    if not isinstance(claims, list) or len(claims) > MAX_PUBLIC_CLONE_ATTEMPTS:
+        raise ValueError("public clone claim log is invalid")
+    for claim in claims:
+        if (
+            not isinstance(claim, dict)
+            or set(claim) != {"version", "status", "source", "failure"}
+            or claim.get("version") != PUBLIC_CLONE_CLAIM_VERSION
+            or claim.get("status") not in {"succeeded", "failed"}
+        ):
+            raise ValueError("public clone claim is invalid")
+        source = claim.get("source")
+        if (
+            not isinstance(source, dict)
+            or set(source) != {"url", "requestedRef", "resolvedCommit"}
+            or not isinstance(source.get("url"), str)
+            or not source["url"]
+            or len(source["url"]) > MAX_PUBLIC_URL_CHARS
+        ):
+            raise ValueError("public clone claim source is invalid")
+        requested_ref = source.get("requestedRef")
+        if requested_ref is not None and (
+            not isinstance(requested_ref, str)
+            or len(requested_ref) > MAX_PUBLIC_REF_CHARS
+        ):
+            raise ValueError("public clone claim ref is invalid")
+        commit = source.get("resolvedCommit")
+        if claim["status"] == "succeeded":
+            if claim.get("failure") is not None or not re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit or ""
+            ):
+                raise ValueError("public clone claim commit is invalid")
+        elif (
+            commit is not None
+            or not isinstance(claim.get("failure"), str)
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", claim["failure"])
+        ):
+            raise ValueError("public clone claim failure is invalid")
+    return claims
+
+
+def _public_clone_verify_root():
+    base = os.environ.get("RUNNER_TEMP", "").strip() or tempfile.gettempdir()
+    return os.path.join(
+        os.path.realpath(base), PUBLIC_CLONE_VERIFY_DIR, PUBLIC_CLONE_DIR
+    )
+
+
+def _observe_public_clone_claim(source, *, runner, resolver, clone_root):
+    """Re-clone one claimed source HERE and return the trusted observation.
+
+    Returns None when this run cannot reproduce the claimed commit, so an
+    unverifiable claim can never contribute a `succeeded` record.
+    """
+    request = {"op": "public_clone", "url": source["url"]}
+    if source["requestedRef"] is not None:
+        request["ref"] = source["requestedRef"]
+    try:
+        observed = json.loads(
+            _public_clone_request(
+                request,
+                runner=runner,
+                resolver=resolver,
+                clone_root=clone_root,
+                claims_path=None,
+            )
+        )
+    except Exception:
+        return None
+    if observed.get("commit") != source["resolvedCommit"]:
+        return None
+    return observed
+
+
+def _trusted_failed_clone_source(source, *, resolver):
+    canonical_url = ""
+    requested_ref = None
+    try:
+        canonical_url, _ = validate_public_git_url(source.get("url"), resolver=resolver)
+    except Exception:
+        pass
+    try:
+        requested_ref = _safe_public_ref(source.get("requestedRef"))
+    except Exception:
+        pass
+    return {
+        "url": canonical_url,
+        "requestedRef": requested_ref,
+        "resolvedCommit": None,
+    }
+
+
+def verify_public_clone_claims(
+    task_path,
+    claims_path,
+    output_path,
+    *,
+    runner=run_public_git,
+    resolver=socket.getaddrinfo,
+    clone_root=None,
+):
+    """Derive the TRUSTED provenance records from the untrusted claim log.
+
+    This runs only in the trusted post-turn context, after the sandboxed model
+    step has exited, so nothing the model can reach produces a recorded fact.
+    Every `succeeded` record's resolved commit, manifest, and SHA-256
+    observations come from THIS run's own clone; the claim only names what to
+    re-clone, and its URL is re-validated by the ordinary request path. Failed
+    claims are not cloned and can yield only re-validated source values plus a
+    trusted failure token. A succeeded claim whose commit cannot be reproduced
+    here is demoted under the same trusted failure-record contract.
+    """
+    with open(task_path, encoding="utf-8") as handle:
+        task = json.load(handle)
+    context = public_clone_context_from_task(task)
+    claims = parse_public_clone_claims(claims_path)
+    if not claims:
+        return False
+    if len(claims) != 1:
+        raise ValueError("public clone verification requires exactly one claim")
+    root = clone_root or _public_clone_verify_root()
+    records = []
+    try:
+        for claim in claims:
+            source = claim["source"]
+            observed = (
+                _observe_public_clone_claim(
+                    source, runner=runner, resolver=resolver, clone_root=root
+                )
+                if claim["status"] == "succeeded"
+                else None
+            )
+            records.append(
+                {
+                    "version": PUBLIC_CLONE_PROVENANCE_VERSION,
+                    "context": context,
+                    "status": "succeeded" if observed else "failed",
+                    "source": (
+                        {
+                            "url": observed["url"],
+                            "requestedRef": _safe_public_ref(
+                                source["requestedRef"]
+                            ),
+                            "resolvedCommit": observed["commit"],
+                        }
+                        if observed
+                        else _trusted_failed_clone_source(source, resolver=resolver)
+                    ),
+                    "manifest": observed["manifest"] if observed else None,
+                    "failure": None
+                    if observed
+                    else (
+                        "Unobserved"
+                        if claim["status"] == "failed"
+                        else "Unreproducible"
+                    ),
+                }
+            )
+    finally:
+        cleanup_public_clones(root)
+        shutil.rmtree(os.path.dirname(root), ignore_errors=True)
+    validate_public_clone_provenance(records, task)
+    _write_public_clone_records(output_path, records)
+    return True
+
+
+def _public_clone_request(
+    req,
+    runner=run_public_git,
+    resolver=socket.getaddrinfo,
+    clone_root=None,
+    claims_path=None,
+):
+    root = _public_clone_root(clone_root)
+    try:
+        unexpected = sorted(set(req) - {"op", "url", "ref"})
+        if unexpected:
+            raise ValueError(
+                "public_clone has unsupported fields: %s" % ", ".join(unexpected)
+            )
+        canonical_url, _ = validate_public_git_url(req.get("url"), resolver=resolver)
+        ref = _safe_public_ref(req.get("ref"))
+        root, runtime, home, tmp, config = _prepare_public_clone_root(root)
+        source = os.path.join(root, "source")
+        git = shutil.which("git")
+        if not git:
+            raise ValueError("git is unavailable")
+        env = _public_git_env(home, tmp, config)
+        clone_args = _public_clone_args(git, canonical_url, source, ref)
+        _run_public_git_checked(
+            runner,
+            clone_args,
+            env,
+            PUBLIC_CLONE_TIMEOUT_SECONDS,
+            cwd=runtime,
+        )
+        commit = (
+            _run_public_git_checked(
+                runner,
+                _public_git_args(git) + ["rev-parse", "--verify", "HEAD^{commit}"],
+                env,
+                PUBLIC_GIT_LOCAL_TIMEOUT_SECONDS,
+                cwd=source,
+            )
+            .strip()
+            .lower()
+        )
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit):
+            raise ValueError("public clone did not resolve a valid commit SHA")
+        _remove_git_admin(source)
+        shutil.rmtree(runtime)
+        manifest = _bounded_clone_manifest(source)
+        result = {
+            "op": "public_clone",
+            "url": canonical_url,
+            "commit": commit,
+            "location": source,
+            "manifest": manifest,
+        }
+        _record_public_clone_attempt_best_effort(
+            claims_path,
+            status="succeeded",
+            url=canonical_url,
+            requested_ref=ref,
+            commit=commit,
+        )
+        return _cap(json.dumps(result, sort_keys=True, indent=2) + "\n")
+    except Exception as error:
+        _record_public_clone_attempt_best_effort(
+            claims_path,
+            status="failed",
+            url=str(req.get("url") or "")[:MAX_PUBLIC_URL_CHARS],
+            requested_ref=(
+                str(req.get("ref"))[:MAX_PUBLIC_REF_CHARS]
+                if req.get("ref") is not None
+                else None
+            ),
+            failure=type(error).__name__,
+        )
+        cleanup_public_clones(root)
+        raise
+
+
 def run_gh(args):
     result = subprocess.run(
         ["gh"] + list(args),
@@ -216,7 +1259,18 @@ def _list_request(req, repos, runner, kind):
     fields = PR_LIST_FIELDS if kind == "pr" else ISSUE_LIST_FIELDS
 
     def args(repo):
-        out = [kind, "list", "-R", repo, "--state", state, "--limit", limit, "--json", fields]
+        out = [
+            kind,
+            "list",
+            "-R",
+            repo,
+            "--state",
+            state,
+            "--limit",
+            limit,
+            "--json",
+            fields,
+        ]
         if query:
             out += ["--search", query]
         return out
@@ -235,31 +1289,58 @@ def _search_args(kind, repo, query, limit):
     return ["search", kind, "--repo", repo, "--limit", limit, "--", query]
 
 
-def handle_request(req, allowed, runner=run_gh):
+def handle_request(
+    req,
+    allowed,
+    runner=run_gh,
+    public_runner=run_public_git,
+    resolver=socket.getaddrinfo,
+    clone_root=None,
+    action="",
+    claims_path=None,
+):
     if not isinstance(req, dict):
         raise ValueError("request must be a JSON object")
-    if not allowed:
-        raise ValueError("no repositories are allowed for search")
     op = str(req.get("op") or "help").strip().lower().replace("-", "_")
     if op in {"help", "repos"}:
-        return json.dumps(
-            {
-                "allowed_repos": allowed,
-                "request_file": REQUEST_FILE,
-                "ops": [
-                    "repos",
-                    "pr_list",
-                    "pr_view",
-                    "pr_diff",
-                    "issue_list",
-                    "issue_view",
-                    "search_prs",
-                    "search_issues",
-                    "search_code",
-                ],
-            },
-            indent=2,
-        ) + "\n"
+        ops = [
+            "repos",
+            "pr_list",
+            "pr_view",
+            "pr_diff",
+            "issue_list",
+            "issue_view",
+            "search_prs",
+            "search_issues",
+            "search_code",
+        ]
+        if action in PUBLIC_CLONE_ACTIONS:
+            ops.append("public_clone")
+        return (
+            json.dumps(
+                {
+                    "allowed_repos": allowed,
+                    "request_file": REQUEST_FILE,
+                    "ops": ops,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+    if op == "public_clone":
+        if action not in PUBLIC_CLONE_ACTIONS:
+            raise ValueError(
+                "public_clone is available only to sanctioned agent actions"
+            )
+        return _public_clone_request(
+            req,
+            runner=public_runner,
+            resolver=resolver,
+            clone_root=clone_root,
+            claims_path=claims_path,
+        )
+    if not allowed:
+        raise ValueError("no repositories are allowed for search")
 
     request = dict(req)
     request["_allowed"] = allowed
@@ -334,7 +1415,9 @@ def _prepare_tool_dir(tool_dir):
         for name in os.listdir(tool_dir):
             path = os.path.join(tool_dir, name)
             if name != "wheelhouse-search":
-                raise ValueError("search tool directory must contain only wheelhouse-search")
+                raise ValueError(
+                    "search tool directory must contain only wheelhouse-search"
+                )
             child = os.lstat(path)
             if stat.S_ISDIR(child.st_mode):
                 raise ValueError("wheelhouse-search path must not be a directory")
@@ -376,9 +1459,18 @@ def cmd_scope():
     print(json.dumps(repos, separators=(",", ":")))
 
 
+def cmd_cleanup():
+    cleanup_public_clones()
+
+
 def cmd_run():
     try:
-        output = handle_request(_read_request(), _env_allowed_repos())
+        output = handle_request(
+            _read_request(),
+            _env_allowed_repos(),
+            action=os.environ.get("WHEELHOUSE_SEARCH_ACTION", ""),
+            claims_path=os.environ.get("WHEELHOUSE_PUBLIC_CLONE_CLAIMS", ""),
+        )
     except Exception as exc:
         print("wheelhouse-search error: %s" % exc, file=sys.stderr)
         sys.exit(1)
@@ -394,10 +1486,13 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1] == "scope":
         cmd_scope()
         return
+    if len(sys.argv) == 2 and sys.argv[1] == "cleanup":
+        cmd_cleanup()
+        return
     if len(sys.argv) == 1:
         cmd_run()
         return
-    sys.exit("usage: nl_readonly_search.py [install|scope]")
+    sys.exit("usage: nl_readonly_search.py [install|scope|cleanup]")
 
 
 if __name__ == "__main__":

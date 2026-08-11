@@ -28,9 +28,7 @@ repos:
     # merge". For lavish-axi this is the "raised via no-mistakes" contribution
     # gate. Set to null if you have no such gate. When set, a PR is never shown
     # as merge-ready until this check passes.
-    # Duplicate contexts with this exact name aggregate worst-wins. A GitHub
-    # rollup FAILURE/ERROR also fails closed rather than marking a PR merge-ready,
-    # even when this is null.
+    # See README setup step 2 for duplicate-context and rollup aggregation rules.
     compliance_check: "PR must be raised via no-mistakes"
     # Substrings that identify your *test* / CI checks. A PR is "tests green"
     # only when every check whose name contains one of these passes. lavish-axi
@@ -42,6 +40,8 @@ repos:
     # auto_approve_ci: false       # optional override of the global setting
     # auto_triage: false           # optional per-repo opt-out for Claude spend (pr-review)
     # auto_triage_issues: false    # optional per-repo opt-out for Claude spend (issue-triage)
+    # triage_attempt_cap_per_revision: 2  # optional override, integer 1..5
+    # triage_context_refresh_allowance: 2  # optional override, integer 0..5
     # pending_contributor_cleanup: false  # optional per-repo stale PR cleanup override
     # pending_contributor_cleanup_days: 14
     # pending_contributor_reminder_days: 10
@@ -70,6 +70,13 @@ repos:
   - name: no-mistakes
     # ci.yml runs `test` (matrix os) + `e2e` (and a format/vet `check` job we skip).
     compliance_check: "PR must be raised via no-mistakes"
+    # This repository's no-mistakes-required workflow publishes the controlled
+    # current-body run identity introduced in no-mistakes merge 912bc756. The
+    # explicit schema opts only this proven producer into latest-event reduction.
+    compliance_evidence:
+      schema: "wheelhouse.actions-current-body/v1"
+      workflow_path: ".github/workflows/no-mistakes-required.yml"
+      workflow_name: "Require no-mistakes"
     test_check_patterns: ["test (", "e2e"]
 
   - name: axi
@@ -143,9 +150,9 @@ repos:
     test_check_patterns: ["build-and-test"]
 
   # -- These have CI but NO no-mistakes contribution gate, so compliance_check is
-  #    null: a PR is never withheld waiting on a gate that does not exist (a
-  #    GitHub rollup FAILURE/ERROR still fails closed). test_check_patterns match
-  #    each repo's real CI test-job check names.
+  #    null: a PR is never withheld waiting on a gate that does not exist.
+  #    GitHub rollup failures still follow README setup step 2.
+  #    test_check_patterns match each repo's real CI test-job check names.
   - name: treehouse
     # No no-mistakes gate. ci.yml ("CI") runs a Go `test` matrix
     # (ubuntu/macos/windows-latest); its separate `check` job is a gofmt/vet gate
@@ -201,8 +208,8 @@ maintainer: ""
 
 # Provider-agnostic agent runtime.
 # Claude is the production primary for every agent-assisted action.
-# The seven direct Claude Action steps remain the exact pinned production
-# implementation behind the shared selection boundary.
+# Eight pinned Claude Action steps remain deployable behind the shared selection
+# boundary: production for non-repair actions and rollback for schema repair.
 # Codex remains disabled adapter evidence because this public deployment has no
 # supported secure noninteractive ChatGPT Pro authentication path.
 # Deferred provider candidates are not represented here and have no adapter or
@@ -214,6 +221,13 @@ agent_runtime:
   primary_profile: claude-action-current-pinned
   target: claude
   fallback: none
+  # Schema repair is the first controlled direct-CLI production cutover.
+  # Set temporary_rollback_profile to claude-action-current-pinned and replay
+  # the durable item explicitly to restore the pinned action path.
+  production_activation:
+    triage.schema-repair: claude-cli-pinned
+    nl-decision.schema-repair: claude-cli-pinned
+  temporary_rollback_profile: null
   disabled_adapters:
     codex-app-server: unsupported-public-chatgpt-pro-auth
 
@@ -233,6 +247,21 @@ agent_runtime:
       provider_hosts:
         - api.anthropic.com
 
+    claude-cli-pinned:
+      adapter: claude-cli
+      harness: claude-code
+      provider: anthropic
+      auth_profile: anthropic-subscription
+      auth_mechanism: claude-code-oauth-token
+      expected_workspace_id: ""
+      model: claude-sonnet-4-6
+      effort: provider-default
+      cost_class: subscription
+      data_boundary: anthropic-subscription
+      allow_model_alias: false
+      provider_hosts:
+        - api.anthropic.com
+
   actions:
     triage.issue.local: {target: claude, profile: claude-action-current-pinned}
     triage.issue.search: {target: claude, profile: claude-action-current-pinned}
@@ -243,13 +272,16 @@ agent_runtime:
     deep-review.search: {target: claude, profile: claude-action-current-pinned}
     nl-decision.local: {target: claude, profile: claude-action-current-pinned}
     nl-decision.search: {target: claude, profile: claude-action-current-pinned}
+    nl-decision.schema-repair: {target: claude, profile: claude-action-current-pinned}
+    merge.resolve-conflicts: {target: claude, profile: claude-action-current-pinned}
 
 # Automatic lightweight PR triage. DEFAULT ON when this key is absent.
 # When CLAUDE_CODE_OAUTH_TOKEN is present, each pure needs-decision pr-review
-# card gets one quick advisory triage per PR head SHA.
-# The card gains a Summary, Product implications, and Recommended next step.
-# A fresh successful structured recommendation may add an Accept recommendation
-# checkbox, but it still never acts unless the owner/maintainer ticks it.
+# card can queue bounded advisory triage attempts keyed by PR head SHA.
+# The card gains Summary and Product implications. A fresh admitted structured
+# recommendation adds the single Recommended action section and may add an
+# Accept recommendation checkbox, but it still never acts unless the
+# owner/maintainer ticks it.
 # Known claude-code-action harness polling/status lines are preserved but
 # labeled as automated status in card text.
 # A brand-new eligible card is first labeled pending-triage and shows no
@@ -262,20 +294,49 @@ auto_triage: true
 # Automatic lightweight issue triage. DEFAULT ON when this key is absent, and
 # INDEPENDENT of `auto_triage` above - toggling one never affects the other.
 # When CLAUDE_CODE_OAUTH_TOKEN is present, each pure needs-decision issue-triage
-# card gets one quick advisory triage per issue `updatedAt` revision (issues have
-# no head SHA, so a new comment or edit is what makes it eligible again).
+# card can queue bounded advisory triage attempts keyed by issue `updatedAt`
+# revision (issues have no head SHA, so a new comment or edit is what makes it
+# eligible again).
 # A brand-new eligible issue card is first labeled pending-triage and shows no
 # decision checkboxes until that attempt completes or fails open.
 # It checks out the repo's default branch read-only for a little code context;
-# there is no diff to review. Same Summary / Product implications / Recommended
-# next step shape as PR auto triage, with the same possible Accept
-# recommendation shortcut for issue-safe actions; same advisory-only,
-# never-acts-unless-ticked guarantee.
+# there is no diff to review. It uses the same Summary / Product implications
+# analysis and conditional admitted Recommended action section as PR auto
+# triage, with the same possible Accept recommendation shortcut for issue-safe
+# actions and the same advisory-only, never-acts-unless-ticked guarantee.
 # Known claude-code-action harness polling/status lines are preserved but
 # labeled as automated status in card text.
 # Set false to opt out for token-spend control, or override per repo above with
 # `auto_triage_issues: false`.
 auto_triage_issues: true
+
+# Automatic-triage spend guards.
+# `triage_attempt_cap_per_revision` counts queued attempts for one card kind and
+# source revision (PR head SHA or issue updatedAt).
+# It defaults to 2 and accepts integers from 1 through 5, with an optional
+# per-repository override above.
+# Invalid values fail closed to 1.
+# `triage_daily_ceiling` is one fleet-wide count of reservations per UTC day.
+# It defaults to 1200 and accepts integers from 1 through 2000.
+# The default lets approved replay waves complete without cost throttling while
+# remaining a finite runaway-containment bound.
+# It has no per-repository override; any invalid configuration fails closed to
+# zero automatic triage reservations until corrected.
+# One reservation permits at most one triage dispatch, whose bounded schema
+# repair can make at most two model calls total.
+# `triage_context_refresh_allowance` is a separate small budget for re-triages
+# whose ONLY trigger is a verified base-branch SHA or VISION.md SHA movement
+# against an unchanged, already-attempted PR head (the auto-merge verdict binds
+# those SHAs, so such a refresh is legitimate and required). It defaults to 2,
+# accepts integers from 0 through 5 (0 disables the allowance), and may be
+# overridden per repository above. Invalid values fail closed to 0. Each use is
+# bound to the exact (head, base, VISION) identity, so a repeated identity
+# grants nothing; ordinary failure retries stay on
+# `triage_attempt_cap_per_revision`, and every context refresh still consumes
+# one daily-ceiling reservation.
+triage_attempt_cap_per_revision: 2
+triage_daily_ceiling: 1200
+triage_context_refresh_allowance: 2
 
 # Code-grounded deep review is ALWAYS available (there is no enable flag). Tick
 # the "Investigate" box, or have the repo owner apply the `needs-deep-review`
@@ -289,10 +350,7 @@ auto_triage_issues: true
 # and configured fleet repos; without it deep review keeps the legacy no-shell,
 # Read/Grep/Glob-only behavior. Known claude-code-action harness polling/status
 # lines are preserved in the posted verdict but labeled as automated status.
-# All Claude-powered paths use the pinned
-# claude-code-action v1.0.161 commit and pass immutable
-# `--model claude-sonnet-4-6` to every Claude
-# step.
+# Runtime provenance and immutable pins: see docs/AGENT_RUNTIME.md.
 
 # Natural-language decisions. Leave false to keep the queue fully deterministic
 # (checkbox + slash-command only). Set true AND add the CLAUDE_CODE_OAUTH_TOKEN
@@ -302,11 +360,12 @@ auto_triage_issues: true
 # "request changes" -> request-changes on a PR-review card), answers a
 # question, or asks you to clarify. The optional READONLY_TOKEN secret also
 # enables read-only answer-mode search across the target repo and configured
-# fleet repos. Without it the Claude step keeps the legacy Write-only, no-shell
-# behavior.
+# fleet repos. Without it the Claude step is Read/Grep/Glob-only with no shell.
 # The LLM only proposes a structured result - the deterministic executor still
 # performs (and guards) any action. Inert until both the flag and the Claude token
 # are present.
+# A delivered strict-JSON/schema miss gets one bounded repair attempt before a
+# content-free retryable failure leaves the card open; see docs/AGENT_RUNTIME.md.
 nl_decisions: true
 
 # Whether the scheduled backstop also opens decision cards for open *issues*
@@ -319,16 +378,13 @@ card_issues: true
 
 # Stale pending-contributor cleanup. DEFAULT OFF when this key is absent; Shreejit's
 # own Wheelhouse opts in here.
-# The PR-only MVP arms cleanup only after deterministic asks: `/request-changes`
-# reviews and merge-conflict rebase nudges.
-# A provable legacy nudge that predates cleanup arming also enters the same
-# reminder-then-close lifecycle.
-# The normal CI-approval lane remains excluded.
-# Its only cleanup exception is a cross-repo ci-noop PR with both a provable
-# rebase nudge and a current authoritative `CONFLICTING` mergeability result.
-# It reminds once after 10 days and closes after 14 days only if the reminder was
-# already posted and the target timeline shows no qualifying contributor comment,
-# review, review comment, edit, or head push after the ask.
+# The PR-only MVP arms cleanup only after a deterministic captain
+# `/request-changes` review. Historical rebase-nudge records are silently
+# disarmed and never enter a reminder or close lifecycle. The normal CI-approval
+# lane remains excluded. It reminds once after 10 days and closes after 14 days
+# only if the reminder was already posted and the target timeline shows no
+# qualifying contributor comment, review, review comment, edit, or head push
+# after the ask.
 # Missing review timestamps are re-read by review ID when possible; an
 # unprovable timestamp or update skips cleanup.
 # Maintainer and bot activity do not reset the clock.
@@ -355,25 +411,16 @@ pending_contributor_cleanup_targets: ["pr"]
 # Unknown fork status fails closed to a manual CI-approval card for contributors
 # or a `suppressed-card` warning for excluded authors.
 # If the approval call verifies no matching run is awaiting approval, scan normally
-# emits no card and reconcile consumes any stale CI-approval card.
-# One narrow contributor-fork exception preserves conflict feedback without a
-# new bucket or card: when that safe approval result is `noop` AND mergeability
-# conclusively settles to `CONFLICTING`, the scan posts the ordinary one-per-head
-# rebase nudge before it drops the PR from the worklist. It does not nudge an
-# actually approved run, an UNKNOWN or missing mergeability value, or a failed
-# settlement, and it does not write the structured pending-contributor cleanup
-# state. A failed
-# settlement marks the repo scan unhealthy, preserving existing cards.
-# Everything uncertain fails closed to a contributor card or excluded-author
+# emits no card and reconcile consumes any stale CI-approval card. Mergeability
+# is display-only for readiness, so no CI path contacts a contributor about a
+# conflict. Everything uncertain fails closed to a contributor card or excluded-author
 # `suppressed-card`. The scan-backstop log records one notice or warning for
 # every auto-approve path outcome, including no-pending runs, approval failures
 # that route back to a card, and suppressed-card cases.
 # The approval call also verifies each action_required workflow run against the
 # target PR: GitHub-populated pull_requests must name exactly that PR, and
 # fork-originated empty associations must match the PR head SHA plus head branch.
-# Verified duplicate pending runs sharing a stable workflowDatabaseId are
-# deduped to the highest/newest run before approval; runs without that stable
-# workflow identity are left distinct.
+# The exact per-run approval contract lives in README.md's Security notes.
 # Caveat: this gates the fork `pull_request` run only. A `pull_request_target`
 # workflow runs automatically with repo secrets and is NOT gated by any approval,
 # so the posture check is a "don't silently auto-clear + warn me" signal plus a
@@ -421,3 +468,29 @@ thank_on_merge: true
 # label on the target PR. Auto-merge never auto-reverts; each merge leaves a
 # resolved decision card plus an entry in the durable auto-merge ledger issue.
 auto_merge: true
+
+# Captain-initiated ASSISTED IN-PLACE MERGE. DEFAULT OFF; deliberately left off
+# in this repository's committed config too, because enabling it also requires
+# provisioning the `ASSISTED_MERGE_PUSH_TOKEN` secret (see README).
+#
+# When the captain decides "merge" on a CONFLICTED same-repository or editable
+# personal-fork pull request and this is on, Wheelhouse resolves the conflict as
+# a merge commit pushed to the contributor's EXISTING pull request branch - never
+# a landing branch, never a replacement PR, never a force push, never a rewrite
+# of their commits. Immediately before the plain non-force push, Wheelhouse
+# re-reads the remote head and refuses any racing contributor update. A bounded
+# model turn only chooses, per conflicted hunk, an ordering of lines
+# that already exist in the two merge parents; trusted code writes the bytes.
+# Anything risky or ambiguous escalates instead of being guessed, and the
+# captain still makes a second `Merge it` decision on the refreshed card.
+#
+# Scan-time auto-merge is UNAFFECTED and stays clean-state-only (G4/G7).
+#
+# Kill switches (layered): this flag, a per-repo `assisted_merge: false`,
+# removing `CLAUDE_CODE_OAUTH_TOKEN`, removing `ASSISTED_MERGE_PUSH_TOKEN`, and
+# a per-PR `wheelhouse:no-assisted-merge` label on the target pull request.
+assisted_merge: false
+# Conflicts larger than either cap escalate to the captain without any model
+# spend. Both may be overridden per repository under `repos:`.
+assisted_merge_max_conflict_files: 5
+assisted_merge_max_conflict_lines: 200

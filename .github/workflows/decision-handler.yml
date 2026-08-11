@@ -43,6 +43,31 @@ jobs:
       target_number: ${{ steps.decide.outputs.target_number }}
       kind: ${{ steps.decide.outputs.kind }}
       head_sha: ${{ steps.decide.outputs.head_sha }}
+      target_revision: ${{ steps.decide.outputs.target_revision }}
+      source_policy_admitted: ${{ steps.source-policy.outputs.admitted }}
+      nl_proceed: ${{ steps.nl-gate.outputs.proceed }}
+      nl_runtime_mode: ${{ steps.nl-gate.outputs.runtime_mode }}
+      nl_action: ${{ steps.nl-gate.outputs.action }}
+      nl_repo: ${{ steps.nl-gate.outputs.repo }}
+      nl_number: ${{ steps.nl-gate.outputs.number }}
+      nl_kind: ${{ steps.nl-gate.outputs.kind }}
+      nl_revision: ${{ steps.nl-gate.outputs.revision }}
+      nl_admitted: ${{ steps.nl-claim.outputs.admitted }}
+      nl_event_key: ${{ steps.nl-claim.outputs.event_key }}
+      nl_claim_id: ${{ steps.nl-claim.outputs.comment_id }}
+      nl_claim_marker: ${{ steps.nl-claim.outputs.marker }}
+      decision_label_recovery_required: ${{ steps.decision-label-recovery.outputs.required }}
+      decision_label_recovery_admitted: ${{ steps.decision-label-recovery.outputs.admitted }}
+      decision_label_recovery_event_key: ${{ steps.decision-label-recovery.outputs.event_key }}
+      nl_pre_model_fresh: ${{ steps.nl-pre-model-freshness.outputs.fresh }}
+      nl_prompt_built: ${{ steps.nl-prompt.outcome == 'success' }}
+      claude_ready: ${{ steps.nl-claude-model.outcome == 'success' }}
+      input_artifact: ${{ steps.nl-claude-model.outputs.input-artifact }}
+      output_artifact: ${{ steps.nl-claude-model.outputs.output-artifact }}
+      handoff_sha256: ${{ steps.nl-claude-model.outputs.handoff-sha256 }}
+      correlation_id: ${{ steps.nl-claude-model.outputs.correlation-id }}
+      child_timeout_minutes: ${{ steps.nl-claude-model.outputs.child-timeout-minutes }}
+      baseline_artifact: ${{ steps.nl-baseline-name.outputs.artifact }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -84,6 +109,33 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: echo "authorized=$(python scripts/wheelhouse_core.py authorized)" >> "$GITHUB_OUTPUT"
 
+      - name: Record denied unauthorized NL admission
+        if: ${{ steps.gate.outputs.authorized != 'true' && github.event_name == 'issue_comment' }}
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
+          OWNER: ${{ github.repository_owner }}
+          ISSUE: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          repo="$(python scripts/wheelhouse_core.py state repo)"
+          number="$(python scripts/wheelhouse_core.py state number)"
+          revision="$(python scripts/wheelhouse_core.py state head_sha)"
+          if [ -z "$revision" ]; then revision="$(python scripts/wheelhouse_core.py state updated_at)"; fi
+          if [ -z "$repo" ] || ! printf '%s' "$number" | grep -Eq '^[0-9]+$' || [ -z "$revision" ]; then
+            echo "unauthorized event had no trustworthy target identity; no agent path was admitted"
+            exit 0
+          fi
+          if [ "$HAS_READONLY_TOKEN" = "true" ]; then action="nl-decision.search"; else action="nl-decision.local"; fi
+          event_key="$(python scripts/agent_runtime.py event-key \
+            --action "$action" --owner "$OWNER" --repo "$repo" \
+            --number "$number" --issue "$ISSUE" --revision "$revision" \
+            --event-id "comment:$COMMENT_ID")"
+          python scripts/agent_runtime.py stage \
+            --action "$action" --source-sha "${{ github.sha }}" \
+            --event-key "$event_key" --stage denied --status skipped \
+            --code admission.unauthorized
+
       # --- Checkbox path -----------------------------------------------------
       # Render the card's checkboxes as {selected, unselected} via
       # issue-ops/parser, for both the new body and the pre-edit body. The
@@ -121,6 +173,36 @@ jobs:
           CHECKBOXES_OLD: ${{ steps.checkboxes-old.outputs.json }}
         run: python scripts/apply_decision.py parse
 
+      - id: source-policy
+        if: ${{ steps.gate.outputs.authorized == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue source-policy reconciliation
+        if: ${{ steps.source-policy.outputs.admitted == 'false' && (steps.source-policy.outputs.mode == 'fork-reject' || steps.source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - id: decision-label-recovery
+        if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issues' && github.event.action == 'labeled' && (steps.decide.outputs.decision != '' || steps.decide.outputs.investigate != '') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          SENDER: ${{ github.event.sender.login }}
+          AUTHORIZED: ${{ steps.gate.outputs.authorized }}
+        run: |
+          python scripts/decision_label_recovery.py claim \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --repo-slug "$REPO_SLUG" \
+            --issue "$ISSUE" \
+            --sender "$SENDER" \
+            --authorized "$AUTHORIZED"
+
       # --- Natural-language path (opt-in) ------------------------------------
       # An owner/maintainer comment that is NOT a slash-command and not on a held
       # `pending-triage` card. Gated on nl_decisions in config AND the
@@ -128,7 +210,7 @@ jobs:
       # intent or answers a question - the deterministic steps below do any
       # acting, so every guard still applies.
       - id: nl-gate
-        if: ${{ steps.gate.outputs.authorized == 'true' && github.event_name == 'issue_comment' && steps.decide.outputs.decision == '' }}
+        if: ${{ steps.gate.outputs.authorized == 'true' && steps.source-policy.outputs.admitted == 'true' && github.event_name == 'issue_comment' && steps.decide.outputs.decision == '' }}
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -167,6 +249,7 @@ jobs:
           {
             echo "proceed=$proceed"
             echo "runtime_mode=$mode"
+            echo "action=$runtime_action"
             echo "repo=$repo"
             echo "number=$(python scripts/wheelhouse_core.py state number)"
             echo "kind=$(python scripts/wheelhouse_core.py state kind)"
@@ -176,11 +259,142 @@ jobs:
             echo "nl path inert (nl_decisions=$nl, auth_ready=$auth_ready, eligible=$eligible)"
           fi
 
+      - name: Record denied natural-language admission
+        if: ${{ steps.nl-gate.outcome == 'success' && steps.nl-gate.outputs.proceed != 'true' && steps.nl-gate.outputs.action != '' && steps.nl-gate.outputs.revision != '' }}
+        env:
+          ACTION: ${{ steps.nl-gate.outputs.action }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          ISSUE: ${{ github.event.issue.number }}
+          REVISION: ${{ steps.nl-gate.outputs.revision }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          event_key="$(python scripts/agent_runtime.py event-key \
+            --action "$ACTION" --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            --event-id "comment:$COMMENT_ID")"
+          python scripts/agent_runtime.py stage \
+            --action "$ACTION" --source-sha "${{ github.sha }}" \
+            --event-key "$event_key" --stage denied --status skipped \
+            --code admission.denied
+
+      - id: nl-preclaim-freshness
+        name: Verify target revision before natural-language admission
+        if: steps.nl-gate.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          SLUG: ${{ github.repository_owner }}/${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          EXPECTED_REVISION: ${{ steps.nl-gate.outputs.revision }}
+        run: |
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: nl-final-source-policy
+        if: steps.nl-preclaim-freshness.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          HEAD_SHA: ${{ steps.nl-gate.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue final natural-language source-policy reconciliation
+        if: ${{ steps.nl-final-source-policy.outputs.admitted == 'false' && (steps.nl-final-source-policy.outputs.mode == 'fork-reject' || steps.nl-final-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - id: nl-claim
+        name: Claim the exact natural-language event before spend
+        if: steps.nl-final-source-policy.outputs.admitted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.nl-gate.outputs.action }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          ISSUE: ${{ github.event.issue.number }}
+          REVISION: ${{ steps.nl-gate.outputs.revision }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python scripts/agent_claim.py \
+            --action "$ACTION" --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            --event-id "comment:$COMMENT_ID" --repo-slug "$REPO_SLUG"
+
+      - name: Record natural-language admission stage
+        if: always() && steps.nl-claim.outputs.event_key != ''
+        run: |
+          status="skipped"; code="admission.duplicate"
+          if [ "${{ steps.nl-claim.outputs.admitted }}" = "true" ]; then status="ok"; code="admission.admitted"; fi
+          python scripts/agent_runtime.py stage \
+            --action "${{ steps.nl-gate.outputs.action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ steps.nl-claim.outputs.event_key }}" \
+            --stage admitted --status "$status" --code "$code"
+
+      - id: nl-pre-model-freshness
+        name: Verify target revision before natural-language task build
+        if: steps.nl-claim.outputs.admitted == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          SLUG: ${{ github.repository_owner }}/${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          EXPECTED_REVISION: ${{ steps.nl-gate.outputs.revision }}
+          CLAIM_ID: ${{ steps.nl-claim.outputs.comment_id }}
+          CLAIM_MARKER: ${{ steps.nl-claim.outputs.marker }}
+          CARD_REPO: ${{ github.repository }}
+        run: |
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            body="The agent event was rejected before task construction because the target revision changed or could not be verified. The card remains open and no target action was taken. ${CLAIM_MARKER}"
+            GH_TOKEN="$CARD_TOKEN" gh api --method PATCH \
+              "repos/$CARD_REPO/issues/comments/$CLAIM_ID" -f "body=$body" >/dev/null
+            python scripts/agent_runtime.py stage \
+              --action "${{ steps.nl-gate.outputs.action }}" \
+              --source-sha "${{ github.sha }}" \
+              --event-key "${{ steps.nl-claim.outputs.event_key }}" \
+              --stage stale --status failed --code target.stale
+          fi
+
+      - name: Capture the post-claim live-card baseline
+        if: steps.nl-pre-model-freshness.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: gh issue view "$ISSUE" --json state,labels,body,updatedAt,comments > nl-card-baseline.json
+
       # Read-only fetch of the target with FLEET_TOKEN so Claude can answer
       # questions well. It is passed as UNTRUSTED DATA in the prompt - the LLM
       # itself never receives FLEET_TOKEN.
       - id: nl-fetch
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: steps.nl-pre-model-freshness.outputs.fresh == 'true'
         env:
           FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -239,7 +453,7 @@ jobs:
       # everyone else, so no unauthorized comment can reach the prompt. The thread
       # already contains the triggering comment; it is excluded there by id.
       - id: nl-comments
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: steps.nl-pre-model-freshness.outputs.fresh == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO_SLUG: ${{ github.repository }}
@@ -256,7 +470,7 @@ jobs:
       # is absent, the prompt and Claude tool list stay in the production no-search
       # mode.
       - id: nl-readonly
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: steps.nl-pre-model-freshness.outputs.fresh == 'true'
         env:
           HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
         run: |
@@ -268,30 +482,40 @@ jobs:
           fi
 
       - id: nl-prompt
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: steps.nl-pre-model-freshness.outputs.fresh == 'true'
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
           KIND: ${{ steps.nl-gate.outputs.kind }}
           TARGET_FILE: target.txt
+          NL_PROMPT_FILE: nl-prompt.txt
           COMMENTS_FILE: card_comments.json
           TRIGGER_COMMENT_ID: ${{ github.event.comment.id }}
           READONLY_SEARCH_ENABLED: ${{ steps.nl-readonly.outputs.enabled }}
         run: python scripts/apply_decision.py nl-prompt
 
       - id: nl-search-tool
-        if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' && steps.nl-readonly.outputs.enabled == 'true' }}
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' && steps.nl-readonly.outputs.enabled == 'true' }}
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
         run: echo "repos=$(python scripts/nl_readonly_search.py scope)" >> "$GITHUB_OUTPUT"
 
+      - id: nl-task-source-policy
+        name: Recheck source permission at Claude task admission
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          HEAD_SHA: ${{ steps.nl-gate.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: nl-claude-task
         name: Build the immutable Claude natural-language AgentTask
-        if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' }}
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-task-source-policy.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' }}
         env:
-          NL_PROMPT: ${{ steps.nl-prompt.outputs.prompt }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.nl-gate.outputs.repo }}
           NUMBER: ${{ steps.nl-gate.outputs.number }}
@@ -300,16 +524,31 @@ jobs:
           SEARCH: ${{ steps.nl-readonly.outputs.enabled }}
           WHEELHOUSE_REVISION: ${{ github.sha }}
           BUNDLE: ${{ runner.temp }}/wheelhouse-claude-nl-decision
+          EVENT_KEY: ${{ steps.nl-claim.outputs.event_key }}
         run: |
           set -euo pipefail
-          printf '%s' "$NL_PROMPT" > prompt.txt
-          rm -f decision.json
           if [ "$SEARCH" = "true" ]; then action="nl-decision.search"; else action="nl-decision.local"; fi
           python scripts/agent_runtime.py build-task \
-            --action "$action" --prompt prompt.txt --bundle "$BUNDLE" \
+            --action "$action" --prompt nl-prompt.txt --bundle "$BUNDLE" \
             --out "$BUNDLE/task.json" --owner "$OWNER" --repo "$REPO" \
             --number "$NUMBER" --kind "$KIND" --revision "$REVISION" \
-            --wheelhouse-revision "$WHEELHOUSE_REVISION" --target-file target.txt
+            --wheelhouse-revision "$WHEELHOUSE_REVISION" --target-file target.txt \
+            --event-key "$EVENT_KEY"
+
+      - name: Queue Claude task-admission source-policy reconciliation
+        if: ${{ steps.nl-task-source-policy.outputs.admitted == 'false' && (steps.nl-task-source-policy.outputs.mode == 'fork-reject' || steps.nl-task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - name: Record natural-language task-build failure stage
+        if: ${{ always() && steps.nl-claim.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'claude' && steps.nl-claude-task.outcome == 'failure' }}
+        run: |
+          python scripts/agent_runtime.py stage \
+            --action "${{ steps.nl-gate.outputs.action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ steps.nl-claim.outputs.event_key }}" \
+            --stage task-failed --status failed --code task.build_failed
 
       - id: nl-claude-model
         name: Run Claude intent mapping in the read-only model workflow
@@ -320,10 +559,9 @@ jobs:
           bundle: ${{ steps.nl-claude-task.outputs.bundle }}
           invocation-id: nl-decision
           allowed-repos: ${{ steps.nl-search-tool.outputs.repos || '[]' }}
-          delivered-file: "true"
 
       - name: Prepare the pinned Codex sandboxed adapter worker
-        if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
         env:
           CODEX_PREFIX: ${{ runner.temp }}/wheelhouse-codex
         run: |
@@ -349,11 +587,22 @@ jobs:
           "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
           python scripts/agent_runtime.py verify-pins
 
+      - id: nl-codex-task-source-policy
+        name: Recheck source permission at Codex task admission
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          HEAD_SHA: ${{ steps.nl-gate.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: nl-agent-runtime-task
         name: Build the immutable natural-language decision AgentTask
-        if: ${{ steps.nl-gate.outputs.proceed == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-codex-task-source-policy.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
         env:
-          NL_PROMPT: ${{ steps.nl-prompt.outputs.prompt }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.nl-gate.outputs.repo }}
           NUMBER: ${{ steps.nl-gate.outputs.number }}
@@ -362,9 +611,9 @@ jobs:
           SEARCH: ${{ steps.nl-readonly.outputs.enabled }}
           WHEELHOUSE_REVISION: ${{ github.sha }}
           BUNDLE: ${{ runner.temp }}/wheelhouse-agent-nl-decision
+          EVENT_KEY: ${{ steps.nl-claim.outputs.event_key }}
         run: |
           set -euo pipefail
-          printf '%s' "$NL_PROMPT" > prompt.txt
           if [ "$SEARCH" = "true" ]; then
             action="nl-decision.search"
           else
@@ -372,7 +621,7 @@ jobs:
           fi
           python scripts/agent_runtime.py build-task \
             --action "$action" \
-            --prompt prompt.txt \
+            --prompt nl-prompt.txt \
             --bundle "$BUNDLE" \
             --out "$BUNDLE/task.json" \
             --owner "$OWNER" \
@@ -381,7 +630,14 @@ jobs:
             --kind "$KIND" \
             --revision "$REVISION" \
             --wheelhouse-revision "$WHEELHOUSE_REVISION" \
-            --target-file target.txt
+            --target-file target.txt \
+            --event-key "$EVENT_KEY"
+
+      - name: Queue Codex task-admission source-policy reconciliation
+        if: ${{ steps.nl-codex-task-source-policy.outputs.admitted == 'false' && (steps.nl-codex-task-source-policy.outputs.mode == 'fork-reject' || steps.nl-codex-task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - id: nl-agent-runtime
         name: Map natural-language intent through the Codex app-server contract
@@ -403,37 +659,168 @@ jobs:
         if: ${{ always() && steps.nl-agent-runtime.outputs.result != '' }}
         run: python scripts/agent_runtime.py summary --result '${{ steps.nl-agent-runtime.outputs.result }}'
 
-      - id: nl-result
-        if: steps.nl-gate.outputs.proceed == 'true'
+      # A delivered NL candidate that fails strict JSON/schema validation gets
+      # exactly one separately claimed same-event repair task. Its distinct
+      # durable action key makes a job re-run unable to admit another repair.
+      - id: nl-repair-prep
+        name: Detect an NL schema miss and prepare one bounded repair turn
+        if: ${{ always() && steps.nl-claim.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode == 'codex' }}
         env:
-          PATH: ${{ steps.trusted-src.outputs.safe_path }}
-          RUNTIME_RESULT: ${{ steps.nl-claude-model.outputs.result || steps.nl-agent-runtime.outputs.result }}
-          BASH_ENV: ""
-          ENV: ""
-          LD_PRELOAD: ""
-          LD_LIBRARY_PATH: ""
+          PRIMARY_RESULT: ${{ steps.nl-agent-runtime.outputs.result }}
+          PROMPT_FILE: ${{ runner.temp }}/wheelhouse-nl-repair-prompt.txt
         run: |
           set -euo pipefail
-          out_dir="${RUNNER_TEMP}/wheelhouse-nl"
-          out_file="${out_dir}/decision.json"
-          mkdir -p "$out_dir"
-          : > "$out_file"
-          if [ -n "${RUNTIME_RESULT:-}" ]; then
-            python scripts/agent_runtime.py export-final \
-              --result "$RUNTIME_RESULT" --out "$out_file"
+          python scripts/apply_decision.py nl-repair-prep \
+            --execution-file "${PRIMARY_RESULT:-}" \
+            --prompt-file "$PROMPT_FILE"
+
+      - id: nl-repair-gate
+        name: Resolve the NL schema-repair runtime selection
+        if: ${{ steps.nl-repair-prep.outputs.repair_needed == 'true' }}
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TARGET_REPO: ${{ steps.nl-gate.outputs.repo }}
+        run: python scripts/agent_runtime.py auth-status --action nl-decision.schema-repair --repo "$TARGET_REPO"
+
+      - id: nl-repair-claim
+        name: Claim the exact NL schema-repair event before spend
+        if: ${{ steps.nl-repair-prep.outputs.repair_needed == 'true' && steps.nl-repair-gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          ISSUE: ${{ github.event.issue.number }}
+          REVISION: ${{ steps.nl-gate.outputs.revision }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python scripts/agent_claim.py \
+            --action nl-decision.schema-repair --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            --event-id "comment:$COMMENT_ID" --repo-slug "$REPO_SLUG"
+
+      - id: nl-agent-runtime-repair-task
+        name: Build the immutable NL schema-repair AgentTask
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' && steps.nl-repair-gate.outputs.mode == 'codex' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          REVISION: ${{ steps.nl-gate.outputs.revision }}
+          WHEELHOUSE_REVISION: ${{ github.sha }}
+          BUNDLE: ${{ runner.temp }}/wheelhouse-agent-nl-repair
+          EVENT_KEY: ${{ steps.nl-repair-claim.outputs.event_key }}
+          PROMPT_FILE: ${{ steps.nl-repair-prep.outputs.prompt_file }}
+        run: |
+          set -euo pipefail
+          python scripts/agent_runtime.py build-task \
+            --action nl-decision.schema-repair \
+            --prompt "$PROMPT_FILE" \
+            --bundle "$BUNDLE" \
+            --out "$BUNDLE/task.json" \
+            --owner "$OWNER" \
+            --repo "$REPO" \
+            --number "$NUMBER" \
+            --kind schema-repair \
+            --revision "$REVISION" \
+            --wheelhouse-revision "$WHEELHOUSE_REVISION" \
+            --event-key "$EVENT_KEY"
+
+      - id: nl-agent-runtime-repair
+        name: Run one bounded NL schema repair through the Codex contract
+        if: ${{ steps.nl-repair-gate.outputs.mode == 'codex' && steps.nl-agent-runtime-repair-task.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          BUNDLE: ${{ steps.nl-agent-runtime-repair-task.outputs.bundle }}
+          TASK: ${{ steps.nl-agent-runtime-repair-task.outputs.task }}
+        run: |
+          set -euo pipefail
+          python scripts/agent_runtime.py run \
+            --task "$TASK" \
+            --bundle "$BUNDLE" \
+            --result "$BUNDLE/result.json" \
+            --events "$BUNDLE/events.ndjson"
+
+      - name: Refresh the live-card baseline after the repair claim
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: gh issue view "$ISSUE" --json state,labels,body,updatedAt,comments > nl-card-baseline.json
+
+      - id: nl-baseline-name
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' }}
+        run: echo "artifact=wheelhouse-nl-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the exact post-claim card baseline
+        if: ${{ steps.nl-pre-model-freshness.outputs.fresh == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.nl-baseline-name.outputs.artifact }}
+          path: nl-card-baseline.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - id: nl-result
+        name: Bind the trusted primary NL AgentResult for projection
+        if: ${{ steps.nl-claim.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode != 'claude' }}
+        env:
+          RUNTIME_RESULT: ${{ steps.nl-agent-runtime.outputs.result }}
+        run: |
+          set -euo pipefail
+          echo "path=${RUNTIME_RESULT:-}" >> "$GITHUB_OUTPUT"
+
+      - id: nl-post-model-freshness
+        name: Re-read target revision before natural-language projection
+        if: ${{ always() && steps.nl-pre-model-freshness.outputs.fresh == 'true' && steps.nl-gate.outputs.runtime_mode != 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          SLUG: ${{ github.repository_owner }}/${{ steps.nl-gate.outputs.repo }}
+          NUMBER: ${{ steps.nl-gate.outputs.number }}
+          KIND: ${{ steps.nl-gate.outputs.kind }}
+          EXPECTED_REVISION: ${{ steps.nl-gate.outputs.revision }}
+          CLAIM_ID: ${{ steps.nl-claim.outputs.comment_id }}
+          CLAIM_MARKER: ${{ steps.nl-claim.outputs.marker }}
+          CARD_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            body="The assistant output was rejected because the target revision changed or could not be verified. The card remains open and no target action was taken. ${CLAIM_MARKER}"
+            GH_TOKEN="$CARD_TOKEN" gh api --method PATCH \
+              "repos/$CARD_REPO/issues/comments/$CLAIM_ID" -f "body=$body" >/dev/null
+            python scripts/agent_runtime.py stage \
+              --action "${{ steps.nl-gate.outputs.action }}" \
+              --source-sha "${{ github.sha }}" \
+              --event-key "${{ steps.nl-claim.outputs.event_key }}" \
+              --stage stale --status failed --code target.stale
           fi
 
       # Validate the LLM's structured result against the per-kind allowlist and
       # emit deterministic outputs. `decision` is non-empty ONLY for a valid
       # `action` mode - that is what makes the execute step below run.
       - id: route
-        if: steps.nl-gate.outputs.proceed == 'true'
+        if: steps.nl-post-model-freshness.outputs.fresh == 'true'
         working-directory: ${{ steps.trusted-src.outputs.path }}
         env:
           TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
           TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
           PATH: ${{ steps.trusted-src.outputs.safe_path }}
-          DECISION_FILE: ${{ runner.temp }}/wheelhouse-nl/decision.json
+          NL_EXECUTION_FILE: ${{ steps.nl-agent-runtime.outputs.result }}
+          NL_REPAIR_EXECUTION_FILE: ${{ steps.nl-agent-runtime-repair.outputs.result }}
+          NL_REPAIR_CLAIM_ADMITTED: ${{ steps.nl-repair-claim.outputs.admitted }}
+          NL_REPAIR_NEEDED: ${{ steps.nl-repair-prep.outputs.repair_needed }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           KIND: ${{ steps.nl-gate.outputs.kind }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -450,7 +837,10 @@ jobs:
             PYTHONDONTWRITEBYTECODE=1 \
             PYTHONNOUSERSITE=1 \
             GITHUB_OUTPUT="$GITHUB_OUTPUT" \
-            DECISION_FILE="$DECISION_FILE" \
+            NL_EXECUTION_FILE="$NL_EXECUTION_FILE" \
+            NL_REPAIR_EXECUTION_FILE="$NL_REPAIR_EXECUTION_FILE" \
+            NL_REPAIR_CLAIM_ADMITTED="$NL_REPAIR_CLAIM_ADMITTED" \
+            NL_REPAIR_NEEDED="$NL_REPAIR_NEEDED" \
             ISSUE_BODY="$ISSUE_BODY" \
             KIND="$KIND" \
             GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
@@ -458,7 +848,7 @@ jobs:
 
       # --- Act on the target (shared by every entry point) -------------------
       - id: current-card
-        if: ${{ steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action' }}
+        if: ${{ steps.source-policy.outputs.admitted == 'true' && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
@@ -466,25 +856,71 @@ jobs:
           TRIGGER_UPDATED_AT: ${{ github.event.issue.updated_at }}
           TRIGGER_LABELS: ${{ toJSON(github.event.issue.labels) }}
           TRIGGER_COMMENTS: ${{ github.event.issue.comments }}
+          ROUTE_MODE: ${{ steps.route.outputs.mode }}
+          LABEL_RECOVERY: ${{ steps.decision-label-recovery.outputs.admitted }}
+          RECOVERY_LABEL: ${{ steps.decision-label-recovery.outputs.label }}
         run: |
           set -euo pipefail
-          card="$(gh issue view "$ISSUE" --json state,labels,body,updatedAt,comments)"
+          gh issue view "$ISSUE" --json state,labels,body,updatedAt,comments > current-card.json
+          card="$(cat current-card.json)"
           allowed=false
+          if [ "$ROUTE_MODE" = "action" ] && [ -f nl-card-baseline.json ]; then
+            if jq -e --slurpfile baseline nl-card-baseline.json '
+              . as $current
+              | $baseline[0] as $before
+              | ([.labels[].name] | sort | unique) == ([$before.labels[].name] | sort | unique)
+              and (.body // "") == ($before.body // "")
+              and (.updatedAt // "") == ($before.updatedAt // "")
+              and ([.comments[]?] | length) == ([$before.comments[]?] | length)
+              and .state == "OPEN"
+              and ([.labels[].name] | index("needs-decision") != null)
+              and ([.labels[].name] | index("processing") == null)
+              and ([.labels[].name] | index("resolved") == null)
+              and ([.labels[].name] | index("blocked") == null)
+              and ([.labels[].name] | index("wheelhouse:auto-merge-claim") == null)
+            ' current-card.json >/dev/null; then
+              allowed=true
+            fi
+            echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          projection_recovery=false
+          if [ -n "$TRIGGER_UPDATED_AT" ]; then
+            projection_recovery="$(
+              TRIGGER_BODY="$TRIGGER_BODY" \
+                python scripts/render_card.py owner-race-recoverable \
+                  --current-card-file current-card.json
+            )"
+          fi
           if [ -n "$TRIGGER_UPDATED_AT" ] && jq -e \
             --arg trigger_body "$TRIGGER_BODY" \
             --arg trigger_updated_at "$TRIGGER_UPDATED_AT" \
             --argjson trigger_labels "$TRIGGER_LABELS" \
-            --argjson trigger_comments "${TRIGGER_COMMENTS:-0}" '
+            --argjson trigger_comments "${TRIGGER_COMMENTS:-0}" \
+            --arg projection_recovery "$projection_recovery" \
+            --arg label_recovery "$LABEL_RECOVERY" \
+            --arg recovery_label "$RECOVERY_LABEL" '
             ([.labels[].name] | sort | unique) as $labels
             | ($trigger_labels | map(.name) | sort | unique) as $trigger_labels
             | ["processing", "wheelhouse:auto-merge-claim"] as $claim_labels
             | ($labels - $claim_labels) as $stable_labels
             | ($trigger_labels - $claim_labels) as $stable_trigger_labels
-            | (.body // "") == $trigger_body
-            and ([.comments[]?] | length) == $trigger_comments
-            and $stable_labels == $stable_trigger_labels
+            | ((.body // "") == $trigger_body or $projection_recovery == "true")
+            and ([.comments[]?] | length) == (
+              $trigger_comments + (if $label_recovery == "true" then 1 else 0 end)
+            )
+            and (
+              $stable_labels == $stable_trigger_labels
+              or (
+                $label_recovery == "true"
+                and $projection_recovery == "true"
+                and ($stable_trigger_labels - [$recovery_label]) == $stable_labels
+                and ($stable_labels - $stable_trigger_labels) == []
+              )
+            )
             and (
               ($labels == $trigger_labels and (.updatedAt // "") == $trigger_updated_at)
+              or $projection_recovery == "true"
               or (
                 ($trigger_labels | index("processing") != null)
                 and ($trigger_labels | index("wheelhouse:auto-merge-claim") != null)
@@ -513,10 +949,29 @@ jobs:
           github_token: ${{ github.token }}
           labels: processing
 
+      - id: decision-label-revalidate
+        if: ${{ steps.decision-label-recovery.outputs.admitted == 'true' && steps.current-card.outputs.allowed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          SENDER: ${{ github.event.sender.login }}
+          AUTHORIZED: ${{ steps.gate.outputs.authorized }}
+          EVENT_KEY: ${{ steps.decision-label-recovery.outputs.event_key }}
+        run: |
+          python scripts/decision_label_recovery.py revalidate \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --repo-slug "$REPO_SLUG" \
+            --issue "$ISSUE" \
+            --sender "$SENDER" \
+            --authorized "$AUTHORIZED" \
+            --event-key "$EVENT_KEY" \
+            --processing required
+
       # Execute writes to the TARGET repo under FLEET_TOKEN. The NL fetch above
       # may also use FLEET_TOKEN, but only for read-only target context.
       - id: execute
-        if: ${{ (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') && steps.current-card.outputs.allowed == 'true' }}
+        if: ${{ (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') && steps.current-card.outputs.allowed == 'true' && (steps.decision-label-recovery.outputs.admitted != 'true' || steps.decision-label-revalidate.outputs.allowed == 'true') }}
         working-directory: ${{ steps.trusted-src.outputs.path }}
         env:
           TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
@@ -532,6 +987,8 @@ jobs:
           TARGET_NUMBER: ${{ steps.decide.outputs.target_number || steps.route.outputs.target_number }}
           KIND: ${{ steps.decide.outputs.kind || steps.route.outputs.kind }}
           HEAD_SHA: ${{ steps.decide.outputs.head_sha || steps.route.outputs.head_sha }}
+          TARGET_REVISION: ${{ steps.decide.outputs.target_revision || steps.route.outputs.target_revision }}
+          MERGE_ASSIST_RECORD: ${{ steps.decide.outputs.merge_assist_record || steps.route.outputs.merge_assist_record }}
           BASH_ENV: ""
           ENV: ""
           LD_PRELOAD: ""
@@ -556,22 +1013,42 @@ jobs:
             TARGET_NUMBER="$TARGET_NUMBER" \
             KIND="$KIND" \
             HEAD_SHA="$HEAD_SHA" \
+            TARGET_REVISION="$TARGET_REVISION" \
+            MERGE_ASSIST_RECORD="$MERGE_ASSIST_RECORD" \
             "$TRUSTED_PYTHON" scripts/apply_decision.py execute
 
+      - name: Queue final source-policy reconciliation
+        if: ${{ steps.execute.outputs.source_policy_mode == 'fork-reject' || steps.execute.outputs.source_policy_mode == 'pushability-unverified' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       # --- Finalize the card (this repo, default token; never re-triggers) ----
-      - name: Comment result on card
-        if: ${{ always() && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') && steps.current-card.outputs.allowed == 'true' }}
+      - id: nl-action-consumer
+        name: Comment result on card
+        if: ${{ always() && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') && steps.current-card.outputs.allowed == 'true' && steps.execute.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           MESSAGE: ${{ steps.execute.outputs.result_message }}
+          CLAIM_ID: ${{ steps.nl-claim.outputs.comment_id }}
+          CLAIM_MARKER: ${{ steps.nl-claim.outputs.marker }}
+          REPO_SLUG: ${{ github.repository }}
           PATH: ${{ steps.trusted-src.outputs.safe_path }}
           BASH_ENV: ""
           ENV: ""
           LD_PRELOAD: ""
           LD_LIBRARY_PATH: ""
           GH_PROMPT_DISABLED: "1"
-        run: gh issue comment "$ISSUE" --body "${MESSAGE:-No actionable result.}" || true
+        run: |
+          body="${MESSAGE:-No actionable result.}"
+          if [ -n "${CLAIM_ID:-}" ]; then
+            body="${body}"$'\n\n'"${CLAIM_MARKER}"
+            gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$CLAIM_ID" \
+              -f "body=$body" >/dev/null
+          else
+            gh issue comment "$ISSUE" --body "$body"
+          fi
 
       - name: Clear processing label
         if: ${{ always() && (steps.decide.outputs.decision != '' || steps.route.outputs.mode == 'action') && steps.current-card.outputs.allowed == 'true' }}
@@ -626,20 +1103,61 @@ jobs:
           GH_PROMPT_DISABLED: "1"
         run: gh issue close "${{ github.event.issue.number }}" || true
 
-      # --- NL answer / clarify: post the reply, leave the card OPEN ----------
-      - name: Post NL reply
-        if: ${{ steps.route.outputs.mode == 'answer' || steps.route.outputs.mode == 'clarify' }}
+      # --- Assisted in-place merge (captain-initiated conflict resolution) ----
+      # The captain's `Merge it` decision hit a merge conflict on an eligible
+      # source branch and assisted merge is enabled for the repo. Dispatch
+      # merge-assist.yml with the immutable coordinates - same `github.token`
+      # workflow_dispatch pattern, and the same recursion-barrier reason, as
+      # Investigate. The card is left pure pending (terminal `none`), so this
+      # runs AFTER the label steps above and never races them. merge-assist
+      # re-proves the exact target, source permission, workflow gates, and kill
+      # switches itself; failing to dispatch changes nothing on the target.
+      - name: Start assisted in-place merge
+        if: ${{ always() && steps.current-card.outputs.allowed == 'true' && steps.execute.outputs.assisted_merge == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
-          REPLY: ${{ steps.route.outputs.answer }}
+          TARGET_REPO: ${{ steps.execute.outputs.assisted_merge_repo }}
+          TARGET_NUMBER: ${{ steps.execute.outputs.assisted_merge_number }}
+          HEAD_SHA: ${{ steps.execute.outputs.assisted_merge_head_sha }}
           PATH: ${{ steps.trusted-src.outputs.safe_path }}
           BASH_ENV: ""
           ENV: ""
           LD_PRELOAD: ""
           LD_LIBRARY_PATH: ""
           GH_PROMPT_DISABLED: "1"
-        run: gh issue comment "$ISSUE" --body "$REPLY" || true
+        run: |
+          set -uo pipefail
+          if ! gh workflow run merge-assist.yml \
+            -f issue="$ISSUE" \
+            -f repo="$TARGET_REPO" \
+            -f number="$TARGET_NUMBER" \
+            -f head_sha="$HEAD_SHA"; then
+            gh issue comment "$ISSUE" --body \
+              "Couldn't start assisted in-place conflict resolution (workflow dispatch failed). Nothing on the target changed; resolve the conflict manually or tick Merge it again." || true
+          fi
+
+      # --- NL answer / clarify: post the reply, leave the card OPEN ----------
+      - id: nl-reply-consumer
+        name: Post NL reply
+        if: ${{ steps.route.outputs.mode == 'answer' || steps.route.outputs.mode == 'clarify' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPLY: ${{ steps.route.outputs.answer }}
+          CLAIM_ID: ${{ steps.nl-claim.outputs.comment_id }}
+          CLAIM_MARKER: ${{ steps.nl-claim.outputs.marker }}
+          REPO_SLUG: ${{ github.repository }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          GH_PROMPT_DISABLED: "1"
+        run: |
+          body="${REPLY}"$'\n\n'"${CLAIM_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$CLAIM_ID" \
+            -f "body=$body" >/dev/null
 
       # --- NL failure visibility (bounded, fire-once) ------------------------
       # If NL was entered and the prompt was built, but the intent-mapping LLM
@@ -651,13 +1169,16 @@ jobs:
       # re-triggers the handler; it echoes NO prompt or comment text and changes
       # no label, gate, or decision - purely an informational surface for a crash
       # that had none.
-      - name: Note NL processing failure on card
-        if: ${{ always() && steps.nl-gate.outputs.proceed == 'true' && steps.nl-prompt.outcome == 'success' && steps.route.outcome == 'skipped' }}
+      - id: nl-failure-consumer
+        name: Note NL processing failure on card
+        if: ${{ always() && steps.nl-claim.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode != 'claude' && steps.nl-post-model-freshness.outputs.fresh == 'true' && steps.nl-prompt.outcome == 'success' && (steps.route.outcome == 'skipped' || steps.route.outputs.result_valid != 'true') }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           REPO_SLUG: ${{ github.repository }}
-          TRIGGER_COMMENT_ID: ${{ github.event.comment.id }}
+          CLAIM_ID: ${{ steps.nl-claim.outputs.comment_id }}
+          CLAIM_MARKER: ${{ steps.nl-claim.outputs.marker }}
+          FAILURE_MESSAGE: ${{ steps.route.outputs.failure_message }}
           PATH: ${{ steps.trusted-src.outputs.safe_path }}
           BASH_ENV: ""
           ENV: ""
@@ -666,28 +1187,654 @@ jobs:
           GH_PROMPT_DISABLED: "1"
         run: |
           set -uo pipefail
-          marker="<!-- wheelhouse-nl-error:${TRIGGER_COMMENT_ID} -->"
-          # Fire-once: skip if this exact failure was already noted (e.g. the job
-          # was re-run). Read is best-effort; on a read error we do NOT post, to
-          # stay fail-quiet rather than risk a duplicate.
-          existing="$(gh api --paginate \
-            "/repos/${REPO_SLUG}/issues/${ISSUE}/comments?per_page=100" \
-            --jq '.[].body' 2>/dev/null)"
-          read_status=$?
-          if [ "$read_status" -ne 0 ]; then
-            echo "could not read card comments; skipping nl-error note"
-            exit 0
+          note="${FAILURE_MESSAGE:-The assistant did not produce a trusted result. No target action was taken; the card remains open and deterministic checkbox or slash-command controls are still available. See the workflow run for the stable stage/error code.}"
+          body="${note} ${CLAIM_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$CLAIM_ID" \
+            -f "body=$body" >/dev/null
+
+      - name: Record natural-language consumer stage
+        if: ${{ always() && steps.nl-claim.outputs.admitted == 'true' && steps.nl-gate.outputs.runtime_mode != 'claude' }}
+        run: |
+          status="failed"; stage="consumer-rejected"; code="consumer.rejected"
+          if [ "${{ steps.nl-action-consumer.outcome }}" = "success" ] || [ "${{ steps.nl-reply-consumer.outcome }}" = "success" ]; then
+            status="ok"; stage="consumer-committed"; code="consumer.committed"
+          elif [ "${{ steps.nl-pre-model-freshness.outputs.fresh }}" = "false" ] || [ "${{ steps.nl-post-model-freshness.outputs.fresh }}" = "false" ]; then
+            code="consumer.stale"
+          elif [ -n "${{ steps.route.outputs.failure_code }}" ]; then
+            code="${{ steps.route.outputs.failure_code }}"
           fi
-          if printf '%s' "$existing" | grep -qF "$marker"; then
-            echo "nl-error note already present; skipping"
-            exit 0
+          python scripts/agent_runtime.py stage \
+            --action "${{ steps.nl-gate.outputs.action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ steps.nl-claim.outputs.event_key }}" \
+            --stage "$stage" --status "$status" --code "$code"
+
+      - name: Finalize the bounded NL schema-repair claim
+        if: ${{ always() && steps.nl-repair-claim.outputs.admitted == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+          REPAIR_CLAIM_ID: ${{ steps.nl-repair-claim.outputs.comment_id }}
+          REPAIR_MARKER: ${{ steps.nl-repair-claim.outputs.marker }}
+          REPAIR_EVENT_KEY: ${{ steps.nl-repair-claim.outputs.event_key }}
+        run: |
+          set -euo pipefail
+          status="failed"; stage="consumer-rejected"; code="${{ steps.route.outputs.failure_code || 'consumer.rejected' }}"
+          if [ "${{ steps.nl-action-consumer.outcome }}" = "success" ] || [ "${{ steps.nl-reply-consumer.outcome }}" = "success" ]; then
+            status="ok"; stage="consumer-committed"; code="consumer.committed"
           fi
-          body="I couldn't process that comment automatically - the assistant step didn't finish (often a transient error or an oversized target). Your card is unchanged; please try again, or drive it with a checkbox or slash-command. See the workflow run for details. ${marker}"
-          gh issue comment "$ISSUE" --body "$body" || true
+          body="Agent NL schema-repair event finished with ${code}. ${REPAIR_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$REPAIR_CLAIM_ID" \
+            -f "body=$body" >/dev/null
+          python scripts/agent_runtime.py stage \
+            --action nl-decision.schema-repair --source-sha "${{ github.sha }}" \
+            --event-key "$REPAIR_EVENT_KEY" \
+            --stage "$stage" --status "$status" --code "$code"
+
+  nl-model:
+    needs: handle
+    if: ${{ needs.handle.outputs.claude_ready == 'true' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/claude-model.yml
+    with:
+      input_artifact: ${{ needs.handle.outputs.input_artifact }}
+      output_artifact: ${{ needs.handle.outputs.output_artifact }}
+      handoff_sha256: ${{ needs.handle.outputs.handoff_sha256 }}
+      expected_commit_sha: ${{ github.sha }}
+      correlation_id: ${{ needs.handle.outputs.correlation_id }}
+      child_timeout_minutes: ${{ fromJSON(needs.handle.outputs.child_timeout_minutes) }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      READONLY_TOKEN: ${{ secrets.READONLY_TOKEN }}
+
+  nl-repair-prepare:
+    needs: [handle, nl-model]
+    if: ${{ always() && needs.handle.outputs.nl_admitted == 'true' && needs.handle.outputs.nl_runtime_mode == 'claude' }}
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    outputs:
+      repair_needed: ${{ steps.nl-repair-prep.outputs.repair_needed }}
+      repair_admitted: ${{ steps.nl-repair-claim.outputs.admitted }}
+      repair_event_key: ${{ steps.nl-repair-claim.outputs.event_key }}
+      repair_claim_id: ${{ steps.nl-repair-claim.outputs.comment_id }}
+      repair_claim_marker: ${{ steps.nl-repair-claim.outputs.marker }}
+      repair_ready: ${{ steps.nl-claude-repair-model.outcome == 'success' }}
+      baseline_artifact: ${{ steps.nl-repair-baseline-name.outputs.artifact }}
+      input_artifact: ${{ steps.nl-claude-repair-model.outputs.input-artifact }}
+      output_artifact: ${{ steps.nl-claude-repair-model.outputs.output-artifact }}
+      handoff_sha256: ${{ steps.nl-claude-repair-model.outputs.handoff-sha256 }}
+      correlation_id: ${{ steps.nl-claude-repair-model.outputs.correlation-id }}
+      child_timeout_minutes: ${{ steps.nl-claude-repair-model.outputs.child-timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install --quiet pyyaml
+
+      - id: nl-primary-result
+        name: Receive the trusted primary natural-language AgentResult
+        if: ${{ needs.nl-model.outputs.result_artifact != '' }}
+        continue-on-error: true
+        uses: ./.github/actions/claude-model-result
+        with:
+          artifact: ${{ needs.nl-model.outputs.result_artifact }}
+          invocation-id: nl-repair-primary
+
+      - id: nl-repair-prep
+        name: Detect an NL schema miss and prepare one bounded repair turn
+        if: ${{ always() }}
+        env:
+          PRIMARY_RESULT: ${{ steps.nl-primary-result.outputs.result }}
+          PROMPT_FILE: ${{ runner.temp }}/wheelhouse-nl-repair-prompt.txt
+        run: |
+          set -euo pipefail
+          python scripts/apply_decision.py nl-repair-prep \
+            --execution-file "${PRIMARY_RESULT:-}" \
+            --prompt-file "$PROMPT_FILE"
+
+      - id: nl-repair-gate
+        name: Resolve the NL schema-repair runtime selection
+        if: ${{ steps.nl-repair-prep.outputs.repair_needed == 'true' }}
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TARGET_REPO: ${{ needs.handle.outputs.nl_repo }}
+        run: python scripts/agent_runtime.py auth-status --action nl-decision.schema-repair --repo "$TARGET_REPO"
+
+      - id: nl-repair-claim
+        name: Claim the exact NL schema-repair event before spend
+        if: ${{ steps.nl-repair-prep.outputs.repair_needed == 'true' && steps.nl-repair-gate.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ needs.handle.outputs.nl_repo }}
+          NUMBER: ${{ needs.handle.outputs.nl_number }}
+          ISSUE: ${{ github.event.issue.number }}
+          REVISION: ${{ needs.handle.outputs.nl_revision }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python scripts/agent_claim.py \
+            --action nl-decision.schema-repair --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            --event-id "comment:$COMMENT_ID" --repo-slug "$REPO_SLUG"
+
+      - id: nl-repair-source-policy
+        name: Recheck source permission at schema-repair task admission
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' && steps.nl-repair-gate.outputs.mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ needs.handle.outputs.nl_repo }}
+          TARGET_NUMBER: ${{ needs.handle.outputs.nl_number }}
+          KIND: ${{ needs.handle.outputs.nl_kind }}
+          HEAD_SHA: ${{ needs.handle.outputs.nl_revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - id: nl-claude-repair-task
+        name: Build the immutable Claude NL schema-repair AgentTask
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' && steps.nl-repair-source-policy.outputs.admitted == 'true' && steps.nl-repair-gate.outputs.mode == 'claude' }}
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ needs.handle.outputs.nl_repo }}
+          NUMBER: ${{ needs.handle.outputs.nl_number }}
+          REVISION: ${{ needs.handle.outputs.nl_revision }}
+          WHEELHOUSE_REVISION: ${{ github.sha }}
+          BUNDLE: ${{ runner.temp }}/wheelhouse-claude-nl-repair
+          EVENT_KEY: ${{ steps.nl-repair-claim.outputs.event_key }}
+          PROMPT_FILE: ${{ steps.nl-repair-prep.outputs.prompt_file }}
+        run: |
+          set -euo pipefail
+          python scripts/agent_runtime.py build-task \
+            --action nl-decision.schema-repair \
+            --prompt "$PROMPT_FILE" \
+            --bundle "$BUNDLE" \
+            --out "$BUNDLE/task.json" \
+            --owner "$OWNER" \
+            --repo "$REPO" \
+            --number "$NUMBER" \
+            --kind schema-repair \
+            --revision "$REVISION" \
+            --wheelhouse-revision "$WHEELHOUSE_REVISION" \
+            --event-key "$EVENT_KEY"
+
+      - name: Queue schema-repair task-admission source-policy reconciliation
+        if: ${{ steps.nl-repair-source-policy.outputs.admitted == 'false' && (steps.nl-repair-source-policy.outputs.mode == 'fork-reject' || steps.nl-repair-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - id: nl-claude-repair-model
+        name: Prepare one Claude NL schema repair for the caller-bound model job
+        if: ${{ steps.nl-claude-repair-task.outcome == 'success' }}
+        uses: ./.github/actions/claude-model-call
+        with:
+          task: ${{ steps.nl-claude-repair-task.outputs.task }}
+          bundle: ${{ steps.nl-claude-repair-task.outputs.bundle }}
+          invocation-id: nl-repair
+
+      - id: nl-repair-baseline-name
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' }}
+        run: echo "artifact=wheelhouse-nl-repair-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Capture the live-card baseline after the repair claim
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: gh issue view "$ISSUE" --json state,labels,body,updatedAt,comments > nl-card-baseline.json
+
+      - name: Upload the exact post-repair-claim card baseline
+        if: ${{ steps.nl-repair-claim.outputs.admitted == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.nl-repair-baseline-name.outputs.artifact }}
+          path: nl-card-baseline.json
+          if-no-files-found: error
+          retention-days: 1
+
+  nl-repair-model:
+    needs: nl-repair-prepare
+    if: ${{ needs.nl-repair-prepare.outputs.repair_ready == 'true' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/claude-model.yml
+    with:
+      input_artifact: ${{ needs.nl-repair-prepare.outputs.input_artifact }}
+      output_artifact: ${{ needs.nl-repair-prepare.outputs.output_artifact }}
+      handoff_sha256: ${{ needs.nl-repair-prepare.outputs.handoff_sha256 }}
+      expected_commit_sha: ${{ github.sha }}
+      correlation_id: ${{ needs.nl-repair-prepare.outputs.correlation_id }}
+      child_timeout_minutes: ${{ fromJSON(needs.nl-repair-prepare.outputs.child_timeout_minutes) }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      READONLY_TOKEN: ${{ secrets.READONLY_TOKEN }}
+
+  nl-claude-consume:
+    needs: [handle, nl-model, nl-repair-prepare, nl-repair-model]
+    if: ${{ always() && needs.handle.outputs.nl_admitted == 'true' && needs.handle.outputs.nl_runtime_mode == 'claude' }}
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install --quiet pyyaml
+
+      - id: trusted-src
+        run: |
+          set -euo pipefail
+          trusted="${RUNNER_TEMP}/wheelhouse-trusted-src"
+          python_path="$(command -v python)"
+          gh_path="$(command -v gh)"
+          safe_path="$(dirname "$python_path"):$(dirname "$gh_path"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          rm -rf "$trusted"
+          mkdir -p "$trusted"
+          tar --exclude=.git -cf - . | tar -xf - -C "$trusted"
+          find "$trusted" -type f -exec chmod a-w {} +
+          find "$trusted" -type d -exec chmod a-w {} +
+          {
+            echo "path=$trusted"
+            echo "python=$python_path"
+            echo "safe_path=$safe_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the exact post-claim card baseline
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.handle.outputs.baseline_artifact }}
+          path: primary-baseline
+
+      - name: Download the exact post-repair-claim card baseline
+        if: ${{ needs.nl-repair-prepare.outputs.baseline_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.nl-repair-prepare.outputs.baseline_artifact }}
+          path: repair-baseline
+
+      - name: Select the latest trusted card baseline
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          if [ -f repair-baseline/nl-card-baseline.json ]; then
+            cp repair-baseline/nl-card-baseline.json nl-card-baseline.json
+          elif [ -f primary-baseline/nl-card-baseline.json ]; then
+            cp primary-baseline/nl-card-baseline.json nl-card-baseline.json
+          fi
+
+      - id: nl-claude-result
+        name: Receive the trusted normalized natural-language result
+        if: ${{ needs.nl-model.outputs.result_artifact != '' }}
+        continue-on-error: true
+        uses: ./.github/actions/claude-model-result
+        with:
+          artifact: ${{ needs.nl-model.outputs.result_artifact }}
+          invocation-id: nl-decision
+
+      - id: nl-claude-repair-result
+        name: Receive the trusted normalized NL schema-repair result
+        if: ${{ needs.nl-repair-model.outputs.result_artifact != '' }}
+        continue-on-error: true
+        uses: ./.github/actions/claude-model-result
+        with:
+          artifact: ${{ needs.nl-repair-model.outputs.result_artifact }}
+          invocation-id: nl-repair
+
+      - id: nl-result
+        name: Bind the trusted primary NL AgentResult for projection
+        if: ${{ always() }}
+        env:
+          RUNTIME_RESULT: ${{ steps.nl-claude-result.outputs.result }}
+        run: |
+          set -euo pipefail
+          echo "path=${RUNTIME_RESULT:-}" >> "$GITHUB_OUTPUT"
+
+      - id: nl-post-model-freshness
+        name: Re-read target revision before natural-language projection
+        if: ${{ always() && needs.handle.outputs.nl_pre_model_fresh == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          SLUG: ${{ github.repository_owner }}/${{ needs.handle.outputs.nl_repo }}
+          NUMBER: ${{ needs.handle.outputs.nl_number }}
+          KIND: ${{ needs.handle.outputs.nl_kind }}
+          EXPECTED_REVISION: ${{ needs.handle.outputs.nl_revision }}
+          CLAIM_ID: ${{ needs.handle.outputs.nl_claim_id }}
+          CLAIM_MARKER: ${{ needs.handle.outputs.nl_claim_marker }}
+          CARD_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            body="The assistant output was rejected because the target revision changed or could not be verified. The card remains open and no target action was taken. ${CLAIM_MARKER}"
+            GH_TOKEN="$CARD_TOKEN" gh api --method PATCH \
+              "repos/$CARD_REPO/issues/comments/$CLAIM_ID" -f "body=$body" >/dev/null
+            python scripts/agent_runtime.py stage \
+              --action "${{ needs.handle.outputs.nl_action }}" \
+              --source-sha "${{ github.sha }}" \
+              --event-key "${{ needs.handle.outputs.nl_event_key }}" \
+              --stage stale --status failed --code target.stale
+          fi
+
+      - id: route
+        if: ${{ steps.nl-post-model-freshness.outputs.fresh == 'true' }}
+        working-directory: ${{ steps.trusted-src.outputs.path }}
+        env:
+          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
+          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          NL_EXECUTION_FILE: ${{ steps.nl-claude-result.outputs.result }}
+          NL_REPAIR_EXECUTION_FILE: ${{ steps.nl-claude-repair-result.outputs.result }}
+          NL_REPAIR_CLAIM_ADMITTED: ${{ needs.nl-repair-prepare.outputs.repair_admitted }}
+          NL_REPAIR_NEEDED: ${{ needs.nl-repair-prepare.outputs.repair_needed }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          KIND: ${{ needs.handle.outputs.nl_kind }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          PYTHONHOME: ""
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          env -i \
+            PATH="$TRUSTED_PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            NL_EXECUTION_FILE="$NL_EXECUTION_FILE" \
+            NL_REPAIR_EXECUTION_FILE="$NL_REPAIR_EXECUTION_FILE" \
+            NL_REPAIR_CLAIM_ADMITTED="$NL_REPAIR_CLAIM_ADMITTED" \
+            NL_REPAIR_NEEDED="$NL_REPAIR_NEEDED" \
+            ISSUE_BODY="$ISSUE_BODY" \
+            KIND="$KIND" \
+            GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
+            "$TRUSTED_PYTHON" scripts/apply_decision.py nl-route
+
+      - id: current-card
+        if: ${{ steps.route.outputs.mode == 'action' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          allowed=false
+          gh issue view "$ISSUE" --json state,labels,body,updatedAt,comments > current-card.json
+          if [ -f nl-card-baseline.json ] && jq -e --slurpfile baseline nl-card-baseline.json '
+            . as $current
+            | $baseline[0] as $before
+            | ([.labels[].name] | sort | unique) == ([$before.labels[].name] | sort | unique)
+            and (.body // "") == ($before.body // "")
+            and (.updatedAt // "") == ($before.updatedAt // "")
+            and ([.comments[]?] | length) == ([$before.comments[]?] | length)
+            and .state == "OPEN"
+            and ([.labels[].name] | index("needs-decision") != null)
+            and ([.labels[].name] | index("processing") == null)
+            and ([.labels[].name] | index("resolved") == null)
+            and ([.labels[].name] | index("blocked") == null)
+            and ([.labels[].name] | index("wheelhouse:auto-merge-claim") == null)
+          ' current-card.json >/dev/null; then
+            allowed=true
+          fi
+          echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+
+      - name: Mark processing
+        if: ${{ steps.route.outputs.mode == 'action' && steps.current-card.outputs.allowed == 'true' }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: add
+          create: true
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: processing
+
+      - id: execute
+        if: ${{ steps.route.outputs.mode == 'action' && steps.current-card.outputs.allowed == 'true' }}
+        working-directory: ${{ steps.trusted-src.outputs.path }}
+        env:
+          TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
+          TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          DECISION: ${{ steps.route.outputs.decision }}
+          FREE_TEXT: ${{ steps.route.outputs.free_text }}
+          TARGET_REPO: ${{ steps.route.outputs.target_repo }}
+          TARGET_NUMBER: ${{ steps.route.outputs.target_number }}
+          KIND: ${{ steps.route.outputs.kind }}
+          HEAD_SHA: ${{ steps.route.outputs.head_sha }}
+          TARGET_REVISION: ${{ steps.route.outputs.target_revision }}
+          MERGE_ASSIST_RECORD: ${{ steps.route.outputs.merge_assist_record }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+          PYTHONHOME: ""
+          PYTHONPATH: ""
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/wheelhouse-home"
+          env -i \
+            PATH="$TRUSTED_PATH" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            HOME="${RUNNER_TEMP}/wheelhouse-home" \
+            GH_PROMPT_DISABLED=1 \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            GH_TOKEN="$GH_TOKEN" \
+            GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
+            DECISION="$DECISION" \
+            FREE_TEXT="$FREE_TEXT" \
+            TARGET_REPO="$TARGET_REPO" \
+            TARGET_NUMBER="$TARGET_NUMBER" \
+            KIND="$KIND" \
+            HEAD_SHA="$HEAD_SHA" \
+            TARGET_REVISION="$TARGET_REVISION" \
+            MERGE_ASSIST_RECORD="$MERGE_ASSIST_RECORD" \
+            "$TRUSTED_PYTHON" scripts/apply_decision.py execute
+
+      - name: Queue final source-policy reconciliation
+        if: ${{ steps.execute.outputs.source_policy_mode == 'fork-reject' || steps.execute.outputs.source_policy_mode == 'pushability-unverified' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - id: nl-action-consumer
+        name: Comment result on card
+        if: ${{ always() && steps.route.outputs.mode == 'action' && steps.current-card.outputs.allowed == 'true' && steps.execute.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MESSAGE: ${{ steps.execute.outputs.result_message }}
+          CLAIM_ID: ${{ needs.handle.outputs.nl_claim_id }}
+          CLAIM_MARKER: ${{ needs.handle.outputs.nl_claim_marker }}
+          REPO_SLUG: ${{ github.repository }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          GH_PROMPT_DISABLED: "1"
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: |
+          body="${MESSAGE:-No actionable result.}"$'\n\n'"${CLAIM_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$CLAIM_ID" \
+            -f "body=$body" >/dev/null
+
+      - name: Clear processing label
+        if: ${{ always() && steps.route.outputs.mode == 'action' && steps.current-card.outputs.allowed == 'true' }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: remove
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: processing
+
+      - name: Resolve card label
+        if: ${{ always() && steps.current-card.outputs.allowed == 'true' && steps.execute.outputs.terminal_state == 'resolved' }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: add
+          create: true
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: resolved
+
+      - name: Block card label
+        if: ${{ always() && steps.current-card.outputs.allowed == 'true' && (steps.execute.outputs.terminal_state == 'blocked' || steps.execute.outputs.terminal_state == 'error') }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: add
+          create: true
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: blocked
+
+      - name: Drop needs-decision on terminal
+        if: ${{ always() && steps.current-card.outputs.allowed == 'true' && (steps.execute.outputs.terminal_state == 'resolved' || steps.execute.outputs.terminal_state == 'blocked' || steps.execute.outputs.terminal_state == 'error') }}
+        uses: issue-ops/labeler@9210b145e254445abdbfd33099941e7637d56d4e # v4.0.0
+        with:
+          action: remove
+          issue_number: ${{ github.event.issue.number }}
+          github_token: ${{ github.token }}
+          labels: needs-decision
+
+      - name: Close resolved card
+        if: ${{ always() && steps.current-card.outputs.allowed == 'true' && steps.execute.outputs.terminal_state == 'resolved' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          GH_PROMPT_DISABLED: "1"
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: gh issue close "${{ github.event.issue.number }}" || true
+
+      - id: nl-reply-consumer
+        name: Post NL reply
+        if: ${{ steps.route.outputs.mode == 'answer' || steps.route.outputs.mode == 'clarify' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPLY: ${{ steps.route.outputs.answer }}
+          CLAIM_ID: ${{ needs.handle.outputs.nl_claim_id }}
+          CLAIM_MARKER: ${{ needs.handle.outputs.nl_claim_marker }}
+          REPO_SLUG: ${{ github.repository }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: |
+          body="${REPLY}"$'\n\n'"${CLAIM_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$CLAIM_ID" \
+            -f "body=$body" >/dev/null
+
+      - id: nl-failure-consumer
+        name: Note NL processing failure on card
+        if: ${{ always() && steps.nl-post-model-freshness.outputs.fresh == 'true' && needs.handle.outputs.nl_prompt_built == 'true' && (steps.route.outcome == 'skipped' || steps.route.outputs.result_valid != 'true') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+          CLAIM_ID: ${{ needs.handle.outputs.nl_claim_id }}
+          CLAIM_MARKER: ${{ needs.handle.outputs.nl_claim_marker }}
+          ERROR_CODE: ${{ steps.nl-claude-result.outputs.error-code }}
+          FAILURE_MESSAGE: ${{ steps.route.outputs.failure_message }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: |
+          set -euo pipefail
+          if [ "$ERROR_CODE" = "source.revision_mismatch" ]; then
+            note="Wheelhouse updated while this request waited; please retry."
+          else
+            note="${FAILURE_MESSAGE:-The assistant did not produce a trusted result. No target action was taken; the card remains open and deterministic checkbox or slash-command controls are still available. See the workflow run for the stable stage/error code.}"
+          fi
+          body="${note} ${CLAIM_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$CLAIM_ID" \
+            -f "body=$body" >/dev/null
+
+      - name: Record natural-language consumer stage
+        if: ${{ always() }}
+        env:
+          MODEL_ERROR_CODE: ${{ steps.nl-claude-result.outputs.error-code }}
+          PATH: ${{ steps.trusted-src.outputs.safe_path }}
+          BASH_ENV: ""
+          ENV: ""
+          LD_PRELOAD: ""
+          LD_LIBRARY_PATH: ""
+        run: |
+          status="failed"; stage="consumer-rejected"; code="${MODEL_ERROR_CODE:-consumer.rejected}"
+          if [ "${{ steps.nl-action-consumer.outcome }}" = "success" ] || [ "${{ steps.nl-reply-consumer.outcome }}" = "success" ]; then
+            status="ok"; stage="consumer-committed"; code="consumer.committed"
+          elif [ "${{ needs.handle.outputs.nl_pre_model_fresh }}" = "false" ] || [ "${{ steps.nl-post-model-freshness.outputs.fresh }}" = "false" ]; then
+            code="consumer.stale"
+          elif [ -n "${{ steps.route.outputs.failure_code }}" ]; then
+            code="${{ steps.route.outputs.failure_code }}"
+          fi
+          python scripts/agent_runtime.py stage \
+            --action "${{ needs.handle.outputs.nl_action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ needs.handle.outputs.nl_event_key }}" \
+            --stage "$stage" --status "$status" --code "$code"
+
+      - name: Finalize the bounded NL schema-repair claim
+        if: ${{ always() && needs.nl-repair-prepare.outputs.repair_admitted == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+          REPAIR_CLAIM_ID: ${{ needs.nl-repair-prepare.outputs.repair_claim_id }}
+          REPAIR_MARKER: ${{ needs.nl-repair-prepare.outputs.repair_claim_marker }}
+          REPAIR_EVENT_KEY: ${{ needs.nl-repair-prepare.outputs.repair_event_key }}
+        run: |
+          set -euo pipefail
+          status="failed"; stage="consumer-rejected"; code="${{ steps.route.outputs.failure_code || 'consumer.rejected' }}"
+          if [ "${{ steps.nl-action-consumer.outcome }}" = "success" ] || [ "${{ steps.nl-reply-consumer.outcome }}" = "success" ]; then
+            status="ok"; stage="consumer-committed"; code="consumer.committed"
+          fi
+          body="Agent NL schema-repair event finished with ${code}. ${REPAIR_MARKER}"
+          gh api --method PATCH "repos/$REPO_SLUG/issues/comments/$REPAIR_CLAIM_ID" \
+            -f "body=$body" >/dev/null
+          python scripts/agent_runtime.py stage \
+            --action nl-decision.schema-repair --source-sha "${{ github.sha }}" \
+            --event-key "$REPAIR_EVENT_KEY" \
+            --stage "$stage" --status "$status" --code "$code"
 
   investigate-dispatch:
     needs: handle
-    if: ${{ needs.handle.outputs.authorized == 'true' && needs.handle.outputs.investigate != '' }}
+    if: ${{ needs.handle.outputs.authorized == 'true' && needs.handle.outputs.source_policy_admitted == 'true' && needs.handle.outputs.investigate != '' && (needs.handle.outputs.decision_label_recovery_required != 'true' || needs.handle.outputs.decision_label_recovery_admitted == 'true') }}
     permissions:
       contents: read
       issues: write
@@ -712,8 +1859,27 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: echo "authorized=$(python scripts/wheelhouse_core.py authorized)" >> "$GITHUB_OUTPUT"
 
+      - id: decision-label-revalidate
+        if: ${{ needs.handle.outputs.decision_label_recovery_admitted == 'true' && steps.triggering-actor-gate.outputs.authorized == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          SENDER: ${{ github.event.sender.login }}
+          AUTHORIZED: ${{ steps.triggering-actor-gate.outputs.authorized }}
+          EVENT_KEY: ${{ needs.handle.outputs.decision_label_recovery_event_key }}
+        run: |
+          python scripts/decision_label_recovery.py revalidate \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --repo-slug "$REPO_SLUG" \
+            --issue "$ISSUE" \
+            --sender "$SENDER" \
+            --authorized "$AUTHORIZED" \
+            --event-key "$EVENT_KEY" \
+            --processing forbidden
+
       - name: Investigate (trigger deep review, leave card open)
-        if: ${{ needs.handle.outputs.authorized == 'true' && steps.triggering-actor-gate.outputs.authorized == 'true' }}
+        if: ${{ needs.handle.outputs.authorized == 'true' && steps.triggering-actor-gate.outputs.authorized == 'true' && (needs.handle.outputs.decision_label_recovery_admitted != 'true' || steps.decision-label-revalidate.outputs.allowed == 'true') }}
         env:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
@@ -722,6 +1888,8 @@ jobs:
           TARGET_NUMBER: ${{ needs.handle.outputs.target_number }}
           TARGET_KIND: ${{ needs.handle.outputs.kind }}
           HEAD_SHA: ${{ needs.handle.outputs.head_sha }}
+          TARGET_REVISION: ${{ needs.handle.outputs.target_revision }}
+          TRIGGER_EVENT_ID: investigate:${{ github.run_id }}:${{ github.event.issue.id }}
         run: |
           set -uo pipefail
           if gh issue view "$ISSUE" --json body --jq .body > investigate_current_body.md; then
@@ -739,7 +1907,9 @@ jobs:
             -f repo="$TARGET_REPO" \
             -f number="$TARGET_NUMBER" \
             -f kind="$TARGET_KIND" \
-            -f head_sha="$HEAD_SHA"; then
+            -f head_sha="$HEAD_SHA" \
+            -f revision="$TARGET_REVISION" \
+            -f trigger_event_id="$TRIGGER_EVENT_ID"; then
             gh issue comment "$ISSUE" --body \
               "Couldn't start the investigation (workflow dispatch failed). Apply the \`needs-deep-review\` label to run it manually." || true
           fi

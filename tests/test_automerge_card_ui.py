@@ -4,8 +4,12 @@
 Run: python tests/test_automerge_card_ui.py
 """
 
+import hashlib
+import inspect
+import json
 import os
 import sys
+import tempfile
 from contextlib import ExitStack
 from unittest.mock import patch
 
@@ -16,11 +20,39 @@ import auto_merge as am  # noqa: E402
 import automerge_criteria as schema  # noqa: E402
 import render_card  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
+import target_observation  # noqa: E402
+import decision_context  # noqa: E402
+import assessment_admission  # noqa: E402
+import assessment_record  # noqa: E402
+import projection_writer  # noqa: E402
 
 _failures = []
 HEAD = "a" * 40
 BASE = "b" * 40
 VISION = "vsha"
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+# A real, committed, declaration-free prose VISION.md from the fleet. Every
+# fleet VISION.md has this shape, so it is the exact input the vision-alignment
+# gate must admit.
+PROSE_VISION_FILE = os.path.join(FIXTURES, "card-1585-vision.md")
+PROSE_TARGET_FACTS_FILE = os.path.join(FIXTURES, "card-1585-target-facts.json")
+
+
+def behavior_admission(behavior_class="A", contradiction=False):
+    value = {
+        "version": 1,
+        "contradicts_existing_contract": contradiction,
+    }
+    if behavior_class == "B":
+        value.update(
+            {
+                "corrected_defect": "Daemon restart lost an open monitored run.",
+                "intended_behavior_restored": (
+                    "An open monitored run remains recoverable."
+                ),
+            }
+        )
+    return value
 
 
 def check(name, condition):
@@ -46,6 +78,7 @@ def item(**overrides):
         "recommendation": "Merge - compliance and tests are green.",
         "priority": "med",
         "auto_triage": True,
+        "same_closing_issue_overlap": "",
     }
     value.update(overrides)
     return value
@@ -62,10 +95,122 @@ def verdict(**overrides):
         "base_sha": BASE,
     }
     value.update(overrides)
+    if "behavior_admission" not in overrides:
+        value["behavior_admission"] = behavior_admission(value["behavior_class"])
     return value
 
 
+def independent_verdict(**overrides):
+    value = {
+        "behavior_class": "A",
+        "changes_existing_or_default_behavior": False,
+        "optin_default_off": False,
+    }
+    value.update(overrides)
+    if "behavior_admission" not in overrides:
+        value["behavior_admission"] = behavior_admission(value["behavior_class"])
+    return value
+
+
+def observation_bound_assessment(
+    *,
+    owner="kunchenguid",
+    repo="axi",
+    number=96,
+    head=HEAD,
+    base=BASE,
+    title="docs: add jj-axi to community catalog",
+    card_issue=623,
+):
+    observation = target_observation.make_observation(
+        owner,
+        repo,
+        number,
+        head_sha=head,
+        base_sha=base,
+        expected_head_sha=head,
+        observed_at="2026-07-23T12:00:00Z",
+        source="bulk-scan",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": title,
+            "author": "aivv73",
+            "updated_at": "2026-07-13T16:27:26Z",
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "fixture",
+            "mergeable": "MERGEABLE",
+            "ci": True,
+            "comp": "pass",
+            "tests": "green",
+            "bucket": "merge-ready",
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "compliance", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=target_observation.changed_path_facts(
+            ["README.md", "catalog.yaml", "docs/index.html"], complete=True
+        ),
+    )
+    snapshot = decision_context.repository_snapshot(
+        [
+            {
+                "owner": owner,
+                "repo": repo,
+                "number": number,
+                "head_sha": head,
+                "title": "Fixture PR %s" % number,
+                "paths_complete": True,
+                "paths": ["README.md", "catalog.yaml", "docs/index.html"],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": card_issue,
+                "url": "https://github.com/%s/%s/pull/%s" % (owner, repo, number),
+                "card_url": "https://github.com/%s/wheelhouse/issues/%s"
+                % (owner, card_issue),
+            }
+        ],
+        "2026-07-23T12:00:00Z",
+    )
+    context = decision_context.build_decision_context(observation, snapshot)
+    assessment = assessment_admission.admit_assessment(
+        {
+            "summary": "Routine bounded review.",
+            "product_implications": "No owner discussion required.",
+            "recommended_action": "merge",
+            "recommended_reason": "Checks and behavior gates are clear.",
+            "recommendation_basis": {
+                "kind": "other",
+                "observation_id": observation["observation_id"],
+                "context_id": context["context_id"],
+                "check_names": [],
+            },
+        },
+        observation,
+        context,
+    )
+    return observation, context, assessment
+
+
 def card_entry(**state_overrides):
+    observation, context, assessment = observation_bound_assessment()
     state = {
         "repo": "axi",
         "number": 96,
@@ -75,6 +220,10 @@ def card_entry(**state_overrides):
         "triage_status": "succeeded",
         "triage_recommendation": {"action": "merge", "reason": ""},
         "automerge_verdict": verdict(),
+        render_card.PROJECTION_OWNER_FIELD: render_card.PROJECTION_OWNER,
+        render_card.REVIEW_OBSERVATION_FIELD: observation,
+        render_card.DECISION_CONTEXT_FIELD: context,
+        render_card.ASSESSMENT_FIELD: assessment,
     }
     state.update(state_overrides)
     return {
@@ -182,6 +331,41 @@ def test_all_preflight_criteria_met_and_action_semantics_unchanged():
     check(
         "positive: G7 is explicitly unavailable until the immediate act boundary",
         visible["g7_immediate_recheck"]["status"] == schema.STATUS_UNAVAILABLE,
+    )
+
+
+def test_g6_recommendation_evidence_distinguishes_advisory_and_authoritative():
+    denied = card_entry(triage_assessment=None, triage_recommendation=None)
+    denied_facts, _ = am.fresh_verdict_facts(denied["state"], HEAD)
+    denied_row = denied_facts["g6_merge_recommendation"]
+    check(
+        "g6 admission denial remains unmet",
+        denied_row["status"] == schema.STATUS_UNMET,
+    )
+    check(
+        "g6 admission denial says no valid agent recommendation was established",
+        denied_row["evidence"]
+        == "no valid agent recommendation was established: the advisory "
+        "assessment was not admitted",
+    )
+    check(
+        "g6 admission denial never claims the model recommended something else",
+        "not an explicit merge" not in denied_row["evidence"],
+    )
+
+    non_merge = card_entry(
+        triage_recommendation={"action": "hold", "reason": ""}
+    )
+    non_merge_facts, _ = am.fresh_verdict_facts(non_merge["state"], HEAD)
+    non_merge_row = non_merge_facts["g6_merge_recommendation"]
+    check(
+        "g6 authoritative non-merge recommendation remains unmet",
+        non_merge_row["status"] == schema.STATUS_UNMET,
+    )
+    check(
+        "g6 authoritative non-merge recommendation keeps distinct evidence",
+        non_merge_row["evidence"]
+        == "top-level triage recommendation is not an explicit merge",
     )
 
 
@@ -318,6 +502,87 @@ def test_each_guarded_criterion_has_a_fail_closed_negative():
         )
 
 
+def test_wh_aud_05_semantic_denial_is_visible_without_masking_other_gates():
+    contradictory = verdict(
+        behavior_class="B",
+        behavior_admission=behavior_admission("B", contradiction=True),
+    )
+    result = evaluate(
+        card_value=card_entry(automerge_verdict=contradictory),
+        full=False,
+    )
+    criterion_rows = rows(result)
+    check(
+        "WH-AUD-05 UI: contradictory class B is visibly UNMET and cannot act",
+        result["eligible"] is False
+        and criterion_rows["g6_behavior_class"]["status"]
+        == schema.STATUS_UNMET
+        and "contradicts" in criterion_rows["g6_behavior_class"]["evidence"],
+    )
+
+    masked = evaluate(
+        card_value=card_entry(automerge_verdict=contradictory),
+        vision=(False, ""),
+        prior=False,
+    )
+    masked_rows = rows(masked)
+    check(
+        "WH-AUD-05 controls: G0 and G3 remain independent denials",
+        masked["eligible"] is False
+        and masked_rows["g0_vision_present"]["status"]
+        == schema.STATUS_UNAVAILABLE
+        and masked_rows["g3_prior_merge"]["status"] == schema.STATUS_UNMET
+        and masked_rows["g6_behavior_class"]["status"] == schema.STATUS_UNMET,
+    )
+
+    control_evidence = {
+        1622: (
+            "Archive retention lost resolved decisions.",
+            "Archive retention retains resolved decisions.",
+        ),
+        1624: (
+            "Normal decision retention broke lifecycle retries.",
+            "Normal decision retention supports lifecycle retries.",
+        ),
+    }
+    for card_number, evidence_pair in control_evidence.items():
+        control = verdict(
+            behavior_class="B",
+            behavior_admission={
+                "version": 1,
+                "contradicts_existing_contract": False,
+                "corrected_defect": evidence_pair[0],
+                "intended_behavior_restored": evidence_pair[1],
+            },
+            changes_existing_or_default_behavior=True,
+        )
+        control_result = evaluate(
+            card_value=card_entry(automerge_verdict=control),
+            full=False,
+        )
+        control_rows = rows(control_result)
+        check(
+            "class B control %s: independent contract-change denial remains" % card_number,
+            control_result["eligible"] is False
+            and control_rows["g6_behavior_class"]["status"] == schema.STATUS_MET
+            and control_rows["g6_default_behavior"]["status"]
+            == schema.STATUS_UNMET,
+        )
+
+    historical = verdict(behavior_class="B")
+    historical.pop("behavior_admission")
+    historical_result = evaluate(
+        card_value=card_entry(automerge_verdict=historical),
+        full=False,
+    )
+    check(
+        "WH-AUD-05 compatibility: incomplete historical class B is unavailable",
+        historical_result["eligible"] is False
+        and rows(historical_result)["g6_behavior_class"]["status"]
+        == schema.STATUS_UNAVAILABLE,
+    )
+
+
 def test_owner_bot_and_security_exclusion_evidence_is_distinct():
     owner_result = rows(
         evaluate(pr_value=live_pr(user={"login": "kunchenguid", "type": "User"}))
@@ -354,7 +619,7 @@ def test_owner_bot_and_security_exclusion_evidence_is_distinct():
     )
 
 
-def test_issue_621_absent_verdict_has_one_g6_blocker_in_real_card_flow():
+def test_no_vision_complete_diff_keeps_independent_g6_facts_in_real_card_flow():
     issue_head = "f4e096532b994d7a37a1161bdeaf6214e9d6439e"
     issue_base = "b708731dc7840c088bcd8c79991b7f052f9a0096"
     issue_item = item(
@@ -367,6 +632,14 @@ def test_issue_621_absent_verdict_has_one_g6_blocker_in_real_card_flow():
     )
     base_card = render_card.render(issue_item)
     state = core.parse_state_block(base_card["body"])
+    observation, context, assessment = observation_bound_assessment(
+        repo="firstmate",
+        number=527,
+        head=issue_head,
+        base=issue_base,
+        title="issue 621 regression",
+        card_issue=621,
+    )
     state.update(
         {
             "repo": "firstmate",
@@ -377,9 +650,13 @@ def test_issue_621_absent_verdict_has_one_g6_blocker_in_real_card_flow():
             "triaged_base_sha": issue_base,
             "triage_status": "succeeded",
             "triage_recommendation": {"action": "merge", "reason": ""},
+            "automerge_verdict": independent_verdict(),
+            render_card.PROJECTION_OWNER_FIELD: render_card.PROJECTION_OWNER,
+            render_card.REVIEW_OBSERVATION_FIELD: observation,
+            render_card.DECISION_CONTEXT_FIELD: context,
+            render_card.ASSESSMENT_FIELD: assessment,
         }
     )
-    state.pop("automerge_verdict", None)
     raw_card = {
         "number": 621,
         "body": render_card._replace_state_block(base_card["body"], state),
@@ -401,7 +678,6 @@ def test_issue_621_absent_verdict_has_one_g6_blocker_in_real_card_flow():
             "firstmate": {
                 "ok": True,
                 "truncated": False,
-                "indeterminate_pr_numbers": [],
             }
         },
         "items": [issue_item],
@@ -457,41 +733,37 @@ def test_issue_621_absent_verdict_has_one_g6_blocker_in_real_card_flow():
         "g6_triage_available",
         "g6_triage_success",
         "g6_merge_recommendation",
-    )
-    dependent_rows = (
-        "g6_vision_alignment",
+        "g6_behavior_class",
         "g6_default_behavior",
-        "g6_verdict_merge",
         "g6_class_c_mode",
+    )
+    vision_rows = (
+        "g6_vision_alignment",
+        "g6_verdict_merge",
         "g6_vision_revision",
         "g6_base_revision",
     )
     check(
-        "issue 621: ordinary triage facts remain independently MET",
+        "no VISION: complete-diff triage facts are independently MET",
         all(criterion_rows[key]["status"] == schema.STATUS_MET for key in met_rows),
     )
     check(
-        "issue 621: behavior class is the only blocking UNMET G6 prerequisite",
-        [
-            key
-            for key in schema.CRITERIA_IDS
-            if key.startswith("g6_")
-            and criterion_rows[key]["status"] == schema.STATUS_UNMET
-        ]
-        == ["g6_behavior_class"],
+        "no VISION: independent facts are not masked as unavailable",
+        all(
+            criterion_rows[key]["status"] != schema.STATUS_UNAVAILABLE
+            for key in (
+                "g6_behavior_class",
+                "g6_default_behavior",
+                "g6_class_c_mode",
+            )
+        ),
     )
     check(
-        "issue 621: behavior class explains the absent verdict and skipped checks",
-        "structured behavior verdict absent"
-        in criterion_rows["g6_behavior_class"]["evidence"]
-        and "not evaluated" in criterion_rows["g6_behavior_class"]["evidence"],
-    )
-    check(
-        "issue 621: dependent behavior and binding rows are honestly UNAVAILABLE",
+        "no VISION: vision-bound rows clearly require VISION.md",
         all(
             criterion_rows[key]["status"] == schema.STATUS_UNAVAILABLE
-            and "not evaluated" in criterion_rows[key]["evidence"]
-            for key in dependent_rows
+            and "VISION.md" in criterion_rows[key]["evidence"]
+            for key in vision_rows
         ),
     )
     rendered = render_card.render(
@@ -502,24 +774,76 @@ def test_issue_621_absent_verdict_has_one_g6_blocker_in_real_card_flow():
             automerge_criteria=handoff[0]["criteria"],
         )
     )
-    g6_lines = [line for line in rendered["body"].splitlines() if "`G6 - " in line]
+    body = rendered["body"]
+    g6_lines = [line for line in body.splitlines() if "`G6 - " in line]
     check(
-        "issue 621: renderer shows one red G6 blocker",
-        sum("❌ **UNMET**" in line for line in g6_lines) == 1
-        and "`G6 - eligible behavior class`"
-        in next(line for line in g6_lines if "❌ **UNMET**" in line),
-    )
-    check(
-        "issue 621: renderer shows every dependent G6 row as unavailable",
+        "no VISION: renderer keeps independent facts at the G6 behavior level",
         all(
-            any(
-                "⚪ **UNAVAILABLE**" in line
-                and "`%s`" % schema.CRITERIA_LABELS[key] in line
+            next(
+                line
                 for line in g6_lines
+                if "`%s`" % schema.CRITERIA_LABELS[key] in line
+            ).startswith("- ")
+            for key in (
+                "g6_behavior_class",
+                "g6_default_behavior",
+                "g6_class_c_mode",
             )
-            for key in dependent_rows
         ),
     )
+    check(
+        "no VISION: renderer nests vision-bound rows under the needs-VISION root",
+        "- **VISION.md-dependent checks** - _needs VISION.md_" in body
+        and all(
+            next(
+                line
+                for line in g6_lines
+                if "`%s`" % schema.CRITERIA_LABELS[key] in line
+            ).startswith("    - ⚪ **UNAVAILABLE**")
+            for key in vision_rows
+        ),
+    )
+    check(
+        "no VISION: complete evaluation remains ineligible",
+        am.verdict_eligible(independent_verdict())[0] is False
+        and criterion_rows["g0_vision_present"]["status"] == schema.STATUS_UNAVAILABLE,
+    )
+
+
+def test_no_vision_independent_behavior_negatives_are_unmet_not_masked():
+    cases = (
+        ("g6_default_behavior", {"changes_existing_or_default_behavior": True}),
+        (
+            "g6_class_c_mode",
+            {"behavior_class": "C", "optin_default_off": False},
+        ),
+    )
+    for criterion, overrides in cases:
+        result = evaluate(
+            card_value=card_entry(automerge_verdict=independent_verdict(**overrides)),
+            vision=(False, ""),
+        )
+        criterion_rows = rows(result)
+        check(
+            "no VISION: %s is evaluated as UNMET from real facts" % criterion,
+            criterion_rows[criterion]["status"] == schema.STATUS_UNMET,
+        )
+        check(
+            "no VISION: %s cannot grant eligibility" % criterion,
+            result["eligible"] is False,
+        )
+        check(
+            "no VISION: vision-bound rows remain UNAVAILABLE for %s" % criterion,
+            all(
+                criterion_rows[key]["status"] == schema.STATUS_UNAVAILABLE
+                for key in (
+                    "g6_vision_alignment",
+                    "g6_verdict_merge",
+                    "g6_vision_revision",
+                    "g6_base_revision",
+                )
+            ),
+        )
 
 
 def test_absent_none_and_non_dictionary_whole_verdicts_are_unavailable_dependents():
@@ -705,7 +1029,6 @@ def test_authoritative_scan_snapshot_flows_into_true_card_render():
             "axi": {
                 "ok": True,
                 "truncated": False,
-                "indeterminate_pr_numbers": [],
             }
         },
         "items": [item()],
@@ -797,14 +1120,313 @@ def test_true_card_render_path_shows_stable_human_visible_rows():
         "render: every stable criterion gets exactly one visible row",
         all(body.count("`%s`" % label) == 1 for _, label in schema.CRITERIA_SPECS),
     )
+    stored_rows = {
+        row["id"]: row
+        for row in state.get(render_card.AUTOMERGE_CRITERIA_FIELD) or []
+    }
+    evaluator_rows = {
+        row["id"]: row for row in schema.normalize_criteria(result["criteria"])
+    }
+    admission_ids = {"g6_triage_success", "g6_merge_recommendation"}
     check(
         "render: structured rows round-trip in non-material state",
-        state.get(render_card.AUTOMERGE_CRITERIA_FIELD)
-        == schema.normalize_criteria(result["criteria"]),
+        all(
+            stored_rows.get(criterion_id) == row
+            for criterion_id, row in evaluator_rows.items()
+            if criterion_id not in admission_ids
+        ),
+    )
+    check(
+        # The evaluator judged a DIFFERENT card fixture; this rendered card
+        # carries no admitted assessment, so the write recomputes the two
+        # admission rows from its own state (card #2148 display race).
+        "render: admission rows are recomputed from this card's own state",
+        stored_rows["g6_triage_success"]["status"] == schema.STATUS_UNMET
+        and "not admitted" in stored_rows["g6_triage_success"]["evidence"]
+        and stored_rows["g6_merge_recommendation"]["status"]
+        == schema.STATUS_UNMET,
     )
     check(
         "render: criteria never enter material fields",
         render_card.AUTOMERGE_CRITERIA_FIELD not in render_card.MATERIAL_FIELDS,
+    )
+
+
+def test_render_groups_every_criterion_by_id_family_and_preserves_evidence():
+    family_prefixes = (
+        ("Scope", ("scope_",)),
+        ("Safety", ("scan_", "safety_")),
+        ("G0 (repo)", ("g0_",)),
+        ("G1 (card)", ("g1_",)),
+        ("G2 (files)", ("g2_",)),
+        ("G3 (author)", ("g3_",)),
+        ("G4 (checks)", ("g4_",)),
+        ("G5 (size)", ("g5_",)),
+        ("G6 (triage + behavior)", ("g6_",)),
+        ("G7 (final gate)", ("g7_",)),
+    )
+    rows_with_evidence = [
+        {
+            "id": criterion_id,
+            "status": schema.STATUS_MET,
+            "evidence": "proof-%02d" % index,
+        }
+        for index, criterion_id in enumerate(schema.CRITERIA_IDS)
+    ]
+    body = "\n".join(render_card._automerge_criteria_section(rows_with_evidence))
+    headings = ["#### %s" % family for family, _ in family_prefixes] + ["#### Other"]
+
+    for index, (family, prefixes) in enumerate(family_prefixes):
+        start = body.index("#### %s" % family)
+        later = [
+            position
+            for position in (
+                body.find(heading, start + 1) for heading in headings[index + 1 :]
+            )
+            if position >= 0
+        ]
+        end = min(later) if later else len(body)
+        section = body[start:end]
+        expected_ids = [
+            criterion_id
+            for criterion_id in schema.CRITERIA_IDS
+            if criterion_id.startswith(prefixes)
+        ]
+        check(
+            "group: %s contains exactly its ID-prefix criteria" % family,
+            all(
+                "`%s`" % schema.CRITERIA_LABELS[criterion_id] in section
+                for criterion_id in expected_ids
+            )
+            and all(
+                "`%s`" % schema.CRITERIA_LABELS[criterion_id] not in section
+                for criterion_id in schema.CRITERIA_IDS
+                if criterion_id not in expected_ids
+            ),
+        )
+
+    check(
+        "render: every criterion keeps its concise evidence",
+        all("proof-%02d" % index in body for index in range(len(schema.CRITERIA_IDS))),
+    )
+
+
+def test_g6_producer_hierarchy_splits_independent_and_vision_bound_facts():
+    result = evaluate(
+        card_value=card_entry(automerge_verdict=independent_verdict()),
+        vision=(False, ""),
+    )
+    body = "\n".join(render_card._automerge_criteria_section(result["criteria"]))
+    independent_ids = (
+        "g6_behavior_class",
+        "g6_default_behavior",
+        "g6_class_c_mode",
+    )
+    vision_ids = (
+        "g6_vision_alignment",
+        "g6_verdict_merge",
+        "g6_vision_revision",
+        "g6_base_revision",
+    )
+    check(
+        "hierarchy: complete-diff behavior facts stay at the G6 group level",
+        all(
+            next(
+                line
+                for line in body.splitlines()
+                if "`%s`" % schema.CRITERIA_LABELS[criterion_id] in line
+            ).startswith("- ")
+            for criterion_id in independent_ids
+        ),
+    )
+    check(
+        "hierarchy: vision-bound facts share one needs-VISION subtree",
+        "- **VISION.md-dependent checks** - _needs VISION.md_" in body
+        and all(
+            next(
+                line
+                for line in body.splitlines()
+                if "`%s`" % schema.CRITERIA_LABELS[criterion_id] in line
+            ).startswith("    - ")
+            for criterion_id in vision_ids
+        ),
+    )
+
+
+def test_ineligible_behavior_class_is_manual_review_presentation_only():
+    with open(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "fixtures",
+            "g6_manual_review_required.json",
+        ),
+        encoding="utf-8",
+    ) as handle:
+        golden = json.load(handle)
+
+    candidate = independent_verdict(
+        behavior_class=golden["machine_behavior_class"],
+        changes_existing_or_default_behavior=True,
+    )
+    normalized = render_card.normalize_automerge_verdict(candidate)
+    result = evaluate(
+        card_value=card_entry(automerge_verdict=normalized),
+        vision=(False, ""),
+    )
+    body = "\\n".join(render_card._automerge_criteria_section(result["criteria"]))
+
+    check(
+        "ineligible: render-version migration exposes the copy correction",
+        render_card.CARD_RENDER_VERSION > golden["source_render_version"]
+        and render_card.render_stale(
+            {"render_version": golden["source_render_version"]}
+        ),
+    )
+    check(
+        "ineligible: machine value remains INELIGIBLE after normalization",
+        normalized["behavior_class"] == golden["machine_behavior_class"],
+    )
+    check(
+        "ineligible: card uses the manual-review presentation",
+        golden["expected_visible_g6_behavior_line"] in body,
+    )
+    check(
+        "ineligible: no stale RISKY presentation remains",
+        all(label not in body for label in golden["forbidden_visible_labels"]),
+    )
+    check(
+        "ineligible: existing/default behavior explanation is concise and explicit",
+        "Existing/default behavior changes do not qualify for automatic-merge class A, B, or C."
+        in body,
+    )
+
+    facts_before, class_before = am.behavior_verdict_facts(candidate)
+    eligible_before = am.verdict_eligible(candidate)
+    rendered = render_card.render(
+        item(repo="firstmate", number=1873, automerge_criteria=result["criteria"])
+    )
+    _ = rendered["body"]
+    facts_after, class_after = am.behavior_verdict_facts(candidate)
+    eligible_after = am.verdict_eligible(candidate)
+    check(
+        "ineligible: G6 machine facts and auto-merge decision are unchanged",
+        (facts_before, class_before, eligible_before)
+        == (facts_after, class_after, eligible_after)
+        and eligible_after[0] is False,
+    )
+
+    for criterion_id in golden["unchanged_gate_ids"]:
+        check(
+            "ineligible: machine criterion remains present: %s" % criterion_id,
+            any(row["id"] == criterion_id for row in result["criteria"]),
+        )
+
+    for behavior_class, optin_default_off in (("A", False), ("B", False), ("C", True)):
+        control = verdict(
+            behavior_class=behavior_class,
+            optin_default_off=optin_default_off,
+        )
+        control_facts, control_class = am.behavior_verdict_facts(control)
+        control_eligibility = am.verdict_eligible(control)
+        check(
+            "controls: eligible class %s keeps G6 facts and decision" % behavior_class,
+            control_class == behavior_class
+            and all(
+                control_facts[key]["status"] == schema.STATUS_MET
+                for key in (
+                    "g6_behavior_class",
+                    "g6_default_behavior",
+                    "g6_class_c_mode",
+                )
+            )
+            and control_eligibility[0] is True,
+        )
+
+
+def test_unmet_and_unavailable_have_distinct_markers():
+    body = "\n".join(
+        render_card._automerge_criteria_section(
+            [
+                {
+                    "id": "g6_behavior_class",
+                    "status": schema.STATUS_UNMET,
+                    "evidence": "root cause",
+                },
+                {
+                    "id": "g6_vision_alignment",
+                    "status": schema.STATUS_UNAVAILABLE,
+                    "evidence": "not evaluated after root",
+                },
+            ]
+        )
+    )
+    check(
+        "markers: root UNMET is visually distinct from dependent UNAVAILABLE",
+        "❌ **UNMET** `G6 - eligible behavior class`" in body
+        and "⚪ **UNAVAILABLE** `G6 - behavior aligns with VISION.md`" in body,
+    )
+
+
+def test_unknown_prefix_criterion_renders_in_other_without_being_dropped():
+    future = {
+        "id": "future_policy_guard",
+        "label": "Future - policy guard",
+        "status": schema.STATUS_UNMET,
+        "evidence": "future evidence remains visible",
+    }
+    criteria = [future]
+    normalized = schema.normalize_criteria(criteria)
+    body = "\n".join(render_card._automerge_criteria_section(criteria))
+    other = body[body.index("#### Other") :]
+    check(
+        "group: unknown-prefix criterion falls back to Other",
+        "`Future - policy guard`" in other,
+    )
+    check(
+        "group: unknown-prefix criterion keeps its status and evidence",
+        "❌ **UNMET**" in other and "future evidence remains visible" in other,
+    )
+    rendered = render_card.render(item(automerge_criteria=criteria))
+    state = core.parse_state_block(rendered["body"])
+    stored = state[render_card.AUTOMERGE_CRITERIA_FIELD]
+    admission_ids = {"g6_triage_success", "g6_merge_recommendation"}
+    check(
+        "group: stable future criterion persists in card state",
+        future in stored
+        and [row for row in stored if row["id"] not in admission_ids]
+        == [row for row in normalized if row["id"] not in admission_ids],
+    )
+    check(
+        "group: matching future criterion does not keep refreshing the card",
+        render_card.automerge_criteria_stale(item(automerge_criteria=criteria), state)
+        is False,
+    )
+    changed = [dict(future, evidence="future evidence changed")]
+    check(
+        "group: changed future criterion refreshes the existing card",
+        render_card.automerge_criteria_stale(item(automerge_criteria=changed), state)
+        is True,
+    )
+
+
+def test_render_version_bump_refreshes_existing_card_exactly_once():
+    result = evaluate()
+    current_item = item(automerge_criteria=result["criteria"])
+    current_state = core.parse_state_block(render_card.render(current_item)["body"])
+    previous_state = dict(current_state)
+    previous_state["render_version"] = render_card.CARD_RENDER_VERSION - 1
+    labels = {"needs-decision"}
+    check(
+        "refresh: previous criteria UI version triggers one display-only refresh",
+        render_card.refresh_needed(current_item, previous_state, labels=labels) is True,
+    )
+    check(
+        "refresh: regrouped current-version card is a no-op on the next pass",
+        render_card.refresh_needed(current_item, current_state, labels=labels) is False,
+    )
+    check(
+        "refresh: criteria hierarchy version remains non-material",
+        render_card.material_changed(current_item, previous_state) is False,
     )
 
 
@@ -851,6 +1473,14 @@ def test_displayed_met_rows_cannot_grant_eligibility():
             {"id": criterion_id, "status": schema.STATUS_MET, "evidence": "claimed met"}
             for criterion_id in schema.CRITERIA_IDS
         ]
+        + [
+            {
+                "id": "future_merge_authorization",
+                "label": "Future - merge authorization",
+                "status": schema.STATUS_MET,
+                "evidence": "forged future row",
+            }
+        ]
     )
     actual = card_entry()
     actual["state"] = dict(
@@ -862,8 +1492,217 @@ def test_displayed_met_rows_cannot_grant_eligibility():
         result["eligible"] is False,
     )
     check(
+        "security: unknown displayed MET rows remain advisory only",
+        any(row["id"] == "future_merge_authorization" for row in forged),
+    )
+    check(
         "security: live persisted verdict guard still holds",
         result["hold_reason"].startswith("G6 no structured behavior verdict"),
+    )
+
+
+def test_triage_write_atomically_re_evaluates_and_replaces_stale_criteria():
+    """Reproduce #1493: triage used to leave the pre-card G6 rows frozen."""
+    stale = evaluate(card_value=None, prior=False)
+    observation, context, _ = observation_bound_assessment()
+    bound_item = item(
+        automerge_criteria=stale["criteria"],
+        target_observation=observation,
+        decision_context=context,
+    )
+    held = render_card.render(bound_item, held=True)
+    # Exercise the atomic evaluator through the v2 result path while replacing
+    # durable-comment and projection I/O with in-memory boundaries. Writer
+    # transaction details remain covered in test_option_b_architecture.py.
+    held["body"] = render_card.body_with_triage_queued(held["body"], bound_item)
+    card = {
+        "number": 623,
+        "body": held["body"],
+        "labels": held["labels"],
+        "state": "OPEN",
+        "updatedAt": "2026-07-19T12:00:00Z",
+        "comments": [],
+    }
+    stale_rows = rows(stale)
+    check(
+        "atomic setup: pre-triage checklist reproduces stale G6",
+        stale_rows["g6_triage_success"]["status"] == schema.STATUS_UNMET
+        and stale_rows["g6_merge_recommendation"]["status"] == schema.STATUS_UNMET,
+    )
+
+    evaluations = []
+    writes = []
+    original_evaluate = am.evaluate_candidate
+
+    def evaluate_once(*args, **kwargs):
+        result = original_evaluate(*args, **kwargs)
+        evaluations.append(
+            {
+                "card_entry": args[2],
+                "token": os.environ.get("GH_TOKEN"),
+                "criteria": result["criteria"],
+            }
+        )
+        return result
+
+    old_env = {
+        key: os.environ.get(key)
+        for key in (
+            "GH_TOKEN",
+            "WHEELHOUSE_FLEET_TOKEN",
+            "WHEELHOUSE_AUTOMERGE_HAS_TOKEN",
+            "GITHUB_REPOSITORY_OWNER",
+        )
+    }
+    os.environ.update(
+        {
+            "GH_TOKEN": "card-token",
+            "WHEELHOUSE_FLEET_TOKEN": "fleet-token",
+            "WHEELHOUSE_AUTOMERGE_HAS_TOKEN": "true",
+            "GITHUB_REPOSITORY_OWNER": "kunchenguid",
+        }
+    )
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(render_card, "get_card", return_value=card)
+            )
+            stack.enter_context(
+                patch.object(assessment_record, "persist", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(assessment_record, "mark_projected", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    projection_writer,
+                    "commit_preplanned",
+                    side_effect=lambda number, _card, **kwargs: (
+                        writes.append((number, kwargs["body"], kwargs.get("managed_labels")))
+                        or "committed"
+                    ),
+                )
+            )
+            stack.enter_context(patch.object(am, "evaluate_candidate", evaluate_once))
+            stack.enter_context(
+                patch.object(
+                    core, "same_closing_issue_overlap", return_value=(True, "")
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    core,
+                    "load_config",
+                    return_value={"auto_merge": True, "repos": {"axi": {}}},
+                )
+            )
+            stack.enter_context(
+                patch.object(core, "maintainers", return_value={"kunchenguid"})
+            )
+            stack.enter_context(
+                patch.object(
+                    am, "vision_on_default_branch", return_value=(True, VISION)
+                )
+            )
+            stack.enter_context(patch.object(am, "live_pr", return_value=live_pr()))
+            stack.enter_context(
+                patch.object(am, "has_prior_merged_pr", return_value=False)
+            )
+            stack.enter_context(
+                patch.object(
+                    am,
+                    "immutable_compare_files",
+                    return_value=(
+                        ["README.md", "catalog.yaml", "docs/index.html"],
+                        True,
+                        True,
+                    ),
+                )
+            )
+            applied = render_card.update_card_triage(
+                623,
+                HEAD,
+                triage={
+                    "summary": "Adds a verified community catalog entry.",
+                    "product_implications": "No runtime behavior changes.",
+                    "evidence": "target.txt: catalog-only changes",
+                    "recommended_action": "merge",
+                    "recommended_reason": "focused and verified",
+                    "recommendation_basis": {
+                        "kind": "other",
+                        "observation_id": observation["observation_id"],
+                        "context_id": context["context_id"],
+                        "check_names": [],
+                    },
+                    "automerge": {
+                        "behavior_class": "A",
+                        "changes_existing_or_default_behavior": False,
+                        "optin_default_off": False,
+                        "aligns_with_vision": True,
+                        "recommend_merge": True,
+                    },
+                },
+                owner="kunchenguid",
+                vision_sha=VISION,
+                base_sha=BASE,
+                automerge_behavior_available=True,
+            )
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    check("atomic: triage update is applied", applied is True)
+    check("atomic: evaluate_candidate runs exactly once", len(evaluations) == 1)
+    projected_state = evaluations[0]["card_entry"]["state"]
+    check(
+        "atomic: evaluator receives the post-triage card state",
+        projected_state.get("triage_status") == "succeeded"
+        and projected_state.get("triage_recommendation", {}).get("action") == "merge",
+    )
+    check(
+        "security: evaluator reads with fleet token and card write restores its token",
+        evaluations[0]["token"] == "fleet-token"
+        and os.environ.get("GH_TOKEN") == old_env["GH_TOKEN"],
+    )
+    check("atomic: one issue-body write carries the whole projection", len(writes) == 1)
+    written_body = writes[0][1]
+    written_state = core.parse_state_block(written_body)
+    written_rows = {
+        row["id"]: row for row in written_state[render_card.AUTOMERGE_CRITERIA_FIELD]
+    }
+    check(
+        "atomic: hidden criteria are exactly the one evaluator result",
+        written_state[render_card.AUTOMERGE_CRITERIA_FIELD]
+        == evaluations[0]["criteria"],
+    )
+    check(
+        "atomic: updated triage and G6 checklist agree",
+        "### Triage" in written_body
+        and "- **Agent recommendation:** `merge`" in written_body
+        and "focused and verified" in written_body
+        and written_rows["g6_triage_success"]["status"] == schema.STATUS_MET
+        and written_rows["g6_merge_recommendation"]["status"] == schema.STATUS_MET
+        and "✅ **MET** `G6 - successful triage for current head`" in written_body
+        and "✅ **MET** `G6 - top-level recommendation is merge`" in written_body,
+    )
+
+
+def test_every_triage_body_writer_uses_the_atomic_projection():
+    writers = (
+        render_card.mark_triage_queued,
+        render_card.publish_triage_budget_deferral,
+        render_card.clear_triage_queued,
+        render_card.update_card_triage,
+    )
+    check(
+        "atomic: every queued, deferred, cleared, or completed triage write re-evaluates",
+        all(
+            inspect.getsource(writer).count("_atomic_automerge_card_body(") == 1
+            for writer in writers
+        ),
     )
 
 
@@ -916,6 +1755,465 @@ def test_criteria_changes_refresh_ui_without_becoming_material():
     check(
         "refresh: criterion-only change remains non-material",
         render_card.material_changed(next_item, state) is False,
+    )
+
+
+def test_healed_admission_overrides_stale_scan_rows_in_one_edit():
+    """Card #2148 lines 1-2: the 19:24 contradiction shape.
+
+    The scan evaluated the pre-heal card body (admission broken by an
+    incomplete observation) while the same reconcile pass writes the healed
+    state. The written card must be self-consistent in that ONE edit, and the
+    healed stored rows must not spin a refresh loop against the still-lagging
+    scan snapshot.
+    """
+    healed_state = card_entry()["state"]
+    stale_rows = schema.unavailable_criteria("not reached")
+    for criterion_id, evidence in (
+        (
+            "g6_triage_success",
+            "current assessment is not admitted for its observation/head",
+        ),
+        (
+            "g6_merge_recommendation",
+            "no valid agent recommendation was established: the advisory "
+            "assessment was not admitted",
+        ),
+    ):
+        row = next(r for r in stale_rows if r["id"] == criterion_id)
+        row["status"] = schema.STATUS_UNMET
+        row["evidence"] = evidence
+    healed_rows = {
+        row["id"]: row
+        for row in render_card._admission_current_criteria(
+            schema.normalize_criteria(stale_rows), healed_state
+        )
+    }
+    check(
+        "heal: one edit recomputes admission rows from the healed state",
+        healed_rows["g6_triage_success"]["status"] == schema.STATUS_MET
+        and healed_rows["g6_triage_success"]["evidence"]
+        == "successful triage for head %s" % HEAD[:8]
+        and healed_rows["g6_merge_recommendation"]["status"] == schema.STATUS_MET
+        and healed_rows["g6_merge_recommendation"]["evidence"]
+        == "explicit merge recommendation",
+    )
+    stored_state = dict(healed_state)
+    stored_state[render_card.AUTOMERGE_CRITERIA_VERSION_FIELD] = (
+        schema.CRITERIA_VERSION
+    )
+    stored_state[render_card.AUTOMERGE_CRITERIA_FIELD] = list(
+        healed_rows.values()
+    )
+    lagging_item = item(automerge_criteria=stale_rows)
+    check(
+        "heal: a lagging scan snapshot cannot spin a refresh loop",
+        render_card.automerge_criteria_stale(lagging_item, stored_state) is False,
+    )
+    pre_heal_state = dict(stored_state)
+    pre_heal_state[render_card.AUTOMERGE_CRITERIA_FIELD] = (
+        schema.normalize_criteria(stale_rows)
+    )
+    check(
+        "heal: genuinely stale stored rows still trigger one healing refresh",
+        render_card.automerge_criteria_stale(lagging_item, pre_heal_state) is True,
+    )
+
+
+def test_same_revision_preservation_recomputes_admission_rows():
+    admitted_state = card_entry()["state"]
+    stale_rows = schema.unavailable_criteria("not reached")
+    for criterion_id in ("g6_triage_success", "g6_merge_recommendation"):
+        row = next(r for r in stale_rows if r["id"] == criterion_id)
+        row["status"] = schema.STATUS_UNMET
+        row["evidence"] = "current assessment is not admitted"
+
+    current_item = item(
+        automerge_criteria=stale_rows,
+        review_observation=admitted_state[render_card.REVIEW_OBSERVATION_FIELD],
+        decision_context=admitted_state[render_card.DECISION_CONTEXT_FIELD],
+    )
+    prior = render_card.render(current_item)
+    prior_state = core.parse_state_block(prior["body"])
+    prior_state.update(admitted_state)
+    prior_state[render_card.AUTOMERGE_CRITERIA_VERSION_FIELD] = (
+        schema.CRITERIA_VERSION
+    )
+    prior_state[render_card.AUTOMERGE_CRITERIA_FIELD] = (
+        schema.normalize_criteria(stale_rows)
+    )
+    prior_body = render_card._replace_state_block(prior["body"], prior_state)
+
+    refreshed = render_card.render(current_item)
+    refreshed_body = render_card._preserve_same_revision_triage(
+        refreshed["body"], prior_body, current_item, prior_state
+    )
+    refreshed_state = core.parse_state_block(refreshed_body)
+    refreshed_rows = {
+        row["id"]: row
+        for row in refreshed_state[render_card.AUTOMERGE_CRITERIA_FIELD]
+    }
+    check(
+        "same revision: restored admission recomputes stored G6 rows",
+        refreshed_rows["g6_triage_success"]["status"] == schema.STATUS_MET
+        and refreshed_rows["g6_merge_recommendation"]["status"]
+        == schema.STATUS_MET,
+    )
+    check(
+        "same revision: restored admission recomputes visible G6 rows",
+        "✅ **MET** `G6 - successful triage for current head`" in refreshed_body
+        and "✅ **MET** `G6 - top-level recommendation is merge`"
+        in refreshed_body,
+    )
+    check(
+        "same revision: recomputed rows do not trigger a refresh loop",
+        render_card.automerge_criteria_stale(current_item, refreshed_state) is False,
+    )
+
+
+def _file_sha256(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _unique_prose_quotes(text, count):
+    """Pick `count` distinct lines that occur exactly once in the prose VISION."""
+    picked = []
+    for line in text.splitlines():
+        line = line.strip()
+        if 40 <= len(line) <= 400 and text.count(line) == 1 and line not in picked:
+            picked.append(line)
+            if len(picked) == count:
+                break
+    return picked
+
+
+def _prose_binding(vision_file):
+    facts = json.loads(open(PROSE_TARGET_FACTS_FILE, encoding="utf-8").read())
+    return facts, {
+        "action": "triage.pr.search",
+        "event_key": "e" * 64,
+        "owner": facts["owner"],
+        "repo": facts["repo"],
+        "number": facts["number"],
+        "revision": facts["head_sha"],
+        "base_sha": facts["base_sha"],
+        "vision_sha": "0" * 40,
+        "vision_content_sha256": _file_sha256(vision_file),
+        "target_facts_sha256": _file_sha256(PROSE_TARGET_FACTS_FILE),
+    }
+
+
+def _bound_candidate(binding, *, applicable_criteria=(), external=False, **automerge):
+    value = {
+        "summary": "Adds an opt-in status pane.",
+        "product_implications": "Routine, default-off.",
+        "recommended_action": "merge",
+        "recommended_reason": "Small, opt-in, tested.",
+        "evidence": "target.txt: 'adds an opt-in status pane'",
+        "vision_evidence": {
+            "target_owner": binding["owner"],
+            "target_repo": binding["repo"],
+            "target_number": binding["number"],
+            "target_facts_sha256": binding["target_facts_sha256"],
+            "vision_sha": binding["vision_sha"],
+            "vision_content_sha256": binding["vision_content_sha256"],
+            "base_sha": binding["base_sha"],
+            "target_head_sha": binding["revision"],
+            "applicable_criteria": list(applicable_criteria),
+        },
+        "automerge": {
+            "behavior_class": "C",
+            "behavior_assertions": [],
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": True,
+            "aligns_with_vision": True,
+            "recommend_merge": True,
+            "external_source_required": external,
+        },
+    }
+    value["automerge"].update(automerge)
+    return value
+
+
+def _admitted_automerge(candidate, vision_file, binding):
+    trusted = render_card.enforce_triage_source_provenance(
+        candidate,
+        "",
+        vision_file,
+        PROSE_TARGET_FACTS_FILE,
+        **{key: binding[key] for key in binding},
+    )
+    return trusted["automerge"]
+
+
+def test_prose_vision_md_admits_a_positive_alignment_verdict():
+    """A committed prose VISION.md - the documented opt-in, and the only shape
+    any fleet repository actually has - must let the model's positive alignment
+    answer survive to a MET row and an eligible verdict."""
+    facts, binding = _prose_binding(PROSE_VISION_FILE)
+    prose = open(PROSE_VISION_FILE, encoding="utf-8").read()
+    candidate = _bound_candidate(binding)
+    check(
+        "prose VISION: the real fixture declares no machine-readable criteria",
+        "wheelhouse-vision-source-dependencies" not in prose
+        and facts["paths"]
+        and render_card.triage_vision_dependency_verified(
+            candidate, PROSE_VISION_FILE, PROSE_TARGET_FACTS_FILE, **binding
+        )
+        is False,
+    )
+    admitted = _admitted_automerge(candidate, PROSE_VISION_FILE, binding)
+    persisted = render_card.normalize_triage(
+        render_card.enforce_triage_source_provenance(
+            candidate, "", PROSE_VISION_FILE, PROSE_TARGET_FACTS_FILE, **binding
+        )
+    )["automerge_verdict"]
+    facts_map, behavior_class = am.behavior_verdict_facts(persisted)
+    eligible, _, reason = am.verdict_eligible(persisted)
+    check(
+        "prose VISION: the positive alignment fields survive trusted admission",
+        admitted.get("aligns_with_vision") is True
+        and admitted.get("recommend_merge") is True
+        and persisted.get("aligns_with_vision") is True
+        and persisted.get("recommend_merge") is True,
+    )
+    check(
+        "prose VISION: vision-bound rows are MET, not UNAVAILABLE",
+        facts_map["g6_vision_alignment"]["status"] == schema.STATUS_MET
+        and facts_map["g6_vision_alignment"]["evidence"] == "alignment confirmed"
+        and facts_map["g6_verdict_merge"]["status"] == schema.STATUS_MET,
+    )
+    check(
+        "prose VISION: the verdict no longer holds on the vision reason",
+        eligible is True
+        and behavior_class == "C"
+        and "VISION.md is required" not in reason,
+    )
+    unverified = [
+        (
+            "model claims an external source without any declared criterion",
+            _bound_candidate(binding, external=True),
+        ),
+        (
+            "model cites a criterion no VISION.md declares",
+            _bound_candidate(
+                binding,
+                applicable_criteria=[
+                    {
+                        "id": "invented",
+                        "quote": _unique_prose_quotes(prose, 1)[0],
+                        "external_source_required": False,
+                    }
+                ],
+            ),
+        ),
+    ]
+    check(
+        "prose VISION: unbacked source or criterion claims still fail closed",
+        all(
+            "aligns_with_vision"
+            not in _admitted_automerge(case, PROSE_VISION_FILE, binding)
+            for _, case in unverified
+        ),
+    )
+    negative = _bound_candidate(binding, aligns_with_vision=False)
+    negative_persisted = render_card.normalize_triage(
+        render_card.enforce_triage_source_provenance(
+            negative, "", PROSE_VISION_FILE, PROSE_TARGET_FACTS_FILE, **binding
+        )
+    )["automerge_verdict"]
+    negative_facts, _ = am.behavior_verdict_facts(negative_persisted)
+    check(
+        "prose VISION: a negative alignment answer still renders UNMET",
+        negative_persisted.get("aligns_with_vision") is False
+        and negative_facts["g6_vision_alignment"]["status"] == schema.STATUS_UNMET
+        and negative_facts["g6_vision_alignment"]["evidence"]
+        == "alignment not confirmed"
+        and am.verdict_eligible(negative_persisted)[0] is False,
+    )
+
+
+def test_declared_vision_criteria_still_bind_external_source_evidence():
+    """Adopting the optional declaration block can only narrow admission: a
+    declared criterion that requires external source still needs the same #1577
+    clone provenance, while a declaration whose selectors miss the changed paths
+    falls back to the ordinary local-only rules."""
+    prose = open(PROSE_VISION_FILE, encoding="utf-8").read()
+    quote = _unique_prose_quotes(prose, 1)[0]
+    with tempfile.TemporaryDirectory() as parent:
+
+        def declaring_vision(name, selector):
+            declaration = {
+                "version": 1,
+                "complete": True,
+                "criteria": [
+                    {
+                        "id": "external-source",
+                        "quote_sha256": hashlib.sha256(
+                            quote.encode("utf-8")
+                        ).hexdigest(),
+                        "external_source_required": True,
+                        "selector": selector,
+                    }
+                ],
+            }
+            path = os.path.join(parent, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "<!-- wheelhouse-vision-source-dependencies: "
+                    + json.dumps(declaration, separators=(",", ":"))
+                    + " -->\n"
+                    + prose
+                )
+            return path
+
+        matching = declaring_vision("vision-matching.md", {"always": True})
+        _, matching_binding = _prose_binding(matching)
+        cited = _bound_candidate(
+            matching_binding,
+            external=True,
+            applicable_criteria=[
+                {
+                    "id": "external-source",
+                    "quote": quote,
+                    "external_source_required": True,
+                }
+            ],
+        )
+        check(
+            "declared VISION: an applicable external criterion still needs clone provenance",
+            render_card.triage_vision_dependency_verified(
+                cited, matching, PROSE_TARGET_FACTS_FILE, **matching_binding
+            )
+            is True
+            and "aligns_with_vision"
+            not in _admitted_automerge(cited, matching, matching_binding),
+        )
+        denied = _bound_candidate(
+            matching_binding,
+            external=False,
+            applicable_criteria=[
+                {
+                    "id": "external-source",
+                    "quote": quote,
+                    "external_source_required": False,
+                }
+            ],
+        )
+        empty = _bound_candidate(matching_binding)
+        check(
+            "declared VISION: an applicable criterion cannot be downgraded or skipped",
+            all(
+                "aligns_with_vision"
+                not in _admitted_automerge(case, matching, matching_binding)
+                for case in (denied, empty)
+            ),
+        )
+        unmatched = declaring_vision(
+            "vision-unmatched.md", {"changed_paths_any": ["docs/**"]}
+        )
+        _, unmatched_binding = _prose_binding(unmatched)
+        no_match = _bound_candidate(unmatched_binding)
+        check(
+            "declared VISION: no matching selector means an honest empty evidence list",
+            render_card.triage_vision_dependency_verified(
+                no_match, unmatched, PROSE_TARGET_FACTS_FILE, **unmatched_binding
+            )
+            is False
+            and _admitted_automerge(no_match, unmatched, unmatched_binding).get(
+                "aligns_with_vision"
+            )
+            is True,
+        )
+        forged = _bound_candidate(
+            unmatched_binding,
+            applicable_criteria=[
+                {
+                    "id": "external-source",
+                    "quote": quote,
+                    "external_source_required": False,
+                }
+            ],
+        )
+        check(
+            "declared VISION: citing an inapplicable criterion still fails closed",
+            "aligns_with_vision"
+            not in _admitted_automerge(forged, unmatched, unmatched_binding),
+        )
+
+
+def test_missing_vision_fact_copy_reflects_whether_vision_was_read():
+    """The UNAVAILABLE evidence must not claim a VISION.md is required when the
+    card's own state proves one was read at triage time."""
+    stripped = independent_verdict()
+    read_rows, _ = am.behavior_verdict_facts(stripped, triaged_vision_sha="v" * 40)
+    absent_rows, _ = am.behavior_verdict_facts(stripped)
+    check(
+        "copy: a read VISION.md is named instead of demanded",
+        all(
+            read_rows[key]["status"] == schema.STATUS_UNAVAILABLE
+            and read_rows[key]["evidence"]
+            == (
+                "VISION.md vvvvvvvv was read, but the triage verdict carries "
+                "no vision-bound alignment fact"
+            )
+            and "VISION.md is required" not in read_rows[key]["reason"]
+            for key in ("g6_vision_alignment", "g6_verdict_merge")
+        ),
+    )
+    check(
+        "copy: a genuinely missing VISION.md keeps the required wording",
+        all(
+            absent_rows[key]["evidence"]
+            == (
+                "not evaluated because a trusted default-branch VISION.md "
+                "is required"
+            )
+            for key in ("g6_vision_alignment", "g6_verdict_merge")
+        ),
+    )
+    present = evaluate(
+        card_value=card_entry(
+            automerge_verdict=independent_verdict(), triaged_vision_sha=VISION
+        ),
+        vision=(True, VISION),
+    )
+    present_rows = rows(present)
+    present_body = "\n".join(render_card._automerge_criteria_section(present["criteria"]))
+    check(
+        "copy: an evaluated card with VISION present never demands VISION.md",
+        present_rows["g0_vision_present"]["status"] == schema.STATUS_MET
+        and present_rows["g6_vision_alignment"]["status"] == schema.STATUS_UNAVAILABLE
+        and "VISION.md is required"
+        not in present_rows["g6_vision_alignment"]["evidence"]
+        and "- **VISION.md-dependent checks**" in present_body
+        and "_needs VISION.md_" not in present_body,
+    )
+    missing = evaluate(
+        card_value=card_entry(automerge_verdict=independent_verdict()),
+        vision=(False, ""),
+    )
+    missing_body = "\n".join(render_card._automerge_criteria_section(missing["criteria"]))
+    check(
+        "copy: a genuinely absent VISION.md still shows the needs-VISION hint",
+        rows(missing)["g0_vision_present"]["evidence"]
+        == schema.G0_VISION_MISSING_EVIDENCE
+        and "- **VISION.md-dependent checks** - _needs VISION.md_" in missing_body,
+    )
+    unevaluated = "\n".join(
+        render_card._automerge_criteria_section(
+            [
+                row
+                for row in missing["criteria"]
+                if row["id"] != "g0_vision_present"
+            ]
+        )
+    )
+    check(
+        "copy: an unevaluated G0 row never invents a needs-VISION instruction",
+        "- **VISION.md-dependent checks**" in unevaluated
+        and "_needs VISION.md_" not in unevaluated,
     )
 
 

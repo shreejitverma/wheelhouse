@@ -1,5 +1,5 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "wheelhouse/nl-decision/v1",
   "type": "object",
   "additionalProperties": false,
@@ -7,7 +7,7 @@
   "properties": {
     "mode": {"type": "string", "enum": ["action", "answer", "clarify"]},
     "action": {"type": "string", "maxLength": 80},
-    "free_text": {"type": "string", "maxLength": 32768},
-    "answer": {"type": "string", "maxLength": 65536}
+    "free_text": {"type": "string", "maxLength": 6144},
+    "answer": {"type": "string", "maxLength": 12288}
   }
 }

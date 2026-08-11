@@ -24,6 +24,16 @@ Wheelhouse dogfoods the same contribution gate it applies to the rest of the fle
 A PR opened directly on GitHub (without the no-mistakes signature in its body) fails the **"PR must be raised via no-mistakes"** check and cannot be merged.
 Automated authors are exempt: PRs from `github-actions[bot]`, `dependabot[bot]`, and `release-please[bot]` skip the gate.
 
+## Pull requests from forks
+
+If you open a pull request from a fork, use a personal fork and enable **Allow edits from maintainers** in the pull request sidebar. This permission lets a maintainer resolve a small conflict on that same branch without asking you to rebase. The path does not rewrite your existing commits, and checks run on the same PR. A visible `wheelhouse:awaiting-captain-confirm` label remains until the maintainer confirms and merges the resolution; the label is advisory and does not prevent a deliberate GitHub merge.
+
+GitHub does not allow organization-owned forks to grant this permission. Pull requests from a fork that cannot be updated by maintainers are closed with an explanation. You can enable the setting and reopen the PR, or send a replacement from a personal fork.
+
+When a maintainer resolves a conflict this way, they push one merge commit to the existing PR branch, whether it is in this repository or an editable personal fork. Immediately before the plain non-force push, the branch is re-read and the update is refused if you pushed meanwhile. Your commits are not rewritten, rebased, or squashed, and you keep authorship; the merge commit credits you with a `Co-authored-by` trailer. Checks then run again on this same pull request.
+
+If GitHub shows **Allow edits and access to secrets by maintainers**, read GitHub's warning before enabling it. That setting has the security implications GitHub documents for fork workflows. Do not enable it if you do not accept those implications. In that case, this contribution policy cannot accept the fork PR.
+
 ## Local validation
 
 There is no build step.
@@ -31,8 +41,10 @@ Before pushing, validate locally:
 
 ```
 python -m py_compile agent_runtime/*.py agent_runtime/adapters/*.py scripts/*.py tests/*.py
+ruff check --select F821 agent_runtime scripts tests
 python scripts/agent_runtime.py verify-pins
 python tests/test_agent_runtime_contract.py
+python tests/test_agent_runtime_source_review.py
 python tests/test_agent_runtime_capabilities.py
 python tests/test_agent_runtime_security.py
 python tests/test_agent_runtime_lifecycle.py
@@ -41,21 +53,51 @@ python tests/test_agent_runtime_dispatch.py
 python tests/test_agent_runtime_claude_handoff.py
 python tests/test_agent_runtime_claude_bridge.py
 python tests/test_agent_runtime_workflows.py
+python tests/test_agent_runtime_admission.py
+python tests/test_agent_runtime_result_binding.py
+python tests/test_agent_runtime_repo_snapshot.py
+python tests/test_agent_runtime_claude_adapter.py
+python tests/test_agent_runtime_schema_repair_cutover.py
+python tests/test_agent_outage_recovery_gate.py
+python tests/test_agent_runtime_child_timeout.py
 python tests/test_claude_model_dispatch.py
 python tests/test_decision.py
 python tests/test_qualify_refs.py
 python tests/test_card_refresh.py
+python tests/test_card_reuse.py
 python tests/test_reconcile.py
 python tests/test_merge_conflict.py
+python tests/test_maintainer_edits_policy.py
+python tests/test_merge_assist.py
 python tests/test_pending_contributor_cleanup.py
 python tests/test_ci_autoapprove.py
+python tests/test_target_observation.py
+python tests/test_option_b_architecture.py
+python tests/test_option_b_path_completeness.py
+python tests/test_decision_label_recovery.py
+python tests/test_target_reconcile_transaction.py
 python tests/test_ci_security_summary.py
 python tests/test_check_status.py
+python tests/test_compliance_event_evidence.py
 python tests/test_author_filter.py
 python tests/test_auto_triage.py
+python tests/test_confirming_accept_copy.py
+python tests/test_canonical_recommendation.py
+python tests/test_presentation_migration.py
+python tests/test_triage_budget.py
+python tests/test_triage_replay.py
+python tests/test_triage_prompt_size.py
+python tests/test_triage_result_delivery.py
+python tests/test_triage_schema_repair.py
 python tests/test_auto_merge_v1.py
+python tests/test_automerge_card_ui.py
+python tests/test_automerge_workflow_hold.py
 python tests/test_deep_review.py
 python tests/test_nl_decisions_search.py
+python tests/test_nl_prompt_size.py
+python tests/test_nl_schema_repair.py
+python tests/test_public_clone.py
+python tests/test_public_clone_e2e.py
 python tests/test_workflow_lint.py
 python tests/test_scan_reliability.py
 python tests/test_config_schema.py

@@ -53,6 +53,17 @@ def body_state(
         "comp": comp,
         "tests": tests,
         "priority": priority,
+        "bucket": (
+            "needs-ci-approval"
+            if kind == "ci-approval"
+            else "issue-triage"
+            if kind == "issue-triage"
+            else "merge-ready"
+        ),
+        "projection_freshness": "",
+        "projection_head_sha": "",
+        "projection_complete": False,
+        "pushability": "",
         "updated_at": updated_at,
         "activity_reflected_at": activity_reflected_at,
     }
@@ -77,6 +88,7 @@ def work_item(**overrides):
         "summary": "compliance=pass tests=green",
         "recommendation": "Merge - compliance and tests are green.",
         "priority": "med",
+        "pushability": "",
     }
     item.update(overrides)
     return item
@@ -96,6 +108,7 @@ def run_reconcile(
         "reflect": [],
         "state": [],
         "triage_rows": [],
+        "confirming_refresh": [],
     }
     current_by_number = {
         c["number"]: c for c in (cards if current_cards is None else current_cards)
@@ -150,9 +163,21 @@ def run_reconcile(
         current_by_number[int(number)]["body"] = new_body
         return True
 
-    def fake_update_absence(number, body, count, run_number=0, closed_at=""):
+    def fake_update_absence(
+        number,
+        body,
+        count,
+        run_number=0,
+        closed_at="",
+        reason="",
+        observation=None,
+    ):
         new_body = reconcile.render_card.body_with_reconcile_absence(
-            body, count, run_number=run_number, closed_at=closed_at
+            body,
+            count,
+            run_number=run_number,
+            closed_at=closed_at,
+            reason=reason,
         )
         calls["state"].append(
             {
@@ -168,6 +193,9 @@ def run_reconcile(
         if new_body == body:
             return False
         current_by_number[int(number)]["body"] = new_body
+        names = reconcile._label_names(current_by_number[int(number)]["labels"])
+        names.add(reconcile.render_card.LIFECYCLE_CONFIRM_LABEL)
+        current_by_number[int(number)]["labels"] = labels(*sorted(names))
         return True
 
     def fake_clear_absence(number, body):
@@ -183,18 +211,41 @@ def run_reconcile(
         if new_body == body:
             return False
         current_by_number[int(number)]["body"] = new_body
+        names = reconcile._label_names(current_by_number[int(number)]["labels"])
+        names.discard(reconcile.render_card.LIFECYCLE_CONFIRM_LABEL)
+        current_by_number[int(number)]["labels"] = labels(*sorted(names))
+        return True
+
+    def fake_refresh_stale_confirming(number, expected):
+        new_body = reconcile.render_card.body_with_controls_aware_recommendation(
+            expected.get("body", ""), owner="owner"
+        )
+        calls["confirming_refresh"].append(
+            {
+                "number": number,
+                "expected": expected,
+                "body_after": new_body,
+            }
+        )
+        if new_body == expected.get("body", ""):
+            return False
+        current_by_number[int(number)]["body"] = new_body
         return True
 
     old_argv = sys.argv[:]
     old_github_actions = os.environ.get("GITHUB_ACTIONS")
     old_event_name = os.environ.get("GITHUB_EVENT_NAME")
     old_run_number = os.environ.get("GITHUB_RUN_NUMBER")
+    old_owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
     old_upsert = reconcile.render_card.upsert_card
     old_close = reconcile.render_card.close_card
     old_get_card = reconcile.render_card.get_card
     old_reflect = reconcile.render_card.reflect_activity
     old_update_absence = reconcile.render_card.update_reconcile_absence
     old_clear_absence = reconcile.render_card.clear_reconcile_absence
+    old_refresh_stale_confirming = (
+        reconcile.render_card.refresh_stale_confirming_card
+    )
     old_maybe_queue = reconcile.maybe_queue_auto_triage
     reconcile.render_card.upsert_card = fake_upsert
     reconcile.render_card.close_card = fake_close
@@ -202,11 +253,15 @@ def run_reconcile(
     reconcile.render_card.reflect_activity = fake_reflect
     reconcile.render_card.update_reconcile_absence = fake_update_absence
     reconcile.render_card.clear_reconcile_absence = fake_clear_absence
+    reconcile.render_card.refresh_stale_confirming_card = (
+        fake_refresh_stale_confirming
+    )
     reconcile.maybe_queue_auto_triage = fake_maybe_queue
     try:
         os.environ["GITHUB_ACTIONS"] = "true"
         os.environ["GITHUB_EVENT_NAME"] = "schedule"
         os.environ["GITHUB_RUN_NUMBER"] = "100"
+        os.environ["GITHUB_REPOSITORY_OWNER"] = "owner"
         with tempfile.TemporaryDirectory() as d:
             scan_path = os.path.join(d, "scan.json")
             cards_path = os.path.join(d, "cards.json")
@@ -240,14 +295,69 @@ def run_reconcile(
             os.environ.pop("GITHUB_RUN_NUMBER", None)
         else:
             os.environ["GITHUB_RUN_NUMBER"] = old_run_number
+        if old_owner is None:
+            os.environ.pop("GITHUB_REPOSITORY_OWNER", None)
+        else:
+            os.environ["GITHUB_REPOSITORY_OWNER"] = old_owner
         reconcile.render_card.upsert_card = old_upsert
         reconcile.render_card.close_card = old_close
         reconcile.render_card.get_card = old_get_card
         reconcile.render_card.reflect_activity = old_reflect
         reconcile.render_card.update_reconcile_absence = old_update_absence
         reconcile.render_card.clear_reconcile_absence = old_clear_absence
+        reconcile.render_card.refresh_stale_confirming_card = (
+            old_refresh_stale_confirming
+        )
         reconcile.maybe_queue_auto_triage = old_maybe_queue
     return calls
+
+
+def complete_absence_observation(number, head_sha="oldsha"):
+    return reconcile.target_contracts.make_observation(
+        "owner",
+        "wheelhouse",
+        number,
+        head_sha=head_sha,
+        base_sha="base",
+        expected_head_sha=head_sha,
+        observed_at="2024-01-03T00:00:00Z",
+        source="bulk-scan",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": "Waiting PR",
+            "author": "contributor",
+            "updated_at": "2024-01-03T00:00:00Z",
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "feature",
+            "mergeable": "CONFLICTING",
+            "ci": True,
+            "comp": "pass",
+            "tests": "green",
+            "bucket": "needs-rebase",
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "Gate", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=reconcile.target_contracts.changed_path_facts(
+            ["src/example.py"], complete=True
+        ),
+    )
 
 
 def scan_payload(
@@ -256,27 +366,28 @@ def scan_payload(
     open_issue_numbers=None,
     ok=True,
     truncated=False,
-    indeterminate_pr_numbers=None,
     ci_wait_pr_numbers=None,
     ci_wait_refresh_items=None,
 ):
+    prs = [42] if open_pr_numbers is None else open_pr_numbers
     return {
         "repos": {
             "wheelhouse": {
                 "ok": ok,
-                "open_pr_numbers": [42] if open_pr_numbers is None else open_pr_numbers,
+                "open_pr_numbers": prs,
                 "open_issue_numbers": []
                 if open_issue_numbers is None
                 else open_issue_numbers,
-                "indeterminate_pr_numbers": []
-                if indeterminate_pr_numbers is None
-                else indeterminate_pr_numbers,
                 "ci_wait_pr_numbers": []
                 if ci_wait_pr_numbers is None
                 else ci_wait_pr_numbers,
                 "ci_wait_refresh_items": []
                 if ci_wait_refresh_items is None
                 else ci_wait_refresh_items,
+                "worklist_absence_observations": {
+                    str(number): complete_absence_observation(number)
+                    for number in prs
+                },
                 "truncated": truncated,
             }
         },
@@ -359,6 +470,31 @@ class ReconcileLifecycle:
         ]
 
     def _gh(self, args, check=True):
+        if args[:3] == ["api", "--method", "PATCH"] and "--input" in args:
+            self.body_write_attempts += 1
+            if self.body_write_attempts in self.fail_body_write_attempts:
+                raise RuntimeError("simulated body write failure")
+            path = args[args.index("--input") + 1]
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            self.issue["title"] = payload["title"]
+            self.issue["body"] = payload["body"]
+            self.issue["labels"] = labels(*payload["labels"])
+            self.body_writes += 1
+            self._tick()
+            response = {
+                "number": self.issue["number"],
+                "body": self.issue["body"],
+                "labels": copy.deepcopy(self.issue["labels"]),
+                "title": self.issue["title"],
+                "state": "open",
+                "updated_at": self.issue["updatedAt"],
+                "user": {"login": "github-actions[bot]"},
+                "comments": len(self.issue["comments"]),
+            }
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps(response), stderr=""
+            )
         if args[:3] == ["api", "--method", "PATCH"]:
             if self.close_attempts in self.fail_close_attempts:
                 raise RuntimeError("simulated close failure")
@@ -454,6 +590,7 @@ class ReconcileLifecycle:
         old_github_actions = os.environ.get("GITHUB_ACTIONS")
         old_event_name = os.environ.get("GITHUB_EVENT_NAME")
         old_run_number = os.environ.get("GITHUB_RUN_NUMBER")
+        old_owner = os.environ.get("GITHUB_REPOSITORY_OWNER")
         reconcile.render_card._gh = self._gh
 
         def guarded_close(*args, **kwargs):
@@ -462,10 +599,12 @@ class ReconcileLifecycle:
 
         reconcile.render_card.close_card = guarded_close
         os.environ["WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN"] = "false"
-        self.run_number += 1
+        if event_name == "schedule":
+            self.run_number += 1
         os.environ["GITHUB_ACTIONS"] = "true"
         os.environ["GITHUB_EVENT_NAME"] = event_name
         os.environ["GITHUB_RUN_NUMBER"] = str(self.run_number)
+        os.environ["GITHUB_REPOSITORY_OWNER"] = "owner"
         try:
             with tempfile.TemporaryDirectory() as d:
                 scan_path = os.path.join(d, "scan.json")
@@ -497,6 +636,10 @@ class ReconcileLifecycle:
                 os.environ.pop("GITHUB_RUN_NUMBER", None)
             else:
                 os.environ["GITHUB_RUN_NUMBER"] = old_run_number
+            if old_owner is None:
+                os.environ.pop("GITHUB_REPOSITORY_OWNER", None)
+            else:
+                os.environ["GITHUB_REPOSITORY_OWNER"] = old_owner
 
 
 def _body_with_absence(body, count=1, run_number=99):
@@ -613,6 +756,52 @@ def test_refresh_uses_current_labels_before_upsert():
     check("reconcile: processing current card is not closed", calls["close"] == [])
 
 
+def test_locked_card_transitions_to_inert_source_policy_audit():
+    policy = {
+        "version": 1,
+        "mode": reconcile.core.PUSHABILITY_FORK_REJECT,
+        "head_sha": "oldsha",
+        "source": {
+            "is_fork": True,
+            "owner_type": "User",
+            "maintainer_can_modify": False,
+        },
+        "phase": "notice-posted",
+        "target_comment_id": 99,
+    }
+    item = work_item(
+        bucket="maintainer-edits-required",
+        pushability=reconcile.core.PUSHABILITY_FORK_REJECT,
+        maintainer_edits_policy=policy,
+    )
+    state = dict(reconcile.core.parse_state_block(body_state()))
+    state[reconcile.render_card.MAINTAINER_EDITS_POLICY_FIELD] = policy
+    snapshot = card(
+        labels(
+            "blocked",
+            "repo:wheelhouse",
+            "kind:pr-review",
+            "priority:med",
+            "target:wheelhouse-42",
+        )
+    )
+    snapshot["body"] = "<!-- wheelhouse-state: %s -->" % json.dumps(
+        state, separators=(",", ":")
+    )
+    calls = run_reconcile(scan_payload(items=[item]), [snapshot])
+    writes = calls["upsert"]
+    check(
+        "policy: locked card is routed through guarded inert transition",
+        len(writes) == 1
+        and writes[0]["existing"] == snapshot
+        and writes[0]["expected_existing"] == snapshot,
+    )
+    check(
+        "policy: locked card bypasses ordinary triage maintenance",
+        calls["triage_rows"] == [],
+    )
+
+
 def test_open_target_that_left_worklist_records_first_absence():
     calls = run_reconcile(
         scan_payload(items=[]),
@@ -641,6 +830,102 @@ def test_open_target_that_left_worklist_records_first_absence():
             calls["state"][0]["body_after"]
         )
         == 1,
+    )
+
+
+def test_render_stale_confirming_card_migrates_without_target_observation():
+    item = work_item(
+        kind="issue-triage",
+        head_sha="",
+        bucket="issue-triage",
+        comp="n/a",
+        tests="n/a",
+        url="https://github.com/kunchenguid/wheelhouse/issues/42",
+    )
+    body = reconcile.render_card.render(item, owner="owner")["body"]
+    revision = reconcile.render_card.triage_revision(item)
+    body = reconcile.render_card.body_with_triage_result(
+        body,
+        revision,
+        triage={
+            "summary": "Current issue analysis.",
+            "product_implications": "Maintainer action remains advisory.",
+            "recommended_action": "investigate",
+            "recommended_reason": "Confirm the reported behavior.",
+            "evidence": "issue body",
+        },
+        owner="owner",
+    )
+    body = reconcile.render_card.body_with_reconcile_absence(
+        body,
+        1,
+        run_number=99,
+        reason="target is outside the current maintainer worklist",
+    )
+    stale = dict(reconcile.core.parse_state_block(body), render_version=13)
+    body = reconcile.render_card._replace_state_block(body, stale).replace(
+        reconcile.render_card.RECOMMENDATION_INERT_FRAMING,
+        reconcile.render_card.RECOMMENDATION_ACCEPT_INSTRUCTION,
+    )
+    confirming = {
+        "number": 7,
+        "body": body,
+        "labels": labels(
+            "needs-decision",
+            "repo:wheelhouse",
+            "kind:issue-triage",
+            "priority:med",
+            "target:wheelhouse-42",
+            reconcile.render_card.LIFECYCLE_CONFIRM_LABEL,
+        ),
+        "title": "[wheelhouse#42] Ready PR",
+        "updated_at": "2024-01-02T00:00:00Z",
+    }
+    calls = run_reconcile(
+        scan_payload(
+            items=[],
+            open_pr_numbers=[],
+            open_issue_numbers=[42],
+        ),
+        [confirming],
+    )
+    check(
+        "confirming migration: guarded card-only refresh runs once",
+        len(calls["confirming_refresh"]) == 1
+        and calls["confirming_refresh"][0]["number"] == 7
+        and calls["confirming_refresh"][0]["expected"].get("body") == body,
+    )
+    healed = calls["confirming_refresh"][0]["body_after"]
+    healed_state = reconcile.core.parse_state_block(healed)
+    check(
+        "confirming migration: copy heals without target observation",
+        not reconcile.render_card.contradictory_accept_instruction(healed)
+        and reconcile.render_card.RECOMMENDATION_INERT_FRAMING in healed
+        and reconcile.render_card.reconcile_absence_count(healed) == 1
+        and healed_state.get("render_version")
+        == reconcile.render_card.CARD_RENDER_VERSION,
+    )
+    check(
+        "confirming migration: does not advance or clear lifecycle state",
+        calls["state"] == [] and calls["close"] == [] and calls["upsert"] == [],
+    )
+    version_12_state = dict(
+        reconcile.core.parse_state_block(body), render_version=12
+    )
+    version_12_body = reconcile.render_card._replace_state_block(
+        body, version_12_state
+    )
+    check(
+        "confirming migration: exact-v13 predicate rejects older cards",
+        not reconcile.render_card.confirming_accept_copy_migration_needed(
+            version_12_state,
+            version_12_body,
+            confirming["labels"],
+        )
+        and reconcile.render_card.body_with_controls_aware_recommendation(
+            version_12_body, owner="owner"
+        )
+        == version_12_body,
     )
 
 
@@ -684,33 +969,6 @@ def test_reconcile_run_number_requires_trusted_actions_identity():
     )
 
 
-def test_indeterminate_pr_card_is_frozen():
-    # #111 invariant: an open PR whose mergeability was unreadable this scan
-    # (UNKNOWN did not settle) is reported in `indeterminate_pr_numbers` and emits
-    # no worklist item. Its existing card must be FROZEN - neither closed/consumed
-    # nor refreshed - so an UNKNOWN reading can never flip worklist membership or
-    # mint/close a card. This is the same mergeable-UNKNOWN oscillation that
-    # minted 10 duplicate cards for lavish-axi#111.
-    calls = run_reconcile(
-        scan_payload(items=[], indeterminate_pr_numbers=[42]),
-        [
-            card(
-                labels(
-                    "needs-decision",
-                    "repo:wheelhouse",
-                    "kind:pr-review",
-                    "priority:med",
-                    "target:wheelhouse-42",
-                )
-            )
-        ],
-    )
-    check("reconcile-freeze: indeterminate card is NOT closed", calls["close"] == [])
-    check(
-        "reconcile-freeze: indeterminate card is NOT refreshed", calls["upsert"] == []
-    )
-
-
 def _pr_review_card():
     return card(
         labels(
@@ -728,7 +986,7 @@ def test_ci_wait_card_is_frozen_not_consumed():
     # approved checks are still running) emits NO worklist item while it awaits
     # terminal checks. Its existing pr-review card must be FROZEN - never consumed
     # merely because its target is mid-approval/CI-wait. Same fail-safe family as
-    # the indeterminate freeze. (No refresh item here -> pure freeze, no upsert.)
+    # a distinct CI-wait freeze. (No refresh item here -> pure freeze, no upsert.)
     calls = run_reconcile(
         scan_payload(items=[], ci_wait_pr_numbers=[42]),
         [_pr_review_card()],
@@ -803,6 +1061,7 @@ def test_ci_wait_refresh_is_noop_when_card_already_current():
             "head_sha": "newsha",
             "comp": "none",
             "tests": "none",
+            "bucket": "ci-running",
             # Match a card already refreshed once by the anti-masquerade path: the
             # pending refresh item is priority `low` and carries the full default
             # option set (incl. `investigate`), so nothing material differs.
@@ -811,21 +1070,209 @@ def test_ci_wait_refresh_is_noop_when_card_already_current():
         }
     )
     already["body"] = reconcile.render_card._replace_state_block(already["body"], state)
-    calls = run_reconcile(
-        scan_payload(
-            items=[],
-            ci_wait_pr_numbers=[42],
-            ci_wait_refresh_items=[
-                ci_wait_refresh_item(head_sha="newsha", comp="none", tests="none")
-            ],
-        ),
-        [already],
-    )
+    # This is a semantic no-churn unit, not an exact-observer transport test.
+    # Return the already-complete pending projection unchanged; production exact
+    # reread transitions are covered by test_target_reconcile_transaction.py.
+    saved_final_projection = reconcile._final_ci_wait_projection
+    reconcile._final_ci_wait_projection = lambda _owner, item, _cfg: item
+    try:
+        calls = run_reconcile(
+            scan_payload(
+                items=[],
+                ci_wait_pr_numbers=[42],
+                ci_wait_refresh_items=[
+                    ci_wait_refresh_item(head_sha="newsha", comp="none", tests="none")
+                ],
+            ),
+            [already],
+        )
+    finally:
+        reconcile._final_ci_wait_projection = saved_final_projection
     check(
         "ci-wait-antimasq: already-current card is not re-refreshed",
         calls["upsert"] == [],
     )
     check("ci-wait-antimasq: already-current card is not closed", calls["close"] == [])
+
+
+def test_ci_wait_refresh_repairs_unknown_criteria_once():
+    head = "same-head"
+    observation = reconcile.target_contracts.incomplete_observation(
+        "owner",
+        "wheelhouse",
+        42,
+        expected_head_sha=head,
+        observed_head_sha=head,
+        observed_at="2024-01-03T00:00:00Z",
+        error="exact observation remains incomplete",
+    )
+    projection_item = ci_wait_refresh_item(
+        head_sha=head, comp="unknown", tests="unknown"
+    )
+    projection_item.update(
+        {
+            "bucket": "ci-state-unknown",
+            "target_observation": observation,
+            "projection_ref": reconcile.target_contracts.make_projection_ref(
+                observation, "unknown", "ci-state-unknown"
+            ),
+        }
+    )
+    positive = reconcile.render_card.criteria_schema.unavailable_criteria(
+        "complete green observation"
+    )
+    positive[0]["status"] = reconcile.render_card.criteria_schema.STATUS_MET
+
+    stale = card(
+        labels(
+            "needs-decision",
+            "repo:wheelhouse",
+            "kind:pr-review",
+            "priority:low",
+            "target:wheelhouse-42",
+        ),
+        render_version=reconcile.render_card.CARD_RENDER_VERSION,
+    )
+    stale_state = reconcile.core.parse_state_block(stale["body"])
+    stale_state.update(
+        {
+            "head_sha": head,
+            "comp": "unknown",
+            "tests": "unknown",
+            "bucket": "ci-state-unknown",
+            "priority": "low",
+            "options": reconcile.render_card.card_options({"kind": "pr-review"}),
+            "projection_freshness": "unknown",
+            "projection_head_sha": head,
+            "projection_complete": False,
+            reconcile.render_card.AUTOMERGE_CRITERIA_VERSION_FIELD: (
+                reconcile.render_card.criteria_schema.CRITERIA_VERSION
+            ),
+            reconcile.render_card.AUTOMERGE_CRITERIA_FIELD: positive,
+        }
+    )
+    stale["body"] = reconcile.render_card._replace_state_block(
+        stale["body"], stale_state
+    )
+
+    saved_final_projection = reconcile._final_ci_wait_projection
+    reconcile._final_ci_wait_projection = (
+        lambda _owner, _item, _cfg: projection_item
+    )
+    try:
+        repair_calls = run_reconcile(
+            scan_payload(
+                items=[],
+                ci_wait_pr_numbers=[42],
+                ci_wait_refresh_items=[ci_wait_refresh_item(head_sha=head)],
+            ),
+            [stale],
+        )
+
+        healed = copy.deepcopy(stale)
+        healed_state = reconcile.core.parse_state_block(healed["body"])
+        healed_state.pop(reconcile.render_card.AUTOMERGE_CRITERIA_FIELD)
+        healed_state.pop(reconcile.render_card.AUTOMERGE_CRITERIA_VERSION_FIELD)
+        healed["body"] = reconcile.render_card._replace_state_block(
+            healed["body"], healed_state
+        )
+        noop_calls = run_reconcile(
+            scan_payload(
+                items=[],
+                ci_wait_pr_numbers=[42],
+                ci_wait_refresh_items=[ci_wait_refresh_item(head_sha=head)],
+            ),
+            [healed],
+        )
+
+        processing = copy.deepcopy(stale)
+        processing["labels"] += labels("processing")
+        protected_calls = run_reconcile(
+            scan_payload(
+                items=[],
+                ci_wait_pr_numbers=[42],
+                ci_wait_refresh_items=[ci_wait_refresh_item(head_sha=head)],
+            ),
+            [processing],
+        )
+
+        healthy_observation = complete_absence_observation(42, head_sha=head)
+        healthy_item = dict(projection_item)
+        healthy_item.update(
+            {
+                "bucket": healthy_observation["facts"]["bucket"],
+                "comp": healthy_observation["facts"]["comp"],
+                "tests": healthy_observation["facts"]["tests"],
+                "target_observation": healthy_observation,
+                "projection_ref": reconcile.target_contracts.make_projection_ref(
+                    healthy_observation,
+                    "current",
+                    healthy_observation["facts"]["bucket"],
+                ),
+                reconcile.render_card.AUTOMERGE_CRITERIA_FIELD: positive,
+            }
+        )
+        healthy = copy.deepcopy(stale)
+        healthy_state = reconcile.core.parse_state_block(healthy["body"])
+        healthy_state.update(
+            {
+                "bucket": healthy_item["bucket"],
+                "comp": healthy_item["comp"],
+                "tests": healthy_item["tests"],
+                "projection_freshness": "current",
+                "projection_complete": True,
+            }
+        )
+        # A healthy no-churn card stores exactly what a current write would
+        # store: the admission-dependent rows recomputed from its own state
+        # (card #2148 display race), so the stale check sees no drift.
+        current_rows = reconcile.render_card._admission_current_criteria(
+            positive, healthy_state
+        )
+        healthy_item[reconcile.render_card.AUTOMERGE_CRITERIA_FIELD] = current_rows
+        healthy_state[reconcile.render_card.AUTOMERGE_CRITERIA_FIELD] = current_rows
+        healthy["body"] = reconcile.render_card._replace_state_block(
+            healthy["body"], healthy_state
+        )
+        reconcile._final_ci_wait_projection = (
+            lambda _owner, _item, _cfg: healthy_item
+        )
+        healthy_calls = run_reconcile(
+            scan_payload(
+                items=[],
+                ci_wait_pr_numbers=[42],
+                ci_wait_refresh_items=[ci_wait_refresh_item(head_sha=head)],
+            ),
+            [healthy],
+        )
+    finally:
+        reconcile._final_ci_wait_projection = saved_final_projection
+
+    check(
+        "ci-wait criteria repair: materially unchanged unknown refreshes once",
+        not reconcile.render_card.material_changed(projection_item, stale_state)
+        and len(repair_calls["upsert"]) == 1
+        and repair_calls["upsert"][0]["item"] is projection_item
+        and repair_calls["triage_rows"] == []
+        and repair_calls["close"] == [],
+    )
+    check(
+        "ci-wait criteria repair: healed unknown projection is idempotent",
+        noop_calls["upsert"] == [] and noop_calls["triage_rows"] == [],
+    )
+    check(
+        "ci-wait criteria repair: non-refreshable card stays protected",
+        protected_calls["upsert"] == [] and protected_calls["triage_rows"] == [],
+    )
+    check(
+        "ci-wait criteria repair: healthy matching criteria stay unchanged",
+        not reconcile.render_card.material_changed(healthy_item, healthy_state)
+        and not reconcile.render_card.automerge_criteria_stale(
+            healthy_item, healthy_state
+        )
+        and healthy_calls["upsert"] == []
+        and healthy_calls["triage_rows"] == [],
+    )
 
 
 def test_ci_wait_freeze_releases_when_checks_terminal():
@@ -891,7 +1338,6 @@ def test_axi96_ci_wait_then_terminal_scan_surfaces_card_with_criteria():
                 "ok": True,
                 "open_pr_numbers": [96],
                 "open_issue_numbers": [],
-                "indeterminate_pr_numbers": [],
                 "ci_wait_pr_numbers": [96],
                 "ci_wait_refresh_items": [waiting_refresh],
                 "truncated": False,
@@ -926,7 +1372,6 @@ def test_axi96_ci_wait_then_terminal_scan_surfaces_card_with_criteria():
                 "ok": True,
                 "open_pr_numbers": [96],
                 "open_issue_numbers": [],
-                "indeterminate_pr_numbers": [],
                 "ci_wait_pr_numbers": [],
                 "ci_wait_refresh_items": [],
                 "truncated": False,
@@ -1478,12 +1923,20 @@ def test_lifecycle_present_absent_present_reuses_and_clears():
 
 
 def test_failed_present_reset_cannot_authorize_later_close():
-    item = work_item()
+    item = work_item(
+        kind="issue-triage", head_sha="", bucket="issue-triage",
+        comp="n/a", tests="n/a",
+        url="https://github.com/kunchenguid/wheelhouse/issues/42",
+    )
     lifecycle = ReconcileLifecycle(item)
-    absent = scan_payload(items=[])
+    absent = scan_payload(items=[], open_pr_numbers=[], open_issue_numbers=[42])
     lifecycle.run(absent)
-    lifecycle.fail_body_write_attempts = {2}
-    lifecycle.run(scan_payload(items=[item]))
+    # The present run can attempt a full projection and then a dedicated
+    # lifecycle clear. Fail both writes to preserve the stale first epoch.
+    lifecycle.fail_body_write_attempts = {2, 3}
+    lifecycle.run(
+        scan_payload(items=[item], open_pr_numbers=[], open_issue_numbers=[42])
+    )
     check(
         "reset failure: stale first absence remains tied to its old run",
         reconcile.render_card.reconcile_absence_count(lifecycle.issue["body"]) == 1
@@ -1674,17 +2127,23 @@ def test_lifecycle_kind_transition_reuses_and_resets():
         "transition: old kind has one absence",
         reconcile.render_card.reconcile_absence_count(lifecycle.issue["body"]) == 1,
     )
-    returned = work_item(kind="pr-review", bucket="review-needed")
+    returned = work_item(
+        kind="issue-triage", head_sha="", bucket="issue-triage",
+        comp="n/a", tests="n/a",
+        url="https://github.com/kunchenguid/wheelhouse/issues/42",
+    )
     writes_before_return = lifecycle.body_writes
-    lifecycle.run(scan_payload(items=[returned]))
+    lifecycle.run(
+        scan_payload(items=[returned], open_pr_numbers=[], open_issue_numbers=[42])
+    )
     state = reconcile.core.parse_state_block(lifecycle.issue["body"])
     label_names = reconcile._label_names(lifecycle.issue["labels"])
     check(
         "transition: same card refreshes to new kind",
         lifecycle.issue["number"] == 7
         and lifecycle.issue["state"] == "OPEN"
-        and state.get("kind") == "pr-review"
-        and "kind:pr-review" in label_names
+        and state.get("kind") == "issue-triage"
+        and "kind:issue-triage" in label_names
         and "kind:ci-approval" not in label_names,
     )
     check(
@@ -1700,13 +2159,7 @@ def test_intervening_runs_break_absence_adjacency():
     cases = [
         ("failed", scan_payload(items=[], ok=False), "schedule"),
         ("truncated", scan_payload(items=[], truncated=True), "schedule"),
-        (
-            "UNKNOWN",
-            scan_payload(items=[], indeterminate_pr_numbers=[42]),
-            "schedule",
-        ),
         ("CI-wait", scan_payload(items=[], ci_wait_pr_numbers=[42]), "schedule"),
-        ("manual", scan_payload(items=[]), "workflow_dispatch"),
     ]
     for name, intervening, event_name in cases:
         lifecycle = ReconcileLifecycle(work_item())
@@ -1740,6 +2193,19 @@ def test_intervening_runs_break_absence_adjacency():
             and lifecycle.issue["state"] == "CLOSED"
             and len(lifecycle.close_calls) == 1,
         )
+
+    manual = ReconcileLifecycle(work_item())
+    manual.run(scan_payload(items=[]))
+    first_body = manual.issue["body"]
+    manual.run(scan_payload(items=[]), event_name="workflow_dispatch")
+    unchanged = manual.issue["body"] == first_body and manual.close_calls == []
+    manual.run(scan_payload(items=[]))
+    check(
+        "freeze lifecycle: manual run neither resets nor advances scheduled epochs",
+        unchanged
+        and manual.issue["state"] == "CLOSED"
+        and len(manual.close_calls) == 1,
+    )
 
 
 def test_ci_wait_antimasquerade_refresh_preserves_absence():
@@ -1952,13 +2418,15 @@ def main():
     test_upsert_rejects_change_after_reconcile_validation()
     test_rejected_nested_refresh_does_not_bypass_triage_snapshot_guard()
     test_refresh_uses_current_labels_before_upsert()
+    test_locked_card_transitions_to_inert_source_policy_audit()
     test_open_target_that_left_worklist_records_first_absence()
+    test_render_stale_confirming_card_migrates_without_target_observation()
     test_reconcile_run_number_requires_trusted_actions_identity()
-    test_indeterminate_pr_card_is_frozen()
     test_ci_wait_card_is_frozen_not_consumed()
     test_ci_wait_refresh_kills_stale_head_masquerade()
     test_ci_wait_refresh_never_creates_a_card()
     test_ci_wait_refresh_is_noop_when_card_already_current()
+    test_ci_wait_refresh_repairs_unknown_criteria_once()
     test_ci_wait_freeze_releases_when_checks_terminal()
     test_conclusive_absence_starts_hysteresis_despite_freeze_machinery()
     test_axi96_ci_wait_then_terminal_scan_surfaces_card_with_criteria()

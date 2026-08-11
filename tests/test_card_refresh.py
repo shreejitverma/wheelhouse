@@ -84,6 +84,109 @@ def test_render_shows_author_without_mention():
     check("render: author not @-mentioned", "@chrishsu" not in body)
 
 
+def test_render_qualifies_only_target_derived_deterministic_surfaces():
+    """Production-shaped card #1697/#1765 coverage for render-v13.
+
+    The title quote and approve warning are target text displayed in the
+    Wheelhouse repository, while G1 evidence is Wheelhouse-owned card text and
+    must remain a bare self-reference.
+    """
+    warning_card = item(
+        repo="baby-menu",
+        number=99,
+        kind="ci-approval",
+        title="fix: probe an interactive login shell for the GUI PATH",
+        url="https://github.com/kunchenguid/baby-menu/pull/99",
+        warning=(
+            "auto-approve did not complete (error: #99 "
+            "(fm/babymenu-guipath-fix@6c8be23b)): approved 0/3 matching run(s)"
+        ),
+    )
+    warning_body = rc.render(warning_card, owner="kunchenguid")["body"]
+    check(
+        "render-v13: card-1697 warning is target-qualified",
+        "error: kunchenguid/baby-menu#99" in warning_body,
+    )
+    check(
+        "render-v13: warning has no unqualified target ref",
+        "error: #99" not in warning_body,
+    )
+
+    title_card = item(
+        repo="firstmate",
+        number=1106,
+        kind="issue-triage",
+        head_sha="",
+        bucket="issue-triage",
+        comp="n/a",
+        tests="n/a",
+        title=(
+            "Brief scaffold needs decomposition/delegation section + session-state "
+            "validation before dispatch (broader than #1033)"
+        ),
+        url="https://github.com/kunchenguid/firstmate/issues/1106",
+    )
+    title_body = rc.render(title_card, owner="kunchenguid")["body"]
+    check(
+        "render-v13: card-1765 title quote is target-qualified",
+        "broader than kunchenguid/firstmate#1033" in title_body,
+    )
+    check(
+        "render-v13: title quote has no unqualified target ref",
+        "broader than #1033" not in title_body,
+    )
+
+    g1_card = item(
+        title="A ref-free card title",
+        automerge_criteria=[
+            {
+                "id": "g1_card_identity",
+                "status": "met",
+                "evidence": "trusted unique machine-created card #123",
+            }
+        ],
+    )
+    g1_body = rc.render(g1_card, owner="kunchenguid")["body"]
+    check(
+        "render-v13: G1 Wheelhouse self-reference stays bare",
+        "trusted unique machine-created card #123" in g1_body
+        and "kunchenguid/lavish-axi#123" not in g1_body,
+    )
+
+    controls = item(
+        repo="firstmate",
+        title="See kunchenguid/other#7 and `#8` in the target, with no extra ref",
+        warning="Already qualified kunchenguid/other#9; code `#10`; no ref here.",
+    )
+    controls_body = rc.render(controls, owner="kunchenguid")["body"]
+    check(
+        "render-v13: already-qualified and code-span refs stay stable",
+        "See kunchenguid/other#7" in controls_body
+        and "`#8`" in controls_body
+        and "kunchenguid/other#9" in controls_body
+        and "`#10`" in controls_body,
+    )
+    ref_free = item(repo="firstmate", title="A ref-free card title", warning="No refs here.")
+    ref_free_body = rc.render(ref_free, owner="kunchenguid")["body"]
+    check(
+        "render-v13: ref-free surface stays unchanged",
+        "A ref-free card title" in ref_free_body and "> No refs here." in ref_free_body,
+    )
+    check(
+        "render-v13: second render is idempotent",
+        rc.render(controls, owner="kunchenguid") == rc.render(controls, owner="kunchenguid"),
+    )
+
+    stale_state = core.parse_state_block(warning_body)
+    stale_state["render_version"] = rc.CARD_RENDER_VERSION - 1
+    check(
+        "render-v15: version-behind cards enter the established migration path",
+        rc.CARD_RENDER_VERSION == 17
+        and rc.render_stale(stale_state)
+        and rc.refresh_needed(warning_card, stale_state, ["needs-decision"]),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # state block now carries the material fields and round-trips
 # --------------------------------------------------------------------------- #
@@ -220,6 +323,175 @@ def test_non_material_change_is_not_a_trigger():
     check(
         "activity_reflected_at not in MATERIAL_FIELDS",
         "activity_reflected_at" not in rc.MATERIAL_FIELDS,
+    )
+
+
+def test_merge_state_display_refresh_is_non_material():
+    conflicting = item(mergeable="CONFLICTING")
+    state = state_of(conflicting)
+    ready = item(mergeable="MERGEABLE")
+    check(
+        "merge state: fresh display cache is stable",
+        state.get(rc.MERGE_STATE_DISPLAY_FIELD) == "conflicting"
+        and not rc.merge_state_display_stale(conflicting, state),
+    )
+    check(
+        "merge state: same-head transition triggers display refresh",
+        rc.merge_state_display_stale(ready, state)
+        and rc.refresh_needed(ready, state, labels=["needs-decision"]),
+    )
+    check(
+        "merge state: display transition is not material routing state",
+        not rc.material_changed(ready, state)
+        and rc.MERGE_STATE_DISPLAY_FIELD not in rc.MATERIAL_FIELDS,
+    )
+    check(
+        "merge state: refreshed card shows current informational state",
+        "- Merge state: `mergeable` (informational)" in rc.render(ready)["body"],
+    )
+
+
+def test_exact_title_drift_and_long_title_truncation():
+    current = item(title="Withdrawn by author")
+    check(
+        "F3: exact same-revision title drift triggers every card kind",
+        all(
+            rc.title_stale(
+                item(kind=kind, title="Withdrawn by author"),
+                "[lavish-axi#42] Add a thing",
+            )
+            for kind in ("pr-review", "issue-triage", "ci-approval")
+        ),
+    )
+    long_item = item(title="x" * 200)
+    check(
+        "F5: identical long titles use renderer truncation and do not drift",
+        not rc.title_stale(long_item, rc.render(long_item)["title"]),
+    )
+    check(
+        "title drift: missing source or card title data is a safe no-op",
+        not rc.title_stale(item(title=None), rc.render(item())["title"])
+        and not rc.title_stale(current, None),
+    )
+
+
+def test_issue_updated_at_trigger_is_strict_and_kind_scoped():
+    old = item(
+        kind="issue-triage",
+        head_sha="",
+        updated_at="2026-07-15T14:05:50Z",
+    )
+    state = state_of(old)
+    check(
+        "F4: strictly newer valid issue updated_at triggers full refresh",
+        rc.issue_updated_at_stale(
+            item(
+                kind="issue-triage",
+                head_sha="",
+                updated_at="2026-07-15T14:07:59Z",
+            ),
+            state,
+        ),
+    )
+    guarded = all(
+        not rc.issue_updated_at_stale(
+            item(kind="issue-triage", head_sha="", updated_at=value), state
+        )
+        for value in (
+            "2026-07-15T14:05:50Z",
+            "2026-07-15T14:00:00Z",
+            "",
+            "malformed",
+        )
+    )
+    check("issue updated_at: equal, older, missing, malformed are no-ops", guarded)
+    check(
+        "issue updated_at: unchanged-head PR activity never triggers full refresh",
+        not rc.issue_updated_at_stale(
+            item(updated_at="2026-07-15T14:07:59Z"), state_of(item())
+        ),
+    )
+
+
+def test_title_only_refresh_preserves_advisory_without_spend_or_comment():
+    old = item(
+        kind="issue-triage",
+        head_sha="",
+        bucket="issue-triage",
+        comp="n/a",
+        tests="n/a",
+        url="https://github.com/o/lavish-axi/issues/42",
+    )
+    triaged = rc.body_with_triage_result(
+        rc.body_with_triage_queued(rc.render(old)["body"], old),
+        old["updated_at"],
+        triage={
+            "summary": "Trusted current advisory.",
+            "product_implications": "No product risk.",
+            "evidence": "target.txt: exact evidence",
+            "recommended_next_step": "merge - still current.",
+        },
+    )
+    current = dict(old, title="Withdrawn by author")
+    existing = {
+        "number": 7,
+        "title": rc.render(old)["title"],
+        "body": triaged,
+        "labels": labels(
+            "needs-decision",
+            "repo:lavish-axi",
+            "kind:pr-review",
+            "priority:med",
+            "target:lavish-axi-42",
+        ),
+        "state": "OPEN",
+    }
+    calls = {"commands": [], "body": ""}
+    old_write = rc._write_body
+    old_gh = rc._gh
+    old_unlink = rc.os.unlink
+    old_get_card = rc.get_card
+    old_ensure = rc.ensure_labels
+    rc._write_body = lambda body: calls.update(body=body) or "/tmp/title-refresh"
+    rc._gh = lambda args, check=True: calls["commands"].append(args)
+    rc.os.unlink = lambda _path: None
+    rc.get_card = lambda _number: existing
+    rc.ensure_labels = lambda _labels: None
+    try:
+        rc.upsert_card(current, existing=existing)
+    finally:
+        rc._write_body = old_write
+        rc._gh = old_gh
+        rc.os.unlink = old_unlink
+        rc.get_card = old_get_card
+        rc.ensure_labels = old_ensure
+    state = core.parse_state_block(calls["body"])
+    edits = [
+        command
+        for command in calls["commands"]
+        if command[:2] == ["issue", "edit"]
+    ]
+    check(
+        "F3: title-only refresh performs one complete deterministic edit",
+        len(edits) == 1
+        and edits[0][edits[0].index("--title") + 1] == rc.render(current)["title"],
+    )
+    check(
+        "F3: title-only refresh preserves every current advisory cache",
+        "Trusted current advisory." in calls["body"]
+        and state.get("triaged_sha") == old["updated_at"]
+        and state.get("triage_status") == "succeeded"
+        and state.get(rc.TRIAGE_ATTEMPTS_FIELD)
+        == core.parse_state_block(triaged).get(rc.TRIAGE_ATTEMPTS_FIELD),
+    )
+    check(
+        "F3: title-only refresh posts no target-updated comment or dispatch",
+        not any(
+            command[:2] == ["issue", "comment"] for command in calls["commands"]
+        )
+        and not any(
+            command[:2] == ["workflow", "run"] for command in calls["commands"]
+        ),
     )
 
 
@@ -435,7 +707,14 @@ def test_upsert_refreshes_once_on_render_version_alone():
     unchanged material state refreshes exactly once, then no-ops (self-
     terminating), and does NOT emit the 'Target updated' comment since
     head_sha is unchanged."""
-    it = item()
+    it = item(
+        kind="issue-triage",
+        head_sha="",
+        bucket="issue-triage",
+        comp="n/a",
+        tests="n/a",
+        url="https://github.com/o/lavish-axi/issues/42",
+    )
     fresh_body = rc.render(it)["body"]
     stale_state = core.parse_state_block(fresh_body)
     stale_state["render_version"] = 0
@@ -521,10 +800,13 @@ def test_render_version_refresh_preserves_triage_section():
     """A render-version-only refresh is a same-head_sha cosmetic refresh, so it
     must preserve an existing ### Triage section and its triaged_sha/status
     cache exactly like a material same-head refresh does."""
-    it = item()
+    it = item(
+        kind="issue-triage", head_sha="", bucket="issue-triage",
+        comp="n/a", tests="n/a", url="https://github.com/o/lavish-axi/issues/42"
+    )
     triaged = rc.body_with_triage_result(
         rc.body_with_triage_queued(rc.render(it)["body"], it),
-        it["head_sha"],
+        it["updated_at"],
         triage={
             "summary": "Still useful context.",
             "product_implications": "No product risk.",
@@ -583,7 +865,7 @@ def test_render_version_refresh_preserves_triage_section():
     )
     check(
         "render-version refresh: triaged_sha preserved",
-        new_state is not None and new_state.get("triaged_sha") == it["head_sha"],
+        new_state is not None and new_state.get("triaged_sha") == it["updated_at"],
     )
     check(
         "render-version refresh: no 'Target updated' comment", calls["comments"] == []
@@ -591,10 +873,13 @@ def test_render_version_refresh_preserves_triage_section():
 
 
 def test_render_version_refresh_labels_preserved_triage_status_lines():
-    it = item()
+    it = item(
+        kind="issue-triage", head_sha="", bucket="issue-triage",
+        comp="n/a", tests="n/a", url="https://github.com/o/lavish-axi/issues/42"
+    )
     triaged = rc.body_with_triage_result(
         rc.body_with_triage_queued(rc.render(it)["body"], it),
-        it["head_sha"],
+        it["updated_at"],
         triage={
             "summary": "Waited for background terminal 60s.",
             "product_implications": "No product risk.",
@@ -675,10 +960,13 @@ def test_render_version_refresh_qualifies_stale_triage_refs():
     refresh must re-qualify its bare `#N` refs and stamp the current
     render_version, both from GITHUB_REPOSITORY_OWNER + the card's own
     deterministic state repo - never from the model text."""
-    it = item()
+    it = item(
+        kind="issue-triage", head_sha="", bucket="issue-triage",
+        comp="n/a", tests="n/a", url="https://github.com/o/lavish-axi/issues/42"
+    )
     triaged = rc.body_with_triage_result(
         rc.body_with_triage_queued(rc.render(it)["body"], it),
-        it["head_sha"],
+        it["updated_at"],
         triage={
             "summary": "Landed in #127 already.",
             "product_implications": "No product risk.",
@@ -753,7 +1041,7 @@ def test_render_version_refresh_qualifies_stale_triage_refs():
     )
     check(
         "render-version refresh: triaged_sha still preserved",
-        new_state is not None and new_state.get("triaged_sha") == it["head_sha"],
+        new_state is not None and new_state.get("triaged_sha") == it["updated_at"],
     )
 
 
@@ -1043,9 +1331,14 @@ def test_upsert_refetches_known_card_before_refresh():
 
 def test_upsert_parses_state_block_after_refetch():
     calls = {"refresh": 0, "old_state": None, "card_state": None}
+    old_item = item(
+        kind="issue-triage", head_sha="", bucket="issue-triage",
+        comp="n/a", tests="n/a", url="https://github.com/o/lavish-axi/issues/42"
+    )
+    changed_item = dict(old_item, priority="high")
     existing = {
         "number": 7,
-        "body": rc.render(item())["body"],
+        "body": rc.render(old_item)["body"],
         "labels": labels(
             "needs-decision",
             "repo:lavish-axi",
@@ -1082,7 +1375,7 @@ def test_upsert_parses_state_block_after_refetch():
     rc._refresh_card = fake_refresh
     rc.ensure_labels = lambda labels_: None
     try:
-        result = rc.upsert_card(item(priority="high"), existing=existing)
+        result = rc.upsert_card(changed_item, existing=existing)
     finally:
         rc.get_card = old_get_card
         rc._refresh_card = old_refresh
@@ -1100,7 +1393,7 @@ def test_upsert_parses_state_block_after_refetch():
     check(
         "upsert: material refresh carries activity_reflected_at",
         calls["card_state"].get("activity_reflected_at")
-        == item(priority="high")["updated_at"],
+        == changed_item["updated_at"],
     )
 
 
@@ -1333,7 +1626,7 @@ def test_plan_label_update_noop_when_identical():
 
 
 # --------------------------------------------------------------------------- #
-# reconcile soft-close hysteresis is hidden, bounded, and non-material
+# reconcile soft-close hysteresis is visible, inert, bounded, and non-material
 # --------------------------------------------------------------------------- #
 def test_reconcile_absence_schema_is_bounded_and_non_material():
     it = item()
@@ -1344,7 +1637,15 @@ def test_reconcile_absence_schema_is_bounded_and_non_material():
         "absence: exact first-pass record round-trips",
         rc.reconcile_absence_count(first) == 1
         and first_state.get(rc.RECONCILE_ABSENCE_FIELD)
-        == {"version": 2, "threshold": 2, "count": 1, "run_number": 41},
+        == {"version": 3, "threshold": 2, "count": 1, "scheduled_epoch": 41},
+    )
+    check(
+        "absence: first pass is visible and inert",
+        "### Target state changed" in first
+        and "Confirmation: `1/2` scheduled observations" in first
+        and "<!-- opt:" not in first
+        and "Decision controls are disabled until the scheduled confirmation completes."
+        in first,
     )
     check(
         "absence: field is outside material semantics",
@@ -1399,7 +1700,9 @@ def test_required_present_writes_fold_absence_reset():
         "absence: activity write folds reset",
         reflected != body
         and reflected_state.get("activity_reflected_at") == it["updated_at"]
-        and rc.RECONCILE_ABSENCE_FIELD not in reflected_state,
+        and rc.RECONCILE_ABSENCE_FIELD not in reflected_state
+        and "### Target state changed" not in reflected
+        and "<!-- opt:" in reflected,
     )
 
     queued_source = rc.body_with_reconcile_absence(
@@ -1411,7 +1714,9 @@ def test_required_present_writes_fold_absence_reset():
         "absence: triage queued write folds reset",
         queued != queued_source
         and queued_state.get("triage_status") == "queued"
-        and rc.RECONCILE_ABSENCE_FIELD not in queued_state,
+        and rc.RECONCILE_ABSENCE_FIELD not in queued_state
+        and "### Target state changed" not in queued
+        and "<!-- opt:" in queued,
     )
     check(
         "absence: fresh full render never inherits lifecycle state",
@@ -1421,6 +1726,7 @@ def test_required_present_writes_fold_absence_reset():
 
 def main():
     test_render_shows_author_without_mention()
+    test_render_qualifies_only_target_derived_deterministic_surfaces()
     test_state_block_carries_material_fields()
     test_material_changed_round_trip_is_noop()
     test_each_material_field_triggers_a_change()
@@ -1428,6 +1734,10 @@ def main():
     test_render_preserves_options_order_in_state_block()
     test_render_filters_non_checkbox_custom_options()
     test_non_material_change_is_not_a_trigger()
+    test_merge_state_display_refresh_is_non_material()
+    test_exact_title_drift_and_long_title_truncation()
+    test_issue_updated_at_trigger_is_strict_and_kind_scoped()
+    test_title_only_refresh_preserves_advisory_without_spend_or_comment()
     test_legacy_card_missing_new_fields_refreshes_once()
     test_legacy_triage_marker_still_parses_for_change_check()
     test_change_check_handles_missing_state()

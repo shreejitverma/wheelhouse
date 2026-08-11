@@ -12,8 +12,8 @@ name: scan-backstop
 # close cards whose target is merged/closed, plus pure pending cards whose open
 # target no longer needs a maintainer decision in two adjacent conclusive
 # scheduled runs - including owner/maintainer/bot-authored targets that the scan author
-# filter leaves out and conflicted PR-review targets that moved to needs-rebase -
-# so the queue reflects current state and self-heals. The ingest event path still
+# filter leaves out - so the queue reflects current state and self-heals. Conflicted
+# PR-review targets remain captain-visible. The ingest event path still
 # upserts on dispatch, but the hourly reconcile is what keeps cards fresh;
 # running it hourly is safe because reconcile writes only when a material,
 # render-version, held-publish, activity-stamp, or auto-triage-cache trigger
@@ -24,6 +24,32 @@ on:
   schedule:
     - cron: "17 * * * *" # hourly, best-effort
   workflow_dispatch:
+    inputs:
+      replay_wave:
+        description: "Operator replay wave slug (empty keeps replay inert)"
+        required: false
+        default: ""
+      replay_limit:
+        description: "Maximum cards in this reviewable replay wave (1..25)"
+        required: false
+        default: "25"
+      replay_dry_run:
+        description: "Plan the exact-number replay wave without writes"
+        required: false
+        type: boolean
+        default: true
+      replay_exact_cards:
+        description: "Exact selector v1:N,N (max 25; count equals replay_limit; non-empty is replay-only)"
+        required: false
+        default: ""
+      replay_attempts_reset_cards:
+        description: "One-time sanctioned comma-separated cohort cards (empty disables reset)"
+        required: false
+        default: ""
+      replay_backfill_policy:
+        description: "Checked-in triage-logic recovery policy (requires exact selector)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -53,6 +79,7 @@ jobs:
       # optional, read-only CI security-summary cache; an unreadable list falls
       # back to an empty cache so the fleet scan still runs and re-analyzes.
       - name: List open cards
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -68,24 +95,54 @@ jobs:
             mv cards.json.tmp cards.json
           fi
 
-      # Cross-repo scan reads fleet state, may approve provably-safe fork-CI
-      # runs, may post rebase nudges, and may remind or close stale
-      # pending-contributor PRs, so this step requires FLEET_TOKEN with Actions
-      # write scope.
+      # Cross-repo scan reads fleet state, may approve provably-safe fork-CI,
+      # and may remind or close only explicit request-changes follow-ups, so this
+      # step requires FLEET_TOKEN with Actions write scope.
       - name: Scan the fleet
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: python scripts/wheelhouse_core.py scan --cards cards.json > scan.json
 
+      # Deterministically notify source branches that cannot meet the fork
+      # contribution requirement before any CI approval, model work, normal
+      # classification action, or target close. This first FLEET_TOKEN phase
+      # posts only a head-bound policy notice, then attaches its comment ID to
+      # the scan item for the default-token audit-card writer below.
+      - name: Post maintainer-edits policy notices
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          python scripts/maintainer_edits_policy.py prepare scan.json policy-notices.json
+          python scripts/maintainer_edits_policy.py notify policy-notices.json policy-notice-results.json
+          python scripts/maintainer_edits_policy.py attach-notices scan.json policy-notice-results.json scan.json
+
+      # Complete read-only G0-G6 runs under the fleet read token before any
+      # action-lock label can reorder a card. Denied or unavailable candidates
+      # produce content-free telemetry with card_writes=0.
+      - name: Evaluate auto-merge candidates before claim
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        run: python scripts/auto_merge.py preclaim scan.json cards.json
+
+      # Action locks stay card-local and use only the default token. This step
+      # can claim only an exact read-only preclaim passer.
       - name: Claim auto-merge decision cards
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
-        run: python scripts/auto_merge.py claim scan.json cards.json
+        run: python scripts/auto_merge.py claim scan.json cards.json automerge-preclaims.json
 
       - name: Validate auto-merge decision cards
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -100,6 +157,7 @@ jobs:
       # manual-merge hold; the resolved decision record and ledger stay in the
       # default-token "Record auto-merges" step below.
       - name: Auto-merge eligible PRs
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
           WHEELHOUSE_CARD_TOKEN: ${{ github.token }}
@@ -111,22 +169,96 @@ jobs:
       # default-token verification/retry of any manual-merge hold before claim
       # release. This is THIS repo's bookkeeping, never FLEET_TOKEN.
       - name: Record auto-merges
-        if: always()
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: python scripts/auto_merge.py record automerge.json automerge-valid-claims.json
 
-      # Reconcile (create, trusted reuse, refresh, activity-reflect, close) in THIS repo -
-      # default token, so backstop activity never re-triggers the handler.
+      # Reconcile card writes (create, trusted reuse, refresh, activity-reflect,
+      # close) use THIS repo's default token, so they never re-trigger the handler.
+      # It writes the source-bound audit card after the FLEET_TOKEN policy notice,
+      # then emits a number-bound handoff for the target-close transaction.
+      # Existing CI-wait refresh candidates temporarily use WHEELHOUSE_FLEET_TOKEN
+      # for one exact, complete target read, then restore the default token before
+      # any card mutation.
       - name: Reconcile the queue
-        if: always()
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          WHEELHOUSE_POLICY_ACTIONS_FILE: policy-actions.json
+        run: python scripts/reconcile.py scan.json cards.json automerge.json
+
+      # This exact FLEET_TOKEN reread happens after the audit card exists and
+      # immediately before the target close. It never receives an assisted-merge
+      # push credential.
+      - name: Close verified maintainer-edits policy targets
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/maintainer_edits_policy.py close policy-actions.json policy-close-results.json
+
+      # Atomically persist the target comment and close result in the card state
+      # while closing the audit card. Card writes stay default-token.
+      - name: Record maintainer-edits policy outcomes
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/maintainer_edits_policy.py record policy-close-results.json
+
+      # Phase 3 replay is deliberately operator-only and inert by default.
+      # Scheduled runs can never reach this step, and workflow_dispatch keeps
+      # replay_wave empty unless the owner explicitly names a reviewed wave.
+      # Any raw non-empty replay_exact_cards or replay_backfill_policy input,
+      # plus the one sanctioned card-1585 incident wave even if its selector is
+      # malformed, enters replay-only posture before validation: every ordinary
+      # maintenance step above and scan-health
+      # below is skipped, while malformed or incomplete input reaches this owner
+      # and fails closed instead of falling through to maintenance. Candidate rows
+      # contribute issue numbers only; the script re-reads every card and target
+      # by exact number before any state-only marker write. The optional v1 exact
+      # selector bypasses generic prefix discovery but not admission,
+      # exact-revision, budget, permit, or idempotency checks.
+      # Replay then re-enters reconcile.maybe_queue_auto_triage so
+      # queue-before-dispatch and both spend guards stay authoritative.
+      - name: Replay one bounded auto-triage wave
+        if: github.event_name == 'workflow_dispatch' && (inputs.replay_wave != '' || inputs.replay_exact_cards != '' || inputs.replay_backfill_policy != '')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
-        run: python scripts/reconcile.py scan.json cards.json automerge.json
+          WHEELHOUSE_AUTO_TRIAGE_HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
+          REPLAY_WAVE: ${{ inputs.replay_wave }}
+          REPLAY_LIMIT: ${{ inputs.replay_limit }}
+          REPLAY_DRY_RUN: ${{ inputs.replay_dry_run }}
+          REPLAY_EXACT_CARDS: ${{ inputs.replay_exact_cards }}
+          REPLAY_ATTEMPTS_RESET_CARDS: ${{ inputs.replay_attempts_reset_cards }}
+          REPLAY_BACKFILL_POLICY: ${{ inputs.replay_backfill_policy }}
+        run: |
+          args=(cards.json --wave "$REPLAY_WAVE" --limit "$REPLAY_LIMIT")
+          if [ "$REPLAY_DRY_RUN" = "true" ]; then
+            args+=(--dry-run)
+          fi
+          if [ -n "$REPLAY_EXACT_CARDS" ]; then
+            args+=(--exact-cards "$REPLAY_EXACT_CARDS")
+          fi
+          if [ -n "$REPLAY_ATTEMPTS_RESET_CARDS" ]; then
+            args+=(--attempts-reset-cards "$REPLAY_ATTEMPTS_RESET_CARDS")
+          fi
+          if [ -n "$REPLAY_BACKFILL_POLICY" ]; then
+            args+=(--backfill-policy "$REPLAY_BACKFILL_POLICY")
+          fi
+          python scripts/triage_replay.py "${args[@]}"
 
       # Track per-repo consecutive scan failures in a dedicated (closed) ledger
       # issue in THIS repo, and fail the run loudly if a fleet repo has been dark
@@ -136,7 +268,7 @@ jobs:
       # last and `always()` so it never skips reconcile and fails open on its own
       # I/O errors.
       - name: Check fleet-scan health
-        if: always()
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.replay_exact_cards != '' || inputs.replay_wave == 'card-1585-anchor-fix-r3-final' || inputs.replay_backfill_policy != '')) && !(github.event_name == 'workflow_dispatch' && inputs.replay_wave != '' && inputs.replay_dry_run) }}
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}

@@ -32,6 +32,7 @@ from .contract import (
     result_projection_sha256,
 )
 from .events import EventWriter
+from .output_validation import evidence_anchor_ok
 from .redaction import contains_secret, sanitize_message
 from .sandbox import SandboxError, build_command, host_proof
 
@@ -54,7 +55,7 @@ FALLBACK_ELIGIBLE = {
     "transport.connection",
     "transport.stream_interrupted",
 }
-RETRYABLE = FALLBACK_ELIGIBLE
+RETRYABLE = FALLBACK_ELIGIBLE | {"source.revision_mismatch"}
 
 
 def _now() -> str:
@@ -153,7 +154,15 @@ def _materialize_fake_work(task: dict[str, Any], bundle: Path) -> None:
 
 def _adapter_digest(adapter_id: str) -> str:
     root = Path(__file__).resolve().parent
-    files = [root / "adapters" / "base.py", root / "adapters" / ("codex.py" if adapter_id == "codex-app-server" else "fake.py"), root / "worker.py"]
+    adapter_files = {
+        "claude-cli": "claude.py",
+        "codex-app-server": "codex.py",
+        "fake": "fake.py",
+    }
+    name = adapter_files.get(adapter_id)
+    if name is None:
+        return canonical_sha256({"adapter": adapter_id, "status": "not-allowlisted"})
+    files = [root / "adapters" / "base.py", root / "adapters" / name, root / "worker.py"]
     return canonical_sha256({path.name: file_sha256(path) for path in files})
 
 
@@ -162,6 +171,7 @@ def _selection(task: dict[str, Any], probe: Any, worker: dict[str, Any] | None =
     descriptor = probe.descriptor.value
     worker = worker or {}
     return {
+        "profile": task["spec"]["selection"]["profile"],
         "candidateIndex": 0,
         "harness": candidate["harness"],
         "adapter": candidate["adapter"],
@@ -170,7 +180,7 @@ def _selection(task: dict[str, Any], probe: Any, worker: dict[str, Any] | None =
         "harnessVersion": descriptor["harnessVersion"],
         "harnessDigest": descriptor["harnessDigest"],
         "harnessProvenanceQuality": "test-fixture" if candidate["adapter"] == "fake" else "verified-executable",
-        "harnessSourceCommit": None,
+        "harnessSourceCommit": probe.supplemental.get("sourceCommit"),
         "harnessMetadataSha256": None,
         "protocol": descriptor["protocol"],
         "protocolSchemaSha256": descriptor["protocolSchemaSha256"],
@@ -235,7 +245,13 @@ def _usage(worker: dict[str, Any], duration_ms: int) -> dict[str, Any]:
 def _proof(task: dict[str, Any], descriptor: dict[str, Any], negotiation: dict[str, Any], host: dict[str, Any]) -> dict[str, Any]:
     return {
         "contractMajor": 1,
+        "executionProfile": task["spec"]["selection"]["profile"],
         "isolationLevel": "sandboxed-adapter-worker-v1",
+        "sandboxImplementation": host["implementation"],
+        "credentialIsolation": "mode-0600-readonly-file+claude-child-env"
+        if task["spec"]["selection"]["candidates"][0]["adapter"] == "claude-cli"
+        else "mode-0600-readonly-file+adapter-child-binding",
+        "structuredOutputMechanism": negotiation["structuredOutputMechanism"],
         "capabilitySnapshotSha256": canonical_sha256(descriptor),
         "negotiationSha256": canonical_sha256(negotiation),
         "policySha256": canonical_sha256({"isolation": task["spec"]["isolation"], "limits": task["spec"]["limits"], "retention": task["spec"]["retention"], "retry": task["spec"]["retry"]}),
@@ -291,10 +307,30 @@ def _read_worker_events(path: Path, events: EventWriter) -> None:
         warn("adapter-events-unavailable", "Adapter event diagnostics were unavailable.")
 
 
+def _restore_direct_output_access(output_dir: Path) -> None:
+    """Return expected root-mapped direct-worker output to the runner safely."""
+
+    owner = "%d:%d" % (os.getuid(), os.getgid())
+    for name in ("worker-state.json", "worker-result.json", "adapter-events.ndjson"):
+        path = output_dir / name
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(mode):
+            continue
+        subprocess.run(
+            ["sudo", "--non-interactive", "chown", "--no-dereference", owner, "--", str(path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def _anchor_ok(value: Any, task: dict[str, Any], bundle: Path) -> bool:
     if task["spec"]["output"]["evidencePolicy"] != "target-anchor/v1":
         return True
-    if not isinstance(value, dict) or not isinstance(value.get("evidence"), str):
+    if not isinstance(value, dict):
         return False
     target = next((row for row in task["spec"]["inputs"] if row["id"] == "target"), None)
     if not target:
@@ -303,16 +339,15 @@ def _anchor_ok(value: Any, task: dict[str, Any], bundle: Path) -> bool:
         text = (bundle / target["artifact"]).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    import re
-    normalized = re.sub(r"\s+", " ", text).strip().lower()
-    for quote in re.findall(r'"([^"\n]{1,240})"', value["evidence"]):
-        needle = re.sub(r"\s+", " ", quote).strip().lower()
-        if len(needle) >= 12 and needle in normalized:
-            return True
-    return False
+    return evidence_anchor_ok(value.get("evidence"), text)
 
 
-def _validate_worker(task: dict[str, Any], bundle: Path, worker: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
+def _validate_worker(
+    task: dict[str, Any],
+    bundle: Path,
+    worker: dict[str, Any],
+    structured_output_mechanism: str = "",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     candidate = task["spec"]["selection"]["candidates"][0]
     delivered_value = worker.get("final") if "final" in worker else worker.get("delivered")
     delivered = None
@@ -349,6 +384,8 @@ def _validate_worker(task: dict[str, Any], bundle: Path, worker: dict[str, Any])
         return None, delivered, _error("model.mismatch", "Observed model or provider did not match the selected candidate.", spend_started=True)
     if worker.get("actualEffort") != candidate["effort"]:
         return None, delivered, _error("effort.mismatch", "Observed effort did not match the selected candidate.", spend_started=True)
+    if candidate["adapter"] == "claude-cli" and structured_output_mechanism != "native-schema":
+        return None, delivered, _error("output.schema_invalid", "Direct Claude output was not negotiated as native structured output.", spend_started=True)
     if delivered is None:
         return None, None, _error("output.missing", "Adapter completed without a bounded final result.", spend_started=True)
     schema = load_json_regular(bundle / task["spec"]["output"]["schemaArtifact"], max_bytes=65536)
@@ -364,6 +401,7 @@ def _validate_worker(task: dict[str, Any], bundle: Path, worker: dict[str, Any])
         "valueSha256": delivered["valueSha256"],
         "bytes": delivered["bytes"],
         "validation": [
+            *([{"name": "native-schema", "status": "passed"}] if candidate["adapter"] == "claude-cli" else []),
             {"name": "json-schema", "status": "passed"},
             {"name": task["spec"]["output"]["evidencePolicy"], "status": "passed" if task["spec"]["output"]["evidencePolicy"] != "none" else "not-applicable"},
             {"name": "observed-provenance", "status": "passed"},
@@ -419,7 +457,16 @@ def _run(task_path: str, bundle_dir: str, result_path: str, events_path: str, re
         raise RuntimeFailure("selection.no_candidate", "selecting", "Selected adapter is not in the trusted allowlist.")
     adapter = adapter_class()
     host = host_proof(adapter.id)
-    probe = adapter.probe(task)
+    if not host.get("testOnly"):
+        # The root-launched Bubblewrap worker is mapped to host root.  It needs
+        # to create its mode-0600 result files, but must not enumerate output.
+        output_dir.chmod(0o733)
+    schema_path = bundle / task["spec"]["output"]["schemaArtifact"]
+    try:
+        schema_bytes = schema_path.read_bytes()
+    except OSError as error:
+        raise RuntimeFailure("contract.invalid", "validating", "Bound output schema is unavailable.") from error
+    probe = adapter.probe(task, schema_bytes)
     negotiated = negotiate(task, probe.descriptor.value, host)
     plan = adapter.compile(task, negotiated.proof, probe)
     attempt_id = secrets.token_hex(16)
@@ -435,7 +482,7 @@ def _run(task_path: str, bundle_dir: str, result_path: str, events_path: str, re
     search_socket = ""
     broker_dir = Path(tempfile.mkdtemp(prefix="wha-"))
     try:
-        if adapter.id == "codex-app-server":
+        if adapter.id in ("claude-cli", "codex-app-server"):
             provider_socket = str(broker_dir / "provider.sock")
             provider_proxy = ProviderProxy(provider_socket, task["spec"]["isolation"]["modelNetwork"]["allowedHosts"])
             provider_proxy.start()
@@ -449,13 +496,15 @@ def _run(task_path: str, bundle_dir: str, result_path: str, events_path: str, re
             search_broker = SearchBroker(search_socket, task["metadata"]["target"]["owner"], task["metadata"]["target"]["repo"], token, wheelhouse_core.load_config())
             search_broker.start()
 
+        auth_source = probe.auth_source
+
         worker_command = adapter.worker_command(str(plan_path), str(output_dir))
         command, environment = build_command(
             task=task,
             bundle=str(bundle),
             plan_path=str(plan_path),
             output_dir=str(output_dir),
-            auth_source=probe.auth_source,
+            auth_source=auth_source,
             binary_path=probe.binary_path,
             provider_socket=provider_socket,
             search_socket=search_socket,
@@ -514,6 +563,8 @@ def _run(task_path: str, bundle_dir: str, result_path: str, events_path: str, re
                 signal.signal(signal.SIGTERM, old_term)
                 signal.signal(signal.SIGINT, old_int)
 
+            if not host.get("testOnly"):
+                _restore_direct_output_access(output_dir)
             worker_path = output_dir / "worker-result.json"
             state_path = output_dir / "worker-state.json"
             try:
@@ -534,7 +585,12 @@ def _run(task_path: str, bundle_dir: str, result_path: str, events_path: str, re
             worker = _merge_worker_checkpoint(worker_value, checkpoint)
             _read_worker_events(output_dir / "adapter-events.ndjson", events)
             try:
-                final, delivered, validation_error = _validate_worker(task, bundle, worker)
+                final, delivered, validation_error = _validate_worker(
+                    task,
+                    bundle,
+                    worker,
+                    negotiated.proof["structuredOutputMechanism"],
+                )
             except Exception:
                 final = None
                 delivered = None
@@ -594,7 +650,7 @@ def _preflight_code(error: Exception) -> tuple[str, str]:
         return "capability.unsatisfied", "probing"
     if isinstance(error, RuntimeFailure):
         return error.code, error.phase
-    if name == "CodexProbeError":
+    if name in ("ClaudeProbeError", "CodexProbeError"):
         if "missing" in lowered or "unavailable" in lowered or "not configured" in lowered:
             return "auth.missing", "probing"
         if "credential" in lowered or "auth" in lowered or "api-key" in lowered:
@@ -633,20 +689,25 @@ def _write_rejected(task_path: str, bundle_dir: str, result_path: str, events_pa
         phase = "running"
     started = recovery.get("startedAt") if spend_started and isinstance(recovery.get("startedAt"), str) else _now()
     adapter_id = candidate["adapter"]
-    if adapter_id == "codex-app-server":
+    if adapter_id in ("claude-cli", "codex-app-server"):
         lock_path = Path(__file__).resolve().parent / "runtime.lock.json"
         lock = load_json_regular(lock_path)
-        codex = lock["codex"]
-        harness_version = codex["binaryVersion"]
-        adapter_version = codex["adapterVersion"]
-        protocol = codex["protocol"]
-        protocol_digest = canonical_sha256(codex["protocolSchemas"])
+        if adapter_id == "claude-cli":
+            claude = lock["claude"]
+            adapter_version = claude["adapterVersion"]
+            protocol = claude["protocol"]
+            protocol_digest = claude["protocolFixtureSha256"]
+        else:
+            codex = lock["codex"]
+            adapter_version = codex["adapterVersion"]
+            protocol = codex["protocol"]
+            protocol_digest = canonical_sha256(codex["protocolSchemas"])
     else:
-        harness_version = "1.0.0"
         adapter_version = "1.0.0"
         protocol = "fake-script-v1"
         protocol_digest = canonical_sha256({"fake-script": 1})
     selection = {
+        "profile": task["spec"]["selection"]["profile"],
         "candidateIndex": 0,
         "harness": candidate["harness"],
         "adapter": adapter_id,
@@ -693,7 +754,11 @@ def _write_rejected(task_path: str, bundle_dir: str, result_path: str, events_pa
         "selection": selection,
         "proof": recovery["proof"] if spend_started else {
             "contractMajor": 1,
+            "executionProfile": task["spec"]["selection"]["profile"],
             "isolationLevel": "sandboxed-adapter-worker-v1",
+            "sandboxImplementation": "not-started",
+            "credentialIsolation": "not-materialized",
+            "structuredOutputMechanism": "unavailable-before-negotiation",
             "capabilitySnapshotSha256": canonical_sha256({"status": "unavailable", "code": code}),
             "negotiationSha256": canonical_sha256({"status": "failed-after-spend" if spend_started else "rejected-before-spend", "code": code}),
             "policySha256": canonical_sha256({"isolation": task["spec"]["isolation"], "limits": task["spec"]["limits"], "retention": task["spec"]["retention"], "retry": task["spec"]["retry"]}),
@@ -742,3 +807,174 @@ def run(task_path: str, bundle_dir: str, result_path: str, events_path: str) -> 
             return _write_rejected(task_path, bundle_dir, result_path, events_path, error, recovery)
         except Exception:
             raise error
+
+
+def _write_direct_failure_result(
+    task_path: str,
+    bundle_dir: str,
+    code: str,
+    result_path: str,
+    events_path: str,
+    *,
+    spend_started: bool,
+) -> dict[str, Any]:
+    task = load_json_regular(task_path, max_bytes=16 * 1024 * 1024)
+    validate_contract(task, "AgentTask")
+    _verify_artifacts(task, Path(bundle_dir).resolve())
+    candidate = task["spec"]["selection"]["candidates"][0]
+    allowed_codes = (
+        ("lifecycle.cancelled", "lifecycle.timeout", "harness.crash")
+        if spend_started
+        else ("harness.install_failed", "sandbox.violation")
+    )
+    if candidate["adapter"] != "claude-cli" or code not in allowed_codes:
+        raise ContractError("direct controller failure request is invalid")
+    lock = load_json_regular(Path(__file__).resolve().parent / "runtime.lock.json")
+    claude = lock["claude"]
+    selection = {
+        "profile": task["spec"]["selection"]["profile"],
+        "candidateIndex": 0,
+        "harness": candidate["harness"],
+        "adapter": candidate["adapter"],
+        "adapterVersion": claude["adapterVersion"],
+        "adapterDigest": _adapter_digest(candidate["adapter"]),
+        "harnessVersion": None,
+        "harnessDigest": None,
+        "harnessProvenanceQuality": "unavailable",
+        "harnessSourceCommit": None,
+        "harnessMetadataSha256": None,
+        "protocol": claude["protocol"],
+        "protocolSchemaSha256": claude["protocolFixtureSha256"],
+        "provider": candidate["provider"],
+        "actualProvider": "",
+        "authProfile": candidate["authProfile"],
+        "authMechanism": candidate["authMechanism"],
+        "expectedWorkspaceIdSha256": None,
+        "requestedModel": candidate["model"],
+        "actualModel": "",
+        "requestedEffort": candidate["effort"],
+        "actualEffort": "",
+        "costClass": candidate["costClass"],
+        "dataBoundary": candidate["dataBoundary"],
+        "fallbackUsed": False,
+        "fallbackReason": None,
+    }
+    pre_spend_failure = (
+        "bubblewrap-prerequisite-failed"
+        if code == "sandbox.violation"
+        else "direct-runtime-install-failed"
+    )
+    proof = {
+        "contractMajor": 1,
+        "executionProfile": task["spec"]["selection"]["profile"],
+        "isolationLevel": "sandboxed-adapter-worker-v1",
+        "sandboxImplementation": "unavailable-after-controller-failure" if spend_started else pre_spend_failure,
+        "credentialIsolation": "mode-0600-file-handoff-attempted" if spend_started else "not-materialized",
+        "structuredOutputMechanism": "unavailable-after-controller-failure" if spend_started else "unavailable-before-negotiation",
+        "capabilitySnapshotSha256": canonical_sha256(task["spec"]["capabilities"]),
+        "negotiationSha256": canonical_sha256({"status": "unavailable-after-controller-failure" if spend_started else "rejected-before-runtime-install", "code": code}),
+        "policySha256": canonical_sha256({name: task["spec"][name] for name in ("isolation", "limits", "retention", "retry")}),
+        "compiledPromptSha256": task["spec"]["prompt"]["segments"][0]["sha256"],
+        "inputManifestSha256": canonical_sha256(task["spec"]["inputs"]),
+        "outputSchemaSha256": task["spec"]["output"]["schemaSha256"],
+        "sandboxPolicySha256": canonical_sha256({"status": "unavailable-after-controller-failure" if spend_started else pre_spend_failure}),
+        "limitEnforcement": task["spec"]["limits"]["enforcement"],
+        "limitEnforcementSha256": canonical_sha256(task["spec"]["limits"]["enforcement"]),
+    }
+    result = {
+        "apiVersion": API_VERSION,
+        "kind": "AgentResult",
+        "executionId": task["metadata"]["executionId"],
+        "requestSha256": canonical_sha256(task),
+        "status": "cancelled" if code == "lifecycle.cancelled" else ("failed" if spend_started else "rejected"),
+        "selection": selection,
+        "proof": proof,
+        "error": _error(
+            code,
+            "Direct model execution ended after its conservative spend checkpoint without an atomic result."
+            if spend_started
+            else (
+                "Bubblewrap sandbox prerequisite failed before model execution started."
+                if code == "sandbox.violation"
+                else "Direct Claude runtime installation failed before model execution started."
+            ),
+            phase="cancelling" if code.startswith("lifecycle.") else ("running" if spend_started else "sandboxing"),
+            spend_started=spend_started,
+        ),
+        "usage": {
+            "inputTokens": None,
+            "outputTokens": None,
+            "cacheReadTokens": None,
+            "cacheWriteTokens": None,
+            "providerRequests": None if spend_started else 0,
+            "toolCalls": 0,
+            "turns": None if spend_started else 0,
+            "durationMs": None if spend_started else 0,
+            "quota": {"available": False, "snapshotSha256": None, "observedAt": None, "primaryUsedPercent": None, "secondaryUsedPercent": None},
+            "cost": {"amount": None, "currency": None, "quality": "unavailable"},
+        },
+        "artifacts": [],
+        "startedAt": _now(),
+        "completedAt": _now(),
+    }
+    with EventWriter(events_path, result["executionId"], task["spec"]["limits"]["maxEventBytes"]) as events:
+        events.emit("execution.accepted", {"requestSha256": result["requestSha256"]})
+        events.emit("selection.resolved", {"candidateIndex": 0, "adapter": candidate["adapter"], "harness": candidate["harness"], "provider": candidate["provider"], "model": candidate["model"], "effort": candidate["effort"], "fallback": "none"})
+        events.emit("validation.completed", {"status": "failed", "errorCode": code, "spendStarted": spend_started})
+        events.emit("execution.completed", {"status": result["status"], "resultSha256": result_projection_sha256(result), "projection": "agent-result-without-artifacts/v1"})
+    event_file = Path(events_path)
+    result["artifacts"].append({"role": "normalized-events", "sha256": file_sha256(event_file), "mediaType": "application/x-ndjson", "bytes": event_file.stat().st_size, "retentionDays": task["spec"]["retention"]["normalizedEventsDays"], "redaction": "wheelhouse-agent/v1"})
+    validate_contract(result, "AgentResult")
+    atomic_write_json(result_path, result)
+    return result
+
+
+def write_controller_failure_result(
+    task_path: str,
+    bundle_dir: str,
+    code: str,
+    result_path: str,
+    events_path: str,
+) -> dict[str, Any]:
+    """Persist a conservative direct-run failure after the spend checkpoint."""
+
+    return _write_direct_failure_result(
+        task_path,
+        bundle_dir,
+        code,
+        result_path,
+        events_path,
+        spend_started=True,
+    )
+
+
+def write_direct_install_failure_result(
+    task_path: str,
+    bundle_dir: str,
+    result_path: str,
+    events_path: str,
+) -> dict[str, Any]:
+    return _write_direct_failure_result(
+        task_path,
+        bundle_dir,
+        "harness.install_failed",
+        result_path,
+        events_path,
+        spend_started=False,
+    )
+
+
+def write_direct_sandbox_failure_result(
+    task_path: str,
+    bundle_dir: str,
+    result_path: str,
+    events_path: str,
+) -> dict[str, Any]:
+    return _write_direct_failure_result(
+        task_path,
+        bundle_dir,
+        "sandbox.violation",
+        result_path,
+        events_path,
+        spend_started=False,
+    )

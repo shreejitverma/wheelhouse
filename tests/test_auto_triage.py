@@ -7,6 +7,8 @@ held-card publish, and recovery behavior.
 Run: python tests/test_auto_triage.py
 """
 
+import base64
+import hashlib
 import io
 import json
 import os
@@ -21,12 +23,20 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import build_item  # noqa: E402
+import card_projection  # noqa: E402
 import reconcile  # noqa: E402
 import render_card as rc  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
+# This suite isolates triage lifecycle mechanics from cross-repo gate reads.
+# The atomic evaluator/write integration is covered end to end in
+# test_automerge_card_ui.py.
+rc._evaluate_automerge_card_projection = lambda *args, **kwargs: (
+    rc.criteria_schema.unavailable_criteria("offline triage lifecycle fixture")
+)
+
 CLAUDE_ACTION_PIN = (
-    "anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd"
+    "anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e"
 )
 _failures = []
 
@@ -94,6 +104,86 @@ def item(**overrides):
     }
     base.update(overrides)
     return base
+
+
+def option_b_item(**overrides):
+    value = item(**overrides)
+    head = value["head_sha"]
+    base_sha = str(value.get("base_sha") or "b" * 40)
+    value["base_sha"] = base_sha
+    value.setdefault("triage_vision_status", "absent")
+    value.setdefault("automerge_vision_sha", "")
+    observation = rc.target_contracts.make_observation(
+        "o",
+        value["repo"],
+        int(value["number"]),
+        head_sha=head,
+        base_sha=base_sha,
+        expected_head_sha=head,
+        observed_at="2026-07-23T12:00:00Z",
+        source="bulk-scan",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": value["title"],
+            "author": value["author"],
+            "updated_at": "2026-07-23T11:59:59Z",
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "fixture",
+            "mergeable": "MERGEABLE",
+            "ci": True,
+            "comp": value["comp"],
+            "tests": value["tests"],
+            "bucket": value["bucket"],
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "compliance", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=rc.target_contracts.changed_path_facts(
+            ["src/example.py"], complete=True
+        ),
+    )
+    snapshot = rc.context_contracts.repository_snapshot(
+        [
+            {
+                "owner": "o",
+                "repo": value["repo"],
+                "number": int(value["number"]),
+                "head_sha": head,
+                "title": value["title"],
+                "paths_complete": True,
+                "paths": ["src/example.py"],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": 0,
+                "url": value["url"],
+                "card_url": "",
+            }
+        ],
+        "2026-07-23T12:00:00Z",
+    )
+    value["target_observation"] = observation
+    value["decision_context"] = rc.context_contracts.build_decision_context(
+        observation, snapshot
+    )
+    return value
 
 
 def item_issue(**overrides):
@@ -197,10 +287,10 @@ def run_reconcile(scan, cards, current_cards=None, token="true"):
             {"number": number, "item": it, "body": body, "body_after": new_body}
         )
         current["body"] = new_body
-        return True
+        return {"number": number, "item": it}
 
-    def fake_dispatch(number, it):
-        calls["dispatch"].append({"number": number, "item": it})
+    def fake_dispatch(permit):
+        calls["dispatch"].append(permit)
 
     def fake_reflect(number, it, body, card_updated_at=""):
         new_body = rc.body_with_activity_reflected(
@@ -417,8 +507,12 @@ def test_render_triage_section_has_no_mentions_and_caches_sha():
         "render: triage strips @mentions", "@alice" not in body and "@bob" not in body
     )
     check(
-        "render: triage does not replace Recommended action",
-        "### Recommended action" in body,
+        "render: no deterministic recommendation section",
+        "### Recommended action" not in body,
+    )
+    check(
+        "render: advisory action is not presented as a recommendation",
+        "Recommended next step" not in body,
     )
     check(
         "state: triaged_sha caches the current head",
@@ -486,8 +580,9 @@ def test_structured_recommendation_persists_and_renders_accept():
         "<!-- opt:accept-recommendation -->" in body,
     )
     check(
-        "accept render: deterministic recommendation is suppressed",
-        "### Recommended action" not in body,
+        "accept render: canonical agent recommendation renders exactly once",
+        body.count("### Recommended action") == 1
+        and "- **Agent recommendation:** `decline`" in body,
     )
     check(
         "accept state: structured recommendation persisted",
@@ -526,8 +621,8 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
     )
     valid_body = rc.render(valid)["body"]
     check(
-        "accept conditional: pr merge rec renders accept",
-        "<!-- opt:accept-recommendation -->" in valid_body,
+        "accept conditional: legacy PR result without typed admission is withheld",
+        "<!-- opt:accept-recommendation -->" not in valid_body,
     )
 
     legacy = item(
@@ -544,8 +639,9 @@ def test_accept_checkbox_is_conditional_and_never_ci_approval():
         "<!-- opt:accept-recommendation -->" not in legacy_body,
     )
     check(
-        "accept conditional: legacy keeps deterministic recommendation",
-        "### Recommended action" in legacy_body,
+        "accept conditional: legacy markdown rec renders no recommendation",
+        "### Recommended action" not in legacy_body
+        and "Recommended next step" not in legacy_body,
     )
 
     invalid = item_issue(
@@ -755,8 +851,30 @@ def test_triage_requires_evidence_field():
     check("evidence: missing evidence rejected", rc.normalize_triage(missing) is None)
     blank = dict(complete, evidence="   ")
     check("evidence: blank evidence rejected", rc.normalize_triage(blank) is None)
-    nonstr = dict(complete, evidence=["target.txt: quote"])
-    check("evidence: non-string evidence rejected", rc.normalize_triage(nonstr) is None)
+    evidence_list = dict(
+        complete,
+        evidence=[
+            'target.txt: "def grok(): ..."',
+            'target-src/grok.py: "return model.run()"',
+        ],
+    )
+    check(
+        "evidence: a non-empty list of non-empty strings is accepted",
+        rc.normalize_triage(evidence_list) is not None,
+    )
+    check(
+        "evidence: an empty list is rejected",
+        rc.normalize_triage(dict(complete, evidence=[])) is None,
+    )
+    check(
+        "evidence: a list containing an empty item is rejected",
+        rc.normalize_triage(dict(complete, evidence=["target.txt: quote", " "]))
+        is None,
+    )
+    check(
+        "evidence: a list containing a non-string item is rejected",
+        rc.normalize_triage(dict(complete, evidence=["target.txt: quote", 3])) is None,
+    )
     check(
         "evidence: parse_triage_json rejects a complete-but-evidence-less result",
         rc.parse_triage_json(
@@ -794,10 +912,38 @@ def test_evidence_anchor_ok_catches_fabrication():
         "anchor: whitespace/case differences still verify",
         rc.evidence_anchor_ok('target.txt: "DEF   grok_request(prompt):"', target),
     )
+    check(
+        "anchor: single-quoted list evidence verifies after markdown cleanup",
+        rc.evidence_anchor_ok(
+            [
+                "target.txt: 'def `grok_request`(prompt):'",
+                "target-src/grok.py: 'unrelated source-only quote'",
+            ],
+            target,
+        ),
+    )
+    check(
+        "anchor: fallback path segment verifies after ellipsis splitting",
+        rc.evidence_anchor_ok(
+            "target.txt: context omitted ... return call_model('grok', prompt)",
+            target,
+        ),
+    )
     fabricated = 'target.txt: "def totally_made_up_symbol(xyz):" was added here'
     check(
         "anchor: a fabricated quote is rejected",
         rc.evidence_anchor_ok(fabricated, target) is False,
+    )
+    check(
+        "anchor: a fabricated evidence list is rejected",
+        rc.evidence_anchor_ok(
+            [
+                "target.txt: 'def totally_made_up_symbol(xyz):'",
+                "target-src/fake.py: invented content that is not in the target",
+            ],
+            target,
+        )
+        is False,
     )
     check(
         "anchor: evidence with no quoted spans is rejected",
@@ -820,6 +966,262 @@ def test_evidence_anchor_ok_catches_fabrication():
     )
 
 
+def test_card_1585_escaped_quote_anchor_regression():
+    """Run 29985490774 supplied four genuine target quotes, but the first
+    source quote used prose-style \\' inside a single-quoted span. The old
+    regex ended that span at the escaped apostrophe and rejected the result.
+    This fixture preserves the exact fetched target and frozen source facts."""
+    cohort = json.loads(read("tests", "fixtures", "provider-telemetry-six.json"))
+    case = next(row for row in cohort if row["card"] == 1585)
+    target_fixture_bytes = open(
+        os.path.join(ROOT, case["target_fixture"]), "rb"
+    ).read()
+    target_bytes = (
+        base64.b64decode(b"".join(target_fixture_bytes.split()), validate=True)
+        if case.get("target_fixture_encoding") == "base64"
+        else target_fixture_bytes
+    )
+    facts_bytes = open(os.path.join(ROOT, case["target_facts_fixture"]), "rb").read()
+    vision_bytes = open(os.path.join(ROOT, case["vision_fixture"]), "rb").read()
+    target = target_bytes.decode("utf-8")
+    data, reason = rc._extract_json_object(case["raw_output"])
+    quotes, _ = rc._evidence_candidates(data["evidence"])
+    normalized_target = rc._normalize_evidence_text(target)
+    binding = case["source_binding"]
+
+    check(
+        "anchor(card 1585): retained target/facts/VISION hashes are exact",
+        len(target_bytes) == case["target_bytes"]
+        and hashlib.sha256(target_bytes).hexdigest() == case["target_sha256"]
+        and hashlib.sha256(facts_bytes).hexdigest()
+        == binding["target_facts_sha256"]
+        and hashlib.sha256(vision_bytes).hexdigest()
+        == binding["vision_content_sha256"],
+    )
+    check(
+        "anchor(card 1585): compact candidate extraction preserves frozen source binding",
+        reason == ""
+        and data["vision_evidence"]
+        == {
+            "target_owner": binding["owner"],
+            "target_repo": binding["repo"],
+            "target_number": binding["number"],
+            "target_facts_sha256": binding["target_facts_sha256"],
+            "vision_sha": binding["vision_sha"],
+            "vision_content_sha256": binding["vision_content_sha256"],
+            "base_sha": binding["base_sha"],
+            "target_head_sha": binding["target_head_sha"],
+            "applicable_criteria": [],
+        },
+    )
+    check(
+        "anchor(card 1585): complete fetched target was not truncated",
+        "[diff truncated after " not in target
+        and target.endswith("</target-content>\n"),
+    )
+    expected_quotes = [
+        "drops --local so worktrees inherit the source repo's effective (includeIf-aware) git identity, preserving prior behavior when local config is set",
+        'Run(ctx, srcDir, "config", "--get", "--default", "", key)',
+        "git.CopyEffectiveUserIdentity(ctx, repo.WorkingPath, wtDir)",
+        "CopyEffectiveUserIdentity(ctx, src, dst)",
+    ]
+    check(
+        "anchor(card 1585): all four cited quotes are extracted exactly",
+        quotes == expected_quotes,
+    )
+    check(
+        "anchor(card 1585): every cited quote occurs in the authoritative target",
+        all(
+            rc._normalize_evidence_text(quote) in normalized_target
+            for quote in quotes
+        ),
+    )
+    check(
+        "anchor(card 1585): exact production evidence now verifies",
+        rc.evidence_anchor_ok(data["evidence"], target),
+    )
+
+    escaped_anchor = (
+        "target.txt PR body: 'drops --local so worktrees inherit the source "
+        "repo\\'s effective (includeIf-aware) git identity, preserving prior "
+        "behavior when local config is set'"
+    )
+    check(
+        "anchor(card 1585): escaped matching delimiter is representation-only",
+        rc.evidence_anchor_ok(escaped_anchor, target),
+    )
+    check(
+        "anchor: escaped matching double-quote delimiter is representation-only",
+        rc.evidence_anchor_ok(
+            'target.txt: "the source says \\"stay safe\\" here"',
+            'The source says "stay safe" here.',
+        ),
+    )
+    exact_span = "a sufficiently long exact target span"
+    check(
+        "anchor: matching single-quote delimiters remain accepted",
+        rc.evidence_anchor_ok("target.txt: '%s'" % exact_span, exact_span),
+    )
+    check(
+        "anchor: matching double-quote delimiters remain accepted",
+        rc.evidence_anchor_ok('target.txt: "%s"' % exact_span, exact_span),
+    )
+    check(
+        "anchor: genuinely unquoted evidence remains accepted",
+        rc.evidence_anchor_ok("target.txt: %s" % exact_span, exact_span),
+    )
+    check(
+        "anchor: unquoted contractions remain accepted",
+        rc.evidence_anchor_ok(
+            "target.txt: the repository's sufficiently long exact target span",
+            "the repository's sufficiently long exact target span",
+        ),
+    )
+    unquoted_punctuation = [
+        "the users' permissions remain sufficiently precise and stable",
+        "the maintainer's choice remains sufficiently precise and stable",
+        'the 12" display remains sufficiently bright and readable',
+        'the size is 12"x14" with sufficiently stable proportions',
+        'the embedded token foo"bar remains sufficiently exact here',
+        "the path C:\\users\\wheelhouse remains sufficiently exact here",
+        "the regex /users\\/wheelhouse/ remains sufficiently exact here",
+    ]
+    check(
+        "anchor: unquoted possessives and measurements remain accepted",
+        all(
+            rc.evidence_anchor_ok("target.txt: %s" % value, value)
+            for value in unquoted_punctuation
+        ),
+    )
+    malformed_quotes = [
+        "target.txt: '%s\"" % exact_span,
+        'target.txt: "%s\'' % exact_span,
+        "target.txt: '%s" % exact_span,
+        'target.txt: "%s' % exact_span,
+        "target.txt: \\'%s" % exact_span,
+        "target.txt: %s\\'" % exact_span,
+        '- target.txt: \\"%s' % exact_span,
+        '1. target.txt: %s\\"' % exact_span,
+        "target.txt: \\'%s'" % exact_span,
+        'target.txt: \\"%s"' % exact_span,
+    ]
+    check(
+        "anchor: malformed delimiters never fall back to unquoted anchoring",
+        all(
+            not rc.evidence_anchor_ok(evidence, exact_span)
+            for evidence in malformed_quotes
+        ),
+    )
+    odd_slash_evidence = (
+        "target.txt: 'the source preserves "
+        + "\\" * 3
+        + "'quoted"
+        + "\\" * 3
+        + "' text exactly'"
+    )
+    odd_slash_target = (
+        "the source preserves "
+        + "\\" * 2
+        + "'quoted"
+        + "\\" * 2
+        + "' text exactly"
+    )
+    check(
+        "anchor: odd internal slash runs decode only their escape slash",
+        rc.evidence_anchor_ok(odd_slash_evidence, odd_slash_target),
+    )
+    even_slash_evidence = (
+        "target.txt: 'a sufficiently long exact target span" + "\\" * 2 + "'"
+    )
+    even_slash_target = "a sufficiently long exact target span" + "\\" * 2
+    check(
+        "anchor: even internal slash runs remain literal",
+        rc.evidence_anchor_ok(even_slash_evidence, even_slash_target),
+    )
+    check(
+        "anchor(card 1585): even slash runs are not over-normalized",
+        not rc.evidence_anchor_ok(
+            escaped_anchor.replace("repo\\'s", "repo\\\\'s"), target
+        ),
+    )
+    check(
+        "anchor(card 1585): unsupported escaped quote still fails closed",
+        not rc.evidence_anchor_ok(
+            "target.txt: 'a fabricated repo\\'s identity was accepted automatically'",
+            target,
+        ),
+    )
+    check(
+        "anchor(card 1585): adversarial near-match remains unsupported",
+        not rc.evidence_anchor_ok(
+            escaped_anchor.replace("local config is set'", "local config is unsafe'"),
+            target,
+        ),
+    )
+    altered = target.replace("source repo's effective", "source repo’s effective", 1)
+    check(
+        "anchor(card 1585): altered authoritative content is rejected",
+        not rc.evidence_anchor_ok(escaped_anchor, altered),
+    )
+    truncated = target[: target.index("drops --local")]
+    check(
+        "anchor(card 1585): quote beyond a truncation boundary is rejected",
+        not rc.evidence_anchor_ok(escaped_anchor, truncated),
+    )
+    whitespace_equivalent = (
+        "target.txt: 'DROPS\u00a0--LOCAL\tSO WORKTREES INHERIT THE SOURCE "
+        "REPO\\'S EFFECTIVE (INCLUDEIF-AWARE) GIT IDENTITY, PRESERVING PRIOR "
+        "BEHAVIOR WHEN LOCAL CONFIG IS SET'"
+    )
+    check(
+        "anchor(card 1585): Unicode whitespace remains semantically equivalent",
+        rc.evidence_anchor_ok(whitespace_equivalent, target),
+    )
+    check(
+        "anchor(card 1585): Unicode punctuation is not folded into a near-match",
+        not rc.evidence_anchor_ok(
+            escaped_anchor.replace("repo\\'s", "repo’s"), target
+        ),
+    )
+    check(
+        "anchor(card 1585): zero-width Unicode changes remain significant",
+        not rc.evidence_anchor_ok(
+            escaped_anchor.replace("worktrees", "work\u200btrees"), target
+        ),
+    )
+    check(
+        "anchor(card 1585): target-src-only quote cannot satisfy target scope",
+        not rc.evidence_anchor_ok(
+            "target-src/internal/git/git.go: "
+            "'github.com/kunchenguid/no-mistakes/internal/safeurl'",
+            target,
+        ),
+    )
+    check(
+        "anchor(card 1585): VISION-only quote cannot satisfy target scope",
+        not rc.evidence_anchor_ok(
+            'vision.md: "The first law is that the tool must not lose people\'s code"',
+            target,
+        ),
+    )
+
+    sibling_results = []
+    for sibling in cohort:
+        if sibling["card"] == 1585:
+            continue
+        sibling_data, sibling_reason = rc._extract_json_object(sibling["raw_output"])
+        sibling_results.append(
+            sibling_reason == ""
+            and rc.evidence_anchor_ok(
+                sibling_data["evidence"], sibling["target_excerpt"]
+            )
+        )
+    check(
+        "anchor(card 1585): all five successful sibling candidates stay accepted",
+        sibling_results == [True] * 5,
+    )
+
+
 def test_body_helpers_queue_and_apply_result():
     it = item()
     body = rc.render(it)["body"]
@@ -832,7 +1234,10 @@ def test_body_helpers_queue_and_apply_result():
     check(
         "queue: hidden status is queued", queued_state.get("triage_status") == "queued"
     )
-    check("queue: no visible triage section yet", "### Triage" not in queued)
+    check(
+        "queue: visible agent status explains the queue event",
+        "Automatic triage queued for this exact revision" in queued,
+    )
 
     updated = rc.body_with_triage_result(
         queued,
@@ -847,8 +1252,13 @@ def test_body_helpers_queue_and_apply_result():
     updated_state = core.parse_state_block(updated)
     check("result: visible triage section inserted", "### Triage" in updated)
     check(
-        "result: triage sits before recommended action",
-        updated.find("### Triage") < updated.find("### Recommended action"),
+        "result: triage sits before the decision controls",
+        updated.find("### Triage") < updated.find("<!-- wheelhouse-decision:start -->"),
+    )
+    check(
+        "result: legacy markdown next step renders no recommendation",
+        "### Recommended action" not in updated
+        and "Recommended next step" not in updated,
     )
     check("result: status succeeded", updated_state.get("triage_status") == "succeeded")
 
@@ -866,20 +1276,23 @@ def test_body_helpers_queue_and_apply_result():
     )
     structured_state = core.parse_state_block(structured)
     check(
-        "result: structured recommendation persisted into state",
-        structured_state.get("triage_recommendation")
-        == {
-            "action": "request-changes",
-            "reason": "Please add a regression test for acme/wheelhouse#7.",
-        },
+        "result: unbound structured recommendation is advisory-only",
+        structured_state.get("triage_recommendation") is None
+        and structured_state.get("assessment_admission", {}).get("status")
+        == "unavailable",
     )
     check(
-        "result: accept checkbox appears after structured triage succeeds",
-        "<!-- opt:accept-recommendation -->" in structured,
+        "result: unbound structured triage renders no accept shortcut",
+        "<!-- opt:accept-recommendation -->" not in structured,
     )
     check(
-        "result: deterministic recommendation suppressed after structured triage",
-        "### Recommended action" not in structured,
+        "result: unbound structured rec renders no recommendation section",
+        "### Recommended action" not in structured
+        and "Recommended next step" not in structured,
+    )
+    check(
+        "result: deterministic controls remain available",
+        "<!-- opt:merge -->" in structured,
     )
 
     parsed_structured = rc.parse_triage_json(
@@ -901,16 +1314,12 @@ def test_body_helpers_queue_and_apply_result():
     )
     from_parsed_state = core.parse_state_block(from_parsed)
     check(
-        "result: parsed structured Claude output still renders accept",
-        "<!-- opt:accept-recommendation -->" in from_parsed,
+        "result: parsed legacy output still has no unbound accept shortcut",
+        "<!-- opt:accept-recommendation -->" not in from_parsed,
     )
     check(
-        "result: parsed structured Claude output persists recommendation",
-        from_parsed_state.get("triage_recommendation")
-        == {
-            "action": "request-changes",
-            "reason": "Please add a regression test for acme/wheelhouse#8.",
-        },
+        "result: parsed legacy recommendation is not admitted",
+        from_parsed_state.get("triage_recommendation") is None,
     )
 
 
@@ -1100,6 +1509,73 @@ def test_triage_completion_preserves_queued_pr_context():
         )
 
 
+def test_automerge_verdict_persistence_requires_complete_diff():
+    it = item(base_sha="b" * 40)
+    queued = rc.body_with_triage_queued(rc.render(it)["body"], it)
+    verdict = {
+        "summary": "Adds lightweight context.",
+        "product_implications": "Routine internal change.",
+        "evidence": "target.txt: quoted a line from the change",
+        "recommended_action": "merge",
+        "recommended_reason": "Scope is small.",
+        "automerge": {
+            "behavior_class": "A",
+            "behavior_assertions": [],
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": False,
+            "aligns_with_vision": True,
+            "recommend_merge": True,
+        },
+    }
+    incomplete = core.parse_state_block(
+        rc.body_with_triage_result(queued, it["head_sha"], triage=verdict)
+    )
+    no_vision = core.parse_state_block(
+        rc.body_with_triage_result(
+            queued,
+            it["head_sha"],
+            triage=verdict,
+            automerge_behavior_available=True,
+        )
+    )
+    with_vision = core.parse_state_block(
+        rc.body_with_triage_result(
+            queued,
+            it["head_sha"],
+            triage=verdict,
+            automerge_behavior_available=True,
+            vision_sha="c" * 40,
+            base_sha=it["base_sha"],
+        )
+    )
+    check(
+        "verdict: incomplete diff persists no behavior object",
+        incomplete.get("automerge_verdict") is None,
+    )
+    check(
+        "verdict: complete no-VISION diff persists only independent facts",
+        no_vision.get("automerge_verdict")
+        == {
+            "behavior_class": "A",
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": False,
+        },
+    )
+    check(
+        "verdict: complete VISION diff persists bound verdict fields",
+        with_vision.get("automerge_verdict")
+        == {
+            "behavior_class": "A",
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": False,
+            "aligns_with_vision": True,
+            "recommend_merge": True,
+            "vision_sha": "c" * 40,
+            "base_sha": it["base_sha"],
+        },
+    )
+
+
 def test_triage_queued_for_head_requires_matching_queued_attempt():
     head = "abc1234def"
     check(
@@ -1220,12 +1696,12 @@ def test_queue_triage_cli_uses_known_issue_number_without_find_card():
 
     def fake_mark(number, queued_item, body):
         current["body"] = rc.body_with_triage_queued(body, queued_item)
-        return True
+        return {"number": number, "item": queued_item}
 
     dispatched = []
 
-    def fake_dispatch(number, queued_item):
-        dispatched.append(number)
+    def fake_dispatch(permit):
+        dispatched.append(permit["number"])
 
     old = (
         sys.argv[:],
@@ -1277,7 +1753,7 @@ def test_queue_triage_command_warns_on_dispatch_failure():
     with no visible trace: the CLI now fails the card open immediately (via
     `update_card_triage`, same as a HELD card's fail-open publish) instead of
     only logging a warning - see AGENTS.md "Held cards"."""
-    it = item(auto_triage=True)
+    it = item_issue(auto_triage_issues=True)
     current = card_row(it)
 
     def fake_find(marker):
@@ -1292,9 +1768,9 @@ def test_queue_triage_command_warns_on_dispatch_failure():
 
     def fake_mark(number, queued_item, body):
         current["body"] = rc.body_with_triage_queued(body, queued_item)
-        return True
+        return {"number": number, "item": queued_item}
 
-    def fake_dispatch(number, queued_item):
+    def fake_dispatch(permit):
         raise RuntimeError("workflow dispatch unavailable")
 
     # `update_card_triage`'s fail-open publish writes via `_write_body` (a
@@ -1371,7 +1847,7 @@ def test_queue_triage_command_warns_on_dispatch_failure():
 
 
 def test_queue_triage_command_clears_cache_when_publish_fails():
-    it = item(auto_triage=True)
+    it = item_issue(auto_triage_issues=True)
     current = card_row(it)
 
     def fake_find(marker):
@@ -1386,9 +1862,9 @@ def test_queue_triage_command_clears_cache_when_publish_fails():
 
     def fake_mark(number, queued_item, body):
         current["body"] = rc.body_with_triage_queued(body, queued_item)
-        return True
+        return {"number": number, "item": queued_item}
 
-    def fake_dispatch(number, queued_item):
+    def fake_dispatch(permit):
         raise RuntimeError("workflow dispatch unavailable")
 
     def fake_update(number, revision, triage=None, error=None, owner=""):
@@ -1468,15 +1944,15 @@ def test_queue_triage_command_clears_cache_when_publish_fails():
 
 
 def test_reconcile_dispatch_failure_publish_failure_clears_cache():
-    it = item(auto_triage=True)
+    it = item_issue(auto_triage_issues=True)
     row = card_row(it)
     row["state"] = core.parse_state_block(row["body"])
 
     def fake_mark(number, queued_item, body):
         row["body"] = rc.body_with_triage_queued(body, queued_item)
-        return True
+        return {"number": number, "item": queued_item}
 
-    def fake_dispatch(number, queued_item):
+    def fake_dispatch(permit):
         raise RuntimeError("workflow dispatch unavailable")
 
     def fake_update(number, revision, triage=None, error=None, owner=""):
@@ -1582,8 +2058,9 @@ def test_render_issue_triage_section_has_no_mentions_and_caches_revision():
         "@alice" not in body and "@bob" not in body,
     )
     check(
-        "render(issue): triage does not replace Recommended action",
-        "### Recommended action" in body,
+        "render(issue): no deterministic recommendation section",
+        "### Recommended action" not in body
+        and "Recommended next step" not in body,
     )
     check(
         "state(issue): triaged_sha caches the current updated_at revision",
@@ -1624,7 +2101,10 @@ def test_body_helpers_queue_and_apply_result_for_issue():
         "queue(issue): hidden status is queued",
         queued_state.get("triage_status") == "queued",
     )
-    check("queue(issue): no visible triage section yet", "### Triage" not in queued)
+    check(
+        "queue(issue): visible agent status explains the queue event",
+        "Automatic triage queued for this exact revision" in queued,
+    )
 
     old = item_issue(updated_at="2024-01-01T00:00:00Z")
     old_body = rc.body_with_triage_queued(rc.render(old)["body"], old)
@@ -1678,8 +2158,8 @@ def test_body_helpers_queue_and_apply_result_for_issue():
     updated_state = core.parse_state_block(updated)
     check("result(issue): visible triage section inserted", "### Triage" in updated)
     check(
-        "result(issue): triage sits before recommended action",
-        updated.find("### Triage") < updated.find("### Recommended action"),
+        "result(issue): triage sits before the decision controls",
+        updated.find("### Triage") < updated.find("<!-- wheelhouse-decision:start -->"),
     )
     check(
         "result(issue): status succeeded",
@@ -1857,7 +2337,7 @@ def test_reconcile_queues_after_issue_updated_at_advance():
     )
 
 
-def test_reconcile_reflects_issue_updated_at_when_auto_triage_disabled():
+def test_reconcile_refreshes_issue_updated_at_when_auto_triage_disabled():
     old = item_issue(updated_at="2024-01-01T00:00:00Z", auto_triage_issues=False)
     old_card = card_row(old)
     new = item_issue(updated_at="2024-06-01T00:00:00Z", auto_triage_issues=False)
@@ -1869,13 +2349,23 @@ def test_reconcile_reflects_issue_updated_at_when_auto_triage_disabled():
         calls["mark"] == [] and calls["dispatch"] == [],
     )
     check(
-        "reconcile(issue): disabled triage still reflects target activity",
-        len(calls["reflect"]) == 1,
+        "reconcile(issue): disabled triage refreshes the newer issue revision",
+        len(calls["upsert"]) == 1,
     )
-    reflected_state = core.parse_state_block(calls["reflect"][0]["body_after"])
     check(
-        "reconcile(issue): reflected activity stamp uses new updated_at",
-        reflected_state.get("activity_reflected_at") == "2024-06-01T00:00:00Z",
+        "reconcile(issue): disabled triage does not do a separate activity stamp",
+        calls["reflect"] == [],
+    )
+    refreshed_state = core.parse_state_block(
+        card_row(calls["upsert"][0]["item"])["body"]
+    )
+    check(
+        "reconcile(issue): refreshed item uses the new updated_at",
+        calls["upsert"][0]["item"].get("updated_at") == "2024-06-01T00:00:00Z",
+    )
+    check(
+        "reconcile(issue): refreshed activity stamp uses new updated_at",
+        refreshed_state.get("activity_reflected_at") == "2024-06-01T00:00:00Z",
     )
 
 
@@ -1923,8 +2413,15 @@ def test_triage_workflow_issue_path_isolation():
     resolve = step_by_id(steps, "resolve")
     verify_head = step_by_id(steps, "verify_head")
     prepare = step_by_id(steps, "prepare")
-    model_steps = load_yaml(".github", "workflows", "claude-model.yml")["jobs"]["model"]["steps"]
-    claude_steps = [s for s in model_steps if s.get("id") in ("triage_search", "triage_local", "triage_repair")]
+    update = step_by_name(steps, "Update the decision card")
+    model_steps = load_yaml(".github", "workflows", "claude-model.yml")["jobs"][
+        "model"
+    ]["steps"]
+    claude_steps = [
+        s
+        for s in model_steps
+        if s.get("id") in ("triage_search", "triage_local", "triage_repair")
+    ]
 
     check(
         "workflow: kind input exists and is required",
@@ -1939,9 +2436,9 @@ def test_triage_workflow_issue_path_isolation():
         inputs.get("revision", {}).get("required") is False,
     )
     check(
-        "workflow: concurrency key includes both head_sha and revision",
-        "github.event.inputs.head_sha" in doc["concurrency"]["group"]
-        and "github.event.inputs.revision" in doc["concurrency"]["group"],
+        "workflow: triage shares the serialized Wheelhouse maintenance group",
+        doc["concurrency"]["group"] == "wheelhouse-backstop"
+        and doc["concurrency"].get("queue") == "max",
     )
 
     check("workflow: resolve gate exists", resolve is not None)
@@ -2019,7 +2516,8 @@ def test_triage_workflow_issue_path_isolation():
         )
         check(
             "workflow: issue prompt marks it as an issue with no diff",
-            "This is an ISSUE, not a PR" in run,
+            "issue title/body/comments in <target-content>" in run
+            and "PR title/body/full diff in <target-content>" in run,
         )
         check(
             "workflow: issue prompt requests an issue-appropriate recommendation",
@@ -2058,7 +2556,8 @@ def test_triage_workflow_issue_path_isolation():
         )
         check(
             "workflow(issue path): Claude uses immutable model",
-            "--model claude-sonnet-4-6" in str((step.get("with") or {}).get("claude_args", "")),
+            "--model claude-sonnet-4-6"
+            in str((step.get("with") or {}).get("claude_args", "")),
         )
 
     check(
@@ -2067,7 +2566,7 @@ def test_triage_workflow_issue_path_isolation():
     )
     check(
         "workflow: final card update no longer uses the old --head-sha flag name",
-        "--head-sha" not in text,
+        update is not None and "--head-sha" not in str(update.get("run", "")),
     )
 
 
@@ -2143,14 +2642,18 @@ def test_triage_workflow_security_wiring():
             and "card is no longer queued for this auto-triage attempt" in run,
         )
 
-    model_steps = load_yaml(".github", "workflows", "claude-model.yml")["jobs"]["model"]["steps"]
-    claude_steps = [s for s in model_steps if s.get("id") in ("triage_search", "triage_local", "triage_repair")]
+    model_steps = load_yaml(".github", "workflows", "claude-model.yml")["jobs"][
+        "model"
+    ]["steps"]
+    claude_steps = [
+        s
+        for s in model_steps
+        if s.get("id") in ("triage_search", "triage_local", "triage_repair")
+    ]
     # Two MAIN triage branches plus the bounded schema-repair branch.
     main_claude = [s for s in claude_steps if s.get("id") != "triage_repair"]
     repair = step_by_id(model_steps, "triage_repair")
-    check(
-        "workflow: search and no-search Claude branches exist", len(main_claude) == 2
-    )
+    check("workflow: search and no-search Claude branches exist", len(main_claude) == 2)
     # Every Claude step (main triage AND repair) shares the same security posture.
     for step in claude_steps:
         dumped = yaml.safe_dump(step)
@@ -2160,7 +2663,8 @@ def test_triage_workflow_security_wiring():
         )
         check(
             "workflow: Claude uses immutable model",
-            "--model claude-sonnet-4-6" in str((step.get("with") or {}).get("claude_args", "")),
+            "--model claude-sonnet-4-6"
+            in str((step.get("with") or {}).get("claude_args", "")),
         )
         check(
             "security: Claude never receives FLEET_TOKEN", "FLEET_TOKEN" not in dumped
@@ -2259,11 +2763,11 @@ def test_triage_workflow_security_wiring():
         env = yaml.safe_dump(preserve.get("env", {}))
         run = str(preserve.get("run", ""))
         check(
-            "workflow: triage result consumes normalized Claude AgentResult",
+            "workflow: in-job triage result consumes normalized Codex AgentResult",
             "EXECUTION_FILE" in env
-            and "steps.claude-model.outputs.result" in env
-            and "steps.claude_search.outputs.execution_file" not in env
-            and "steps.claude.outputs.execution_file" not in env,
+            and "steps.agent-runtime.outputs.result" in env
+            and "steps.claude-model.outputs.result" not in env
+            and "steps.claude_search.outputs.execution_file" not in env,
         )
         check(
             "workflow: triage result uses trusted shell PATH",
@@ -2354,8 +2858,10 @@ def test_triage_workflow_security_wiring():
             and "scripts/render_card.py triage-fail" in run,
         )
         check(
-            "workflow: final card update never receives FLEET_TOKEN",
-            "FLEET_TOKEN" not in dumped,
+            "workflow: final card update keeps card and fleet tokens separated",
+            env.get("GH_TOKEN") == "${{ github.token }}"
+            and env.get("WHEELHOUSE_FLEET_TOKEN") == "${{ secrets.FLEET_TOKEN }}"
+            and run.count('WHEELHOUSE_FLEET_TOKEN="$WHEELHOUSE_FLEET_TOKEN"') == 2,
         )
         check(
             "workflow: final card update carries GITHUB_REPOSITORY_OWNER for ref qualification",
@@ -2368,7 +2874,7 @@ def test_triage_workflow_security_wiring():
 
     check(
         "workflow: triage prompt instructs the model to fully qualify cross-repo refs",
-        "fully qualified as $SLUG#N" in text and "never a bare #N" in text,
+        "qualify references as $SLUG#N, never #N" in text,
     )
 
     trusted_i = step_index(steps, lambda s: s.get("id") == "trusted-src")
@@ -2411,7 +2917,8 @@ def test_triage_workflow_security_wiring():
     if recover:
         check(
             "workflow: recovery step does not depend on Claude token gate",
-            recover.get("if") == "always() && steps.trusted-src.outputs.path != ''",
+            recover.get("if")
+            == "always() && steps.trusted-src.outputs.path != '' && steps.gate.outputs.mode != 'claude'",
         )
         env = recover.get("env", {})
         check(
@@ -2443,9 +2950,10 @@ def test_triage_workflow_security_wiring():
             "CLAUDE_CODE_OAUTH_TOKEN is absent" in run,
         )
         check(
-            "workflow: recovery step runs under the default token (no FLEET_TOKEN)",
+            "workflow: recovery keeps the default card token and passes the fleet read token separately",
             env.get("GH_TOKEN") == "${{ github.token }}"
-            and "FLEET_TOKEN" not in yaml.safe_dump(recover),
+            and env.get("WHEELHOUSE_FLEET_TOKEN") == "${{ secrets.FLEET_TOKEN }}"
+            and 'WHEELHOUSE_FLEET_TOKEN="$WHEELHOUSE_FLEET_TOKEN"' in run,
         )
     check("workflow: no-source queued-cache fallback exists", fallback is not None)
     if fallback:
@@ -2456,7 +2964,7 @@ def test_triage_workflow_security_wiring():
             fallback.get("if") == "always() && steps.trusted-src.outputs.path == ''",
         )
         check(
-            "workflow: no-source fallback reads RAW dispatch inputs",
+            "workflow: no-source fallback reads RAW dispatch inputs for both kinds",
             env.get("ISSUE") == "${{ github.event.inputs.issue }}"
             and env.get("KIND") == "${{ github.event.inputs.kind }}"
             and env.get("HEAD_SHA") == "${{ github.event.inputs.head_sha }}"
@@ -2474,6 +2982,22 @@ def test_triage_workflow_security_wiring():
             and "gh issue edit" in run
             and "future scan can retry" in run,
         )
+        check(
+            "workflow: no-source fallback retains PR-review coverage",
+            'elif [ "$KIND" = "pr-review" ]' in run and 'REVISION="$HEAD_SHA"' in run,
+        )
+        check(
+            "workflow: no-source fallback visibly marks its non-atomic exception",
+            "### Triage" in run
+            and "Security fallback" in run
+            and "without re-evaluating Auto-merge criteria" in run
+            and "until trusted card maintenance runs" in run,
+        )
+        check(
+            "workflow: no-source fallback exception is documented",
+            "no-trusted-source security fallback" in read("AGENTS.md")
+            and "visible `### Triage` security-fallback warning" in read("AGENTS.md"),
+        )
     recover_i = step_index(
         steps,
         lambda s: s.get("name")
@@ -2482,6 +3006,81 @@ def test_triage_workflow_security_wiring():
     check(
         "workflow: recovery step runs after the update step",
         None not in (update_i, recover_i) and update_i < recover_i,
+    )
+
+
+def test_no_source_pr_fallback_writes_visible_security_notice():
+    """Run the workflow's source-less transformer against a queued PR card."""
+    steps = load_yaml(".github", "workflows", "triage.yml")["jobs"]["triage"]["steps"]
+    fallback = step_by_name(
+        steps,
+        "Clear queued triage cache if trusted source is unavailable",
+    )
+    run = str((fallback or {}).get("run", ""))
+    heredoc_start = 'python3 - "$card_json" "$body_file" <<\'PY\'\n'
+    start = run.find(heredoc_start)
+    end = run.find("\nPY\n", start + len(heredoc_start))
+    check(
+        "fallback notice: inline card transformer is extractable",
+        fallback is not None and start >= 0 and end > start,
+    )
+    if fallback is None or start < 0 or end <= start:
+        return
+
+    transform = run[start + len(heredoc_start) : end]
+    candidate = item()
+    rendered = rc.render(candidate, held=True)
+    queued_body = rc.body_with_triage_queued(rendered["body"], candidate)
+    queued_state = core.parse_state_block(queued_body)
+    card = {
+        "state": "OPEN",
+        "labels": rendered["labels"],
+        "body": queued_body,
+    }
+
+    with tempfile.TemporaryDirectory() as directory:
+        card_path = os.path.join(directory, "card.json")
+        body_path = os.path.join(directory, "body.md")
+        with open(card_path, "w") as f:
+            json.dump(card, f)
+        env = dict(os.environ)
+        env.update({"KIND": "pr-review", "REVISION": candidate["head_sha"]})
+        result = subprocess.run(
+            [sys.executable, "-", card_path, body_path],
+            input=transform,
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        check(
+            "fallback notice: PR-review transformer succeeds",
+            result.returncode == 0 and os.path.exists(body_path),
+        )
+        if result.returncode != 0 or not os.path.exists(body_path):
+            return
+        with open(body_path) as f:
+            written_body = f.read()
+
+    written_state = core.parse_state_block(written_body)
+    check(
+        "fallback notice: card visibly identifies the security fallback",
+        "### Triage" in written_body
+        and "> **Security fallback:** Trusted source was unavailable" in written_body
+        and "without re-evaluating Auto-merge criteria" in written_body
+        and "checklist may temporarily reflect the prior queued state" in written_body,
+    )
+    check(
+        "fallback notice: queued cache clears while frozen criteria remain explicit",
+        written_state.get("triaged_sha") is None
+        and written_state.get("triage_status") is None
+        and written_state.get(rc.AUTOMERGE_CRITERIA_FIELD)
+        == queued_state.get(rc.AUTOMERGE_CRITERIA_FIELD),
+    )
+    check(
+        "fallback notice: exactly one managed Triage notice is written",
+        written_body.count("<!-- wheelhouse-triage:start -->") == 1
+        and written_body.count("<!-- wheelhouse-triage:end -->") == 1,
     )
 
 
@@ -2515,7 +3114,7 @@ print(render_card.HOLD_LABEL)
 
 
 def test_triage_recover_cli_publishes_a_stuck_held_card():
-    for kind, it in (("pr-review", item()), ("issue-triage", item_issue())):
+    for kind, it in (("issue-triage", item_issue()),):
         revision = it["head_sha"] if kind == "pr-review" else it["updated_at"]
         held_card = rc.render(it, held=True)
         held_card["body"] = rc.body_with_triage_queued(held_card["body"], it)
@@ -2529,8 +3128,12 @@ def test_triage_recover_cli_publishes_a_stuck_held_card():
         old = (sys.argv[:], rc.get_card, rc._write_body, rc._gh, rc.os.unlink)
         rc.get_card = lambda number: existing
         rc._write_body, rc._gh = _mock_edit(calls)
+        output_fd, output_path = tempfile.mkstemp()
+        os.close(output_fd)
         rc.os.unlink = lambda path: None
+        original_output = os.environ.get("GITHUB_OUTPUT")
         try:
+            os.environ["GITHUB_OUTPUT"] = output_path
             sys.argv = [
                 "render_card.py",
                 "triage-recover",
@@ -2547,8 +3150,15 @@ def test_triage_recover_cli_publishes_a_stuck_held_card():
             with redirect_stdout(buf):
                 rc.main()
             out = buf.getvalue()
+            with open(output_path) as output_file:
+                applied_output = output_file.read()
         finally:
             sys.argv, rc.get_card, rc._write_body, rc._gh, rc.os.unlink = old
+            if original_output is None:
+                os.environ.pop("GITHUB_OUTPUT", None)
+            else:
+                os.environ["GITHUB_OUTPUT"] = original_output
+            os.unlink(output_path)
         check(
             "recover(%s): warns that the run never reached the update step" % kind,
             "::warning::auto triage run did not reach its update step" in out,
@@ -2567,11 +3177,15 @@ def test_triage_recover_cli_publishes_a_stuck_held_card():
             "recover(%s): hold label removed via gh edit" % kind,
             any(rc.HOLD_LABEL in c for c in calls["gh_calls"]),
         )
+        check(
+            "recover(%s): reports explicit applied output" % kind,
+            applied_output == "applied=true\ntriage_status=error\n",
+        )
 
 
 def test_triage_recover_cli_is_noop_when_not_stuck():
-    it = item()
-    revision = it["head_sha"]
+    it = item_issue()
+    revision = it["updated_at"]
 
     # Case 1: card was never held (already published) -> no-op.
     published = rc.render(it)
@@ -2636,8 +3250,9 @@ def test_triage_recover_cli_is_noop_when_not_stuck():
     )
 
     # Case 3: held, queued, but for a DIFFERENT (superseded) revision -> no-op.
-    held_stale = rc.render(item(head_sha="newer-revision"), held=True)
-    held_stale["body"] = rc.body_with_triage_queued(held_stale["body"], it)
+    newer = item_issue(updated_at="2024-06-01T00:00:00Z")
+    held_stale = rc.render(newer, held=True)
+    held_stale["body"] = rc.body_with_triage_queued(held_stale["body"], newer)
     stale_revision = {
         "number": 7,
         "body": held_stale["body"],
@@ -2652,26 +3267,41 @@ def test_triage_recover_cli_is_noop_when_not_stuck():
     ):
         calls = {"gh_calls": []}
         old = (sys.argv[:], rc.get_card, rc._write_body, rc._gh)
+        original_output = os.environ.get("GITHUB_OUTPUT")
         rc.get_card = lambda number: existing
         rc._write_body, rc._gh = _mock_edit(calls)
+        output_fd, output_path = tempfile.mkstemp()
+        os.close(output_fd)
         try:
+            os.environ["GITHUB_OUTPUT"] = output_path
             sys.argv = [
                 "render_card.py",
                 "triage-recover",
                 "--issue",
                 "7",
                 "--kind",
-                "pr-review",
+                "issue-triage",
                 "--revision",
                 revision,
             ]
             with redirect_stdout(io.StringIO()):
                 rc.main()
+            with open(output_path) as output_file:
+                applied_output = output_file.read()
         finally:
             sys.argv, rc.get_card, rc._write_body, rc._gh = old
+            if original_output is None:
+                os.environ.pop("GITHUB_OUTPUT", None)
+            else:
+                os.environ["GITHUB_OUTPUT"] = original_output
+            os.unlink(output_path)
         check(
             "recover no-op (%s): no card write happened" % label,
             calls["gh_calls"] == [],
+        )
+        check(
+            "recover no-op (%s): reports explicit rejected output" % label,
+            applied_output == "applied=false\ntriage_status=error\n",
         )
 
 
@@ -2724,8 +3354,13 @@ def test_scan_and_ingest_can_dispatch_with_default_token():
 # Held cards (visibility gated on the first auto-triage attempt completing)
 # --------------------------------------------------------------------------- #
 def test_should_hold_gates():
-    it = item(auto_triage=True)
+    it = option_b_item(auto_triage=True)
     check("hold: eligible pr-review with token", rc.should_hold(it, True) is True)
+    unavailable_vision = dict(it, triage_vision_status="unavailable")
+    check(
+        "hold: untrusted VISION context leaves decision controls visible",
+        rc.should_hold(unavailable_vision, True) is False,
+    )
     check("hold: no token -> never held", rc.should_hold(it, False) is False)
     check(
         "hold: auto_triage off (item-level opt-out) -> never held",
@@ -2802,11 +3437,21 @@ def test_upsert_card_creates_held_only_when_triage_would_be_queued():
     )
     rc.lookup_card_lifecycle = lambda item_: {"open": None, "reusable": None}
     scenarios = [
-        ("pr-review token+config on -> held", item(auto_triage=True), True, True),
-        ("pr-review no token -> unheld", item(auto_triage=True), False, False),
+        (
+            "pr-review token+config on -> held",
+            option_b_item(auto_triage=True),
+            True,
+            True,
+        ),
+        (
+            "pr-review no token -> unheld",
+            option_b_item(auto_triage=True),
+            False,
+            False,
+        ),
         (
             "pr-review config off -> unheld",
-            item(auto_triage=False),
+            option_b_item(auto_triage=False),
             True,
             False,
         ),
@@ -2827,9 +3472,7 @@ def test_upsert_card_creates_held_only_when_triage_would_be_queued():
     try:
         for label, scenario_item, has_token, expect_held in scenarios:
             captured = {}
-            rc._create_and_verify_card = (
-                lambda item_, card: captured.update(card) or 99
-            )
+            rc._create_and_verify_card = lambda item_, card: captured.update(card) or 99
             number = rc.upsert_card(scenario_item, has_token=has_token)
             check("create: %s" % label, number == 99)
             check(
@@ -2848,12 +3491,28 @@ def test_upsert_card_creates_held_only_when_triage_would_be_queued():
 
 
 def test_upsert_card_refresh_preserves_held_when_still_eligible():
+    pr_base = option_b_item(auto_triage=True, head_sha="oldsha")
+    pr_changed = option_b_item(auto_triage=True, head_sha="newsha999")
+    pr_held = card_projection.plan_card_projection(
+        pr_base, prior={}, held=True, has_token=True
+    )
+    pr_refreshed = card_projection.plan_card_projection(
+        pr_changed,
+        prior={
+            "title": pr_held["title"],
+            "body": pr_held["body"],
+            "labels": pr_held["managed_labels"],
+        },
+        held=True,
+        has_token=True,
+    )
+    check(
+        "refresh(pr-review): held card stays held across a target revision",
+        rc.HOLD_LABEL in pr_refreshed["managed_labels"]
+        and "<!-- opt:" not in pr_refreshed["body"],
+    )
+
     for kind, base, changed in (
-        (
-            "pr-review",
-            item(auto_triage=True, head_sha="oldsha"),
-            item(auto_triage=True, head_sha="newsha999"),
-        ),
         (
             "issue-triage",
             item_issue(auto_triage_issues=True, priority="low"),
@@ -3035,33 +3694,58 @@ def _run_reconcile_real_upsert_refresh(
 
 
 def test_upsert_card_refresh_publishes_held_when_hold_gate_turns_off():
+    pr_base = option_b_item(auto_triage=True, head_sha="oldsha")
+    pr_held = card_projection.plan_card_projection(
+        pr_base, prior={}, held=True, has_token=True
+    )
+    prior = {
+        "title": pr_held["title"],
+        "body": pr_held["body"],
+        "labels": pr_held["managed_labels"],
+    }
+    for label, changed_item, has_token, reason in (
+        (
+            "pr auto-triage config disabled",
+            option_b_item(auto_triage=False, head_sha="oldsha"),
+            True,
+            "repository policy disables it",
+        ),
+        (
+            "token absent",
+            option_b_item(auto_triage=True, head_sha="oldsha"),
+            False,
+            "model credential is not configured",
+        ),
+    ):
+        projection = card_projection.plan_card_projection(
+            changed_item, prior=prior, held=False, has_token=has_token
+        )
+        state = core.parse_state_block(projection["body"])
+        check(
+            "refresh publish(%s): Option B card is actionable with a reason" % label,
+            "held" not in state
+            and "<!-- opt:" in projection["body"]
+            and reason in projection["body"]
+            and rc.HOLD_LABEL not in projection["managed_labels"],
+        )
+
     scenarios = [
         (
             "kind changed to ci-approval",
             item(auto_triage=True, head_sha="oldsha"),
             item(kind="ci-approval", auto_triage=True, head_sha="newsha999"),
             True,
-        ),
-        (
-            "pr auto-triage config disabled",
-            item(auto_triage=True, head_sha="oldsha"),
-            item(auto_triage=False, head_sha="oldsha"),
-            True,
+            False,
         ),
         (
             "issue auto-triage config disabled",
             item_issue(auto_triage_issues=True, priority="low"),
             item_issue(auto_triage_issues=False, priority="low"),
             True,
-        ),
-        (
-            "token absent",
-            item(auto_triage=True, head_sha="oldsha"),
-            item(auto_triage=True, head_sha="oldsha"),
-            False,
+            True,
         ),
     ]
-    for label, base_item, changed_item, has_token in scenarios:
+    for label, base_item, changed_item, has_token, expect_reason in scenarios:
         calls = _capture_upsert_refresh(base_item, changed_item, has_token, queued=True)
         body = calls.get("body", "")
         state = core.parse_state_block(body)
@@ -3073,8 +3757,8 @@ def test_upsert_card_refresh_publishes_held_when_hold_gate_turns_off():
             "<!-- opt:" in body,
         )
         check(
-            "refresh publish(%s): no triage section added" % label,
-            rc.TRIAGE_START not in body,
+            "refresh publish(%s): triage suppression visibility is exact" % label,
+            ("repository policy disables it" in body) == expect_reason,
         )
         check(
             "refresh publish(%s): pending label removed" % label,
@@ -3105,8 +3789,8 @@ def test_upsert_card_refresh_publishes_held_when_hold_gate_turns_off():
 
 
 def test_reconcile_refresh_preserves_held_when_still_eligible():
-    old = item(head_sha="oldsha", auto_triage=True)
-    new = item(head_sha="newsha999", auto_triage=True)
+    old = item_issue(priority="low", auto_triage_issues=True)
+    new = item_issue(priority="high", auto_triage_issues=True)
     calls = _run_reconcile_real_upsert_refresh(old, new, token="true")
     body = calls["card"]["body"]
     state = core.parse_state_block(body)
@@ -3123,14 +3807,14 @@ def test_reconcile_refresh_publishes_held_when_hold_gate_turns_off():
     scenarios = [
         (
             "config disabled",
-            item(head_sha="oldsha", auto_triage=True),
-            item(head_sha="oldsha", auto_triage=False),
+            item_issue(auto_triage_issues=True),
+            item_issue(auto_triage_issues=False),
             "true",
         ),
         (
             "token absent",
-            item(head_sha="oldsha", auto_triage=True),
-            item(head_sha="oldsha", auto_triage=True),
+            item_issue(auto_triage_issues=True),
+            item_issue(auto_triage_issues=True),
             "",
         ),
     ]
@@ -3152,8 +3836,12 @@ def test_reconcile_refresh_publishes_held_when_hold_gate_turns_off():
             rc.HOLD_LABEL not in label_names,
         )
         check(
-            "reconcile(%s): ineligible held card has no triage section" % label,
-            rc.TRIAGE_START not in body,
+            "reconcile(%s): ineligible held card explains triage suppression" % label,
+            rc.TRIAGE_START in body
+            and (
+                "repository policy disables it" in body
+                or "model credential is not configured" in body
+            ),
         )
         check(
             "reconcile(%s): ineligible held card clears queued cache" % label,
@@ -3193,7 +3881,7 @@ def _mock_edit(calls):
 
 
 def test_update_card_triage_publishes_held_card_on_success():
-    for kind, it in (("pr-review", item()), ("issue-triage", item_issue())):
+    for kind, it in (("issue-triage", item_issue()),):
         revision = it["head_sha"] if kind == "pr-review" else it["updated_at"]
         held_card = rc.render(it, held=True)
         existing = {
@@ -3252,7 +3940,7 @@ def test_update_card_triage_publishes_held_card_on_success():
 
 
 def test_update_card_triage_publishes_held_card_on_failure_fail_open():
-    for kind, it in (("pr-review", item()), ("issue-triage", item_issue())):
+    for kind, it in (("issue-triage", item_issue()),):
         revision = it["head_sha"] if kind == "pr-review" else it["updated_at"]
         held_card = rc.render(it, held=True)
         existing = {
@@ -3310,7 +3998,7 @@ def test_update_card_triage_publishes_held_card_on_failure_fail_open():
 
 
 def test_update_card_triage_stale_revision_is_noop_for_held_card():
-    for kind, it in (("pr-review", item()), ("issue-triage", item_issue())):
+    for kind, it in (("issue-triage", item_issue()),):
         held_card = rc.render(it, held=True)
         existing = {
             "number": 7,
@@ -3343,7 +4031,7 @@ def test_update_card_triage_unheld_card_behavior_unchanged():
     """A regression check: for a card that was never held, `update_card_triage`
     behaves exactly as before this feature - attach the triage section, no
     label churn, no touching the (already-present) checkboxes."""
-    it = item()
+    it = item_issue()
     card = rc.render(it)
     existing = {
         "number": 7,
@@ -3364,7 +4052,7 @@ def test_update_card_triage_unheld_card_behavior_unchanged():
     try:
         ok = rc.update_card_triage(
             7,
-            it["head_sha"],
+            it["updated_at"],
             triage={
                 "summary": "does X",
                 "product_implications": "low risk",
@@ -3385,7 +4073,7 @@ def test_update_card_triage_unheld_card_behavior_unchanged():
     check("unheld: no held key ever appears", "held" not in new_state)
     check(
         "unheld: checkboxes were already present and remain",
-        "<!-- opt:merge -->" in calls["body"],
+        "<!-- opt:close -->" in calls["body"],
     )
     check(
         "unheld: never touches the hold label (card was never held)",
@@ -3429,6 +4117,7 @@ def main():
     test_triage_requires_complete_structured_json()
     test_triage_requires_evidence_field()
     test_evidence_anchor_ok_catches_fabrication()
+    test_card_1585_escaped_quote_anchor_regression()
     test_body_helpers_queue_and_apply_result()
     test_automated_status_lines_are_labeled_only_on_allowlist()
     test_body_helpers_queue_and_apply_result_for_issue()
@@ -3449,10 +4138,11 @@ def main():
     test_reconcile_dispatch_failure_publish_failure_clears_cache()
     test_reconcile_queues_after_head_refresh()
     test_reconcile_queues_after_issue_updated_at_advance()
-    test_reconcile_reflects_issue_updated_at_when_auto_triage_disabled()
+    test_reconcile_refreshes_issue_updated_at_when_auto_triage_disabled()
     test_auto_triage_toggles_are_independent_end_to_end()
     test_triage_workflow_issue_path_isolation()
     test_triage_workflow_security_wiring()
+    test_no_source_pr_fallback_writes_visible_security_notice()
     test_scan_and_ingest_can_dispatch_with_default_token()
     test_should_hold_gates()
     test_render_held_card_placeholder_and_labels()

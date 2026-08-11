@@ -8,9 +8,8 @@ name: ingest
 # A brand-new eligible card is created HELD (`pending-triage`, no decision
 # checkboxes) before that first attempt, then published when the attempt
 # completes or fails open.
-# This path trusts the explicit dispatch payload; the scheduled scan's
-# owner/maintainer/bot author filter and merge-conflict needs-rebase routing are
-# not applied here.
+# This path trusts the explicit dispatch identity hint, then independently
+# observes PR facts and applies the same source-permission policy as the scan.
 #
 # Portability: the owner is github.repository_owner; the fleet + policy come from
 # wheelhouse.config.yml. Nothing here is account-specific.
@@ -44,9 +43,6 @@ on:
         required: false
       summary:
         description: "One-line situation summary"
-        required: false
-      recommendation:
-        description: "Recommended action"
         required: false
       priority:
         description: "high | med | low"
@@ -95,10 +91,35 @@ jobs:
           INPUT_UPDATED_AT: ${{ github.event.inputs.updated_at }}
           INPUT_TITLE: ${{ github.event.inputs.title }}
           INPUT_SUMMARY: ${{ github.event.inputs.summary }}
-          INPUT_RECOMMENDATION: ${{ github.event.inputs.recommendation }}
           INPUT_PRIORITY: ${{ github.event.inputs.priority }}
           INPUT_OPTIONS: ${{ github.event.inputs.options }}
         run: python scripts/build_item.py item.json
+
+      - id: source-policy
+        name: Route exact source-permission policy
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/maintainer_edits_policy.py route-item item.json policy-notices.json
+
+      - name: Post exact source-permission notice
+        if: steps.source-policy.outputs.admitted != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          python scripts/maintainer_edits_policy.py notify policy-notices.json policy-notice-results.json
+          python scripts/maintainer_edits_policy.py attach-item item.json policy-notice-results.json
+
+      # A dispatch is only an invalidation/identity hint. Ordinary PR-review
+      # facts are replaced by an exact ReviewObservation from the same reducer
+      # used by the scheduled scan before any card projection.
+      - name: Observe the exact PR revision
+        if: steps.source-policy.outputs.admitted == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/projection_writer.py observe-item item.json
 
       - id: upsert
         name: Create, reuse, or refresh the decision card
@@ -113,15 +134,39 @@ jobs:
           WHEELHOUSE_AUTO_TRIAGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
         run: python scripts/render_card.py upsert --item-file item.json
 
+      - name: Prepare source-policy close handoff
+        if: steps.source-policy.outputs.admitted != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/maintainer_edits_policy.py prepare-close item.json "${{ steps.upsert.outputs.issue }}" policy-actions.json
+
+      - name: Close verified source-policy target
+        if: steps.source-policy.outputs.admitted != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/maintainer_edits_policy.py close policy-actions.json policy-close-results.json
+
+      - name: Record source-policy outcome
+        if: steps.source-policy.outputs.admitted != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: python scripts/maintainer_edits_policy.py record policy-close-results.json
+
       - id: auto-triage-gate
         env:
           HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
         run: echo "has_token=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Queue auto triage
-        if: steps.auto-triage-gate.outputs.has_token == 'true'
+        if: steps.auto-triage-gate.outputs.has_token == 'true' && steps.source-policy.outputs.admitted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          WHEELHOUSE_FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          WHEELHOUSE_AUTOMERGE_HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         # --issue threads the number `upsert` just created/refreshed, so this
         # reads the card back by number (read-after-write consistent) instead
         # of relying on find_card's label-filtered listing, which can race a

@@ -1,4 +1,19 @@
-"""Bounded content-addressed handoff for the read-only Claude model workflow."""
+"""Bounded content-addressed handoff for the read-only Claude model workflow.
+
+Invocation invariant (load-bearing for signed-tree integrity):
+
+  Every process that imports the *packaged* runtime from a signed handoff
+  directory (``PYTHONPATH=$HANDOFF/runtime python -m agent_runtime.claude_handoff``)
+  MUST set ``PYTHONPYCACHEPREFIX`` to a directory that is path-disjoint from
+  the signed handoff tree (production uses ``$RUNNER_TEMP/wheelhouse-pycache``)
+  *before* import, with bytecode writing left enabled. Do not use ``-B`` /
+  ``PYTHONDONTWRITEBYTECODE`` as the production mechanism: the robust fix is
+  a redirected external cache, not suppressed bytecode. A fresh interpreter
+  that writes ``__pycache__`` into the signed tree will fail closed at
+  ``verify()`` because complete file-set and digest verification rejects any
+  post-signing file. Do not weaken ``verify()`` to ignore arbitrary
+  unmanifested files.
+"""
 
 from __future__ import annotations
 
@@ -11,12 +26,50 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .contract import ContractError, atomic_write_json, canonical_sha256, file_sha256, load_json_regular, validate_contract
+from .contract import (
+    ContractError,
+    atomic_write_json,
+    canonical_json_bytes,
+    canonical_sha256,
+    file_sha256,
+    load_json_regular,
+    validate_contract,
+)
+from .task_builder import claude_native_structured_output
 
 MAX_HANDOFF_BYTES = 220_000_000
 MAX_HANDOFF_FILES = 32_000
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SIGNED_TARGET_INPUT_PATHS = {"repository-provenance.json", "target-src", "target.txt"}
+PACKAGED_RUNTIME_FILES = (
+    "__init__.py",
+    "admission.py",
+    "brokers.py",
+    "capabilities.py",
+    "claude_bridge.py",
+    "claude_handoff.py",
+    "contract.py",
+    "events.py",
+    "install_direct_runtime.sh",
+    "limits.py",
+    "output_validation.py",
+    "redaction.py",
+    "retention.py",
+    "runtime.lock.json",
+    "sandbox.py",
+    "size_budget.py",
+    "supervisor.py",
+    "task_builder.py",
+    "tools.py",
+    "worker.py",
+    "adapters/__init__.py",
+    "adapters/base.py",
+    "adapters/claude.py",
+    "adapters/codex.py",
+    "adapters/fake.py",
+    "vendor/claude-stream-json-2.1.215/protocol-fixture.ndjson",
+)
 
 
 def _files(root: Path, excluded: set[str] | None = None) -> list[dict[str, Any]]:
@@ -46,10 +99,13 @@ def _files(root: Path, excluded: set[str] | None = None) -> list[dict[str, Any]]
 def _copy_runtime(destination: Path) -> None:
     package = destination / "runtime" / "agent_runtime"
     package.mkdir(parents=True)
-    for name in ("__init__.py", "contract.py", "claude_handoff.py"):
-        shutil.copyfile(ROOT / name, package / name)
+    for name in PACKAGED_RUNTIME_FILES:
+        target = package / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, target)
     shutil.copytree(ROOT / "schemas", package / "schemas")
     shutil.copyfile(ROOT.parent / "scripts" / "nl_readonly_search.py", destination / "runtime" / "nl_readonly_search.py")
+    shutil.copyfile(ROOT.parent / "scripts" / "public_clone_provenance.py", destination / "runtime" / "public_clone_provenance.py")
 
 
 def _verify_bundle(task: dict[str, Any], bundle: Path) -> None:
@@ -163,9 +219,34 @@ def hydrate(handoff_dir: str, workspace_dir: str) -> dict[str, Any]:
         source = root / "bundle" / item["artifact"]
         destination = workspace / item["logicalPath"]
         _copy_artifact(source, destination)
+    action = task["metadata"]["action"]
+    native_schema = ""
+    adapter = task["spec"]["selection"]["candidates"][0]["adapter"]
+    if claude_native_structured_output(action):
+        structured_rows = [
+            row["constraints"]
+            for row in task["spec"]["capabilities"]["required"]
+            if row["name"] == "output.structured"
+        ]
+        if len(structured_rows) != 1:
+            raise ContractError("Claude task structured-output capability was invalid")
+        structured = structured_rows[0]
+        if structured.get("mechanismAnyOf") != ["native-schema"]:
+            raise ContractError("Claude task did not require native structured output")
+        schema_path = root / "bundle" / task["spec"]["output"]["schemaArtifact"]
+        schema = load_json_regular(schema_path, max_bytes=65536)
+        native_schema_bytes = canonical_json_bytes(schema)
+        if schema_path.read_bytes() != native_schema_bytes:
+            raise ContractError("native output schema artifact was not canonical")
+        native_schema = native_schema_bytes.decode("utf-8")
+        if len(native_schema.encode("utf-8")) > 65536:
+            raise ContractError("native output schema exceeded its byte bound")
     return {
-        "action": task["metadata"]["action"],
+        "action": action,
+        "adapter": adapter,
+        "profile": task["spec"]["selection"]["profile"],
         "prompt": prompt.read_text(encoding="utf-8"),
+        "nativeSchema": native_schema,
         "taskSha256": canonical_sha256(task),
         "allowedRepos": metadata["allowedRepos"],
         "dispatchDeadlineMs": task["spec"]["limits"]["dispatchDeadlineMs"],
@@ -185,16 +266,21 @@ def declared_output_paths(task: dict[str, Any]) -> list[str]:
 
 
 def workspace_input_observation(task: dict[str, Any], workspace_dir: str) -> str:
+    """Trusted immutability evidence for signed target inputs only.
+
+    Hashes exact path, type, bytes, mode, file-count, and digest for
+    ``target.txt``, ``target-src/``, and ``repository-provenance.json`` when
+    present. Declared outputs, ``.git/**``, ``vision.md``, and unrelated
+    workspace scratch are out of scope: their presence or mutation does not
+    affect this observation and must not collapse it to null. Any change to a
+    signed input still fails closed.
+    """
     validate_contract(task, "AgentTask")
     workspace = Path(workspace_dir).resolve()
-    output_paths = declared_output_paths(task)
-    allowed = [Path(item["logicalPath"]) for item in task["spec"]["inputs"]] + [Path(path) for path in output_paths] + [Path(".git")]
-    for path in workspace.rglob("*"):
-        relative = path.relative_to(workspace)
-        if not any(relative == root or root in relative.parents or relative in root.parents for root in allowed):
-            raise ContractError("model workspace contains an undeclared output path")
     observed: list[dict[str, Any]] = []
     for item in task["spec"]["inputs"]:
+        if item["logicalPath"] not in SIGNED_TARGET_INPUT_PATHS:
+            continue
         path = workspace / item["logicalPath"]
         try:
             info = path.lstat()
@@ -219,7 +305,7 @@ def workspace_input_observation(task: dict[str, Any], workspace_dir: str) -> str
         if canonical_sha256(rows) != item["sha256"] or sum(row["bytes"] for row in rows) != item["bytes"] or len(rows) != item["git"]["fileCount"]:
             raise ContractError("hydrated directory input changed")
         observed.append({"logicalPath": item["logicalPath"], "kind": "directory", "bytes": item["bytes"], "sha256": item["sha256"], "fileCount": len(rows), "mode": "0500"})
-    return canonical_sha256({"inputs": observed, "declaredOutputPaths": output_paths})
+    return canonical_sha256({"inputs": observed})
 
 
 def _output(name: str, value: Any) -> None:

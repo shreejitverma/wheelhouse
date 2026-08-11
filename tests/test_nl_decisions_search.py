@@ -20,7 +20,7 @@ import apply_decision as ad  # noqa: E402
 import nl_readonly_search as nls  # noqa: E402
 
 CLAUDE_ACTION_PIN = (
-    "anthropics/claude-code-action@fad22eb3fa582b7357fc0ea48af6645851b884fd"
+    "anthropics/claude-code-action@af0559ee4f514d1ef21826982bed13f7edc3c35e"
 )
 _failures = []
 
@@ -166,7 +166,7 @@ def test_claude_steps_split_legacy_vs_search():
 
     for claude in llm_steps:
         check(
-            "workflow: Claude action is pinned to the reviewed v1.0.161 commit",
+            "workflow: Claude action is pinned to the reviewed v1.0.178 commit",
             str(claude.get("uses", "")) == CLAUDE_ACTION_PIN,
         )
 
@@ -176,9 +176,9 @@ def test_claude_steps_split_legacy_vs_search():
         check(
             "workflow: legacy step keeps the no-shell tool mode and immutable model "
             "(Read/Grep/Glob added for pass-by-reference target.txt, card #555; "
-            "Write kept for decision.json, still no Bash)",
+            "no Write and no Bash)",
             args
-            == "--allowedTools Read,Grep,Glob,Write\n--max-turns 32\n--model claude-sonnet-4-6",
+            == "--allowedTools Read,Grep,Glob\n--max-turns 32\n--model claude-sonnet-4-6\n--json-schema '${{ steps.hydrate.outputs.nativeSchema }}'",
         )
         check(
             "workflow: legacy step has no GH_TOKEN env",
@@ -204,6 +204,10 @@ def test_claude_steps_split_legacy_vs_search():
         check(
             "workflow: legacy step uses immutable model",
             "--model claude-sonnet-4-6" in args,
+        )
+        check(
+            "workflow: legacy step requests the verified native NL schema",
+            "--json-schema '${{ steps.hydrate.outputs.nativeSchema }}'" in args,
         )
 
     if search:
@@ -255,6 +259,10 @@ def test_claude_steps_split_legacy_vs_search():
             "workflow: search step uses immutable model",
             "--model claude-sonnet-4-6" in args,
         )
+        check(
+            "workflow: search step requests the verified native NL schema",
+            "--json-schema '${{ steps.hydrate.outputs.nativeSchema }}'" in args,
+        )
         for forbidden in (
             "FLEET_TOKEN",
             "Bash(gh",
@@ -283,8 +291,8 @@ def test_claude_steps_split_legacy_vs_search():
 
     dh = read(".github", "workflows", "claude-model.yml")
     check(
-        "workflow: Claude action pin keeps the v1.0.161 breadcrumb",
-        f"uses: {CLAUDE_ACTION_PIN} # v1.0.161" in dh,
+        "workflow: Claude action pin keeps the v1.0.178 breadcrumb",
+        f"uses: {CLAUDE_ACTION_PIN} # v1.0.178" in dh,
     )
 
 
@@ -452,7 +460,7 @@ def read_file(path):
 
 
 def test_claude_output_is_isolated_before_routing():
-    steps = handle_steps()
+    steps = load_workflow()["jobs"]["nl-claude-consume"]["steps"]
     trusted = step_by_id(steps, "trusted-src")
     preserve = step_by_id(steps, "nl-result")
     route = step_by_id(steps, "route")
@@ -491,14 +499,15 @@ def test_claude_output_is_isolated_before_routing():
         env = preserve.get("env", {})
         run = str(preserve.get("run", ""))
         check(
-            "workflow: nl-result uses trusted shell PATH",
-            hardened_shell_env(preserve),
+            "workflow: nl-result binds only the trusted AgentResult path",
+            'echo "path=${RUNTIME_RESULT:-}"' in run,
         )
         check(
-            "workflow: nl-result exports only normalized decision.json in runner temp",
-            "${RUNNER_TEMP}/wheelhouse-nl" in run
-            and "agent_runtime.py export-final" in run
-            and "steps.nl-claude-model.outputs.result" in str(env.get("RUNTIME_RESULT")),
+            "workflow: nl-result never exports an unvalidated decision file",
+            "agent_runtime.py export-final" not in run
+            and "decision.json" not in run
+            and "steps.nl-claude-result.outputs.result"
+            in str(env.get("RUNTIME_RESULT")),
         )
         check(
             "workflow: raw model decision bypass is absent",
@@ -528,9 +537,11 @@ def test_claude_output_is_isolated_before_routing():
             and env.get("TRUSTED_PATH") == "${{ steps.trusted-src.outputs.safe_path }}",
         )
         check(
-            "workflow: nl-route reads the isolated decision file",
-            env.get("DECISION_FILE")
-            == "${{ runner.temp }}/wheelhouse-nl/decision.json",
+            "workflow: nl-route reads primary and repair AgentResults",
+            env.get("NL_EXECUTION_FILE")
+            == "${{ steps.nl-claude-result.outputs.result }}"
+            and env.get("NL_REPAIR_EXECUTION_FILE")
+            == "${{ steps.nl-claude-repair-result.outputs.result }}",
         )
         check(
             "workflow: nl-route scrubs inherited model environment",
@@ -577,18 +588,19 @@ def test_claude_output_is_isolated_before_routing():
     preserve_i = step_index(steps, lambda s: s.get("id") == "nl-result")
     route_i = step_index(steps, lambda s: s.get("id") == "route")
     execute_i = step_index(steps, lambda s: s.get("id") == "execute")
-    claude_indexes = [step_index(steps, lambda s: s.get("id") == "nl-claude-model")]
     check(
-        "workflow: trusted source is prepared before every Claude step",
+        "workflow: trusted source is prepared before normalized result receipt",
         trusted_i is not None
-        and claude_indexes
-        and all(trusted_i < i for i in claude_indexes),
+        and step_index(steps, lambda s: s.get("id") == "nl-claude-result")
+        > trusted_i,
     )
     check(
-        "workflow: nl-result runs after every Claude step",
+        "workflow: nl-result runs after the caller-bound model job",
         preserve_i is not None
-        and claude_indexes
-        and all(i < preserve_i for i in claude_indexes),
+        and load_workflow()["jobs"]["nl-model"].get("uses")
+        == "./.github/workflows/claude-model.yml"
+        and "nl-model"
+        in load_workflow()["jobs"]["nl-claude-consume"].get("needs", []),
     )
     check(
         "workflow: trusted deterministic steps run after result isolation",
@@ -711,11 +723,23 @@ def test_retryable_terminal_keeps_card_actionable():
             "'retryable'" not in str(block.get("if", ""))
             and '"retryable"' not in str(block.get("if", "")),
         )
+        # Recoverable merge-conflict uses terminal "none" (card #1544). Same
+        # non-blocking surface as comment/request-changes: never durable blocked.
+        check(
+            "workflow: none (recoverable conflict) does not add blocked",
+            "'none'" not in str(block.get("if", ""))
+            and '"none"' not in str(block.get("if", "")),
+        )
     if drop:
         check(
             "workflow: retryable merge result keeps needs-decision",
             "'retryable'" not in str(drop.get("if", ""))
             and '"retryable"' not in str(drop.get("if", "")),
+        )
+        check(
+            "workflow: none (recoverable conflict) keeps needs-decision",
+            "'none'" not in str(drop.get("if", ""))
+            and '"none"' not in str(drop.get("if", "")),
         )
 
 
@@ -732,6 +756,54 @@ def test_nl_prompt_instructs_fully_qualified_refs():
         "prompt: omits the qualification rule when no target slug is known",
         "never a bare #N" not in prompt_without_slug,
     )
+
+
+def test_source_policy_is_revalidated_at_model_admission():
+    steps = handle_steps()
+    preclaim = step_by_id(steps, "nl-preclaim-freshness")
+    policy = step_by_id(steps, "nl-final-source-policy")
+    claim = step_by_id(steps, "nl-claim")
+    task = step_by_id(steps, "nl-claude-task")
+    indexes = {
+        step_id: step_index(steps, lambda step, wanted=step_id: step.get("id") == wanted)
+        for step_id in (
+            "nl-preclaim-freshness",
+            "nl-final-source-policy",
+            "nl-claim",
+            "nl-claude-task",
+        )
+    }
+    check(
+        "source policy: live revision and permission precede claim and task",
+        None not in indexes.values()
+        and indexes["nl-preclaim-freshness"]
+        < indexes["nl-final-source-policy"]
+        < indexes["nl-claim"]
+        < indexes["nl-claude-task"],
+    )
+    check(
+        "source policy: final permission read uses only the fleet credential",
+        policy is not None
+        and (policy.get("env") or {}).get("GH_TOKEN")
+        == "${{ secrets.FLEET_TOKEN }}"
+        and (policy.get("env") or {}).get("HEAD_SHA")
+        == "${{ steps.nl-gate.outputs.revision }}",
+    )
+    check(
+        "source policy: no event claim is admitted after a denied final read",
+        claim is not None
+        and str(claim.get("if", ""))
+        == "steps.nl-final-source-policy.outputs.admitted == 'true'",
+    )
+    check(
+        "source policy: freshness is exact-target evidence",
+        preclaim is not None
+        and (preclaim.get("env") or {}).get("EXPECTED_REVISION")
+        == "${{ steps.nl-gate.outputs.revision }}"
+        and (preclaim.get("env") or {}).get("GH_TOKEN")
+        == "${{ secrets.FLEET_TOKEN }}",
+    )
+    check("source policy: Claude task remains present", task is not None)
 
 
 def test_nl_route_qualifies_answer_with_deterministic_state_not_model_text():
@@ -792,6 +864,7 @@ def main():
     test_error_terminal_state_labels_as_blocked()
     test_retryable_terminal_keeps_card_actionable()
     test_nl_prompt_instructs_fully_qualified_refs()
+    test_source_policy_is_revalidated_at_model_admission()
     test_nl_route_qualifies_answer_with_deterministic_state_not_model_text()
     print()
     if _failures:

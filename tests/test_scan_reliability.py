@@ -9,14 +9,7 @@ Unit-exercise the fleet-scan reliability + correctness hardening, NO network:
 - Consecutive-failure health ledger (`parse_scan_health` / `update_scan_health` /
   `render_scan_health_body` / `cmd_scan_health`): increment/reset, threshold
   alert, run-failing exit, and fail-open on ledger I/O errors.
-- UNKNOWN-mergeability policy (`_settle_mergeable` / `_resolve_pr_bucket` +
-  build_repo): poll a merge-ready or review-needed candidate whose mergeable
-  reads UNKNOWN until it settles to CONFLICTING (-> needs-rebase) or MERGEABLE
-  (-> its original worklist bucket); if it never settles, return
-  MERGEABILITY_PENDING and freeze the PR
-  (`indeterminate_pr_numbers`) so an UNKNOWN reading never flips worklist
-  membership. Plus the #111 acceptance that a statically-conflicting PR never
-  enters the worklist.
+- Pagination and complete-scan behavior after mergeability became a display fact rather than a worklist-membership gate.
 
 Run: python tests/test_scan_reliability.py
 """
@@ -701,186 +694,6 @@ def test_cmd_scan_health_ledger_io_error_fails_open():
 
 # --------------------------------------------------------------------------- #
 # UNKNOWN-mergeable hardening
-# --------------------------------------------------------------------------- #
-def test_settle_mergeable_returns_first_conclusive():
-    seq = iter(["UNKNOWN", "CONFLICTING"])
-    save_read = core.gh_graphql_pr_mergeable
-    save_sleep = core._sleep
-    core.gh_graphql_pr_mergeable = lambda o, n, num: next(seq)
-    core._sleep = lambda d: None
-    try:
-        val = core._settle_mergeable("owner", "demo", 5)
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-        core._sleep = save_sleep
-    check("settle: returns first conclusive value", val == "CONFLICTING")
-
-
-def test_settle_mergeable_fails_open_on_error():
-    def boom(o, n, num):
-        raise RuntimeError("HTTP 502")
-
-    save_read = core.gh_graphql_pr_mergeable
-    save_sleep = core._sleep
-    core.gh_graphql_pr_mergeable = boom
-    core._sleep = lambda d: None
-    try:
-        val = core._settle_mergeable("owner", "demo", 5)
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-        core._sleep = save_sleep
-    check("settle-error: fails open to None", val is None)
-
-
-def _pr_green(number, mergeable):
-    return {
-        "number": number,
-        "isDraft": False,
-        "mergeable": mergeable,
-    }
-
-
-def test_resolve_bucket_reread_catches_conflict():
-    reads = []
-
-    def fake_read(o, n, num):
-        reads.append(num)
-        return "CONFLICTING"
-
-    save_read = core.gh_graphql_pr_mergeable
-    save_sleep = core._sleep
-    core.gh_graphql_pr_mergeable = fake_read
-    core._sleep = lambda d: None
-    try:
-        bucket = core._resolve_pr_bucket(
-            "owner",
-            "demo",
-            _pr_green(5, "UNKNOWN"),
-            False,
-            "pass",
-            "green",
-            True,
-            False,
-        )
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-        core._sleep = save_sleep
-    check("resolve: UNKNOWN merge-ready triggered a re-read", reads == [5])
-    check("resolve: settled CONFLICTING -> needs-rebase", bucket == "needs-rebase")
-
-
-def test_resolve_bucket_unsettled_returns_pending():
-    # UNKNOWN that never settles must NOT be classified into any worklist bucket:
-    # it returns the pending sentinel so build_repo freezes the PR (no membership
-    # flip, no card).
-    reads = []
-    save_read = core.gh_graphql_pr_mergeable
-    save_sleep = core._sleep
-    core.gh_graphql_pr_mergeable = lambda o, n, num: reads.append(num) or "UNKNOWN"
-    core._sleep = lambda d: None
-    try:
-        bucket = core._resolve_pr_bucket(
-            "owner",
-            "demo",
-            _pr_green(6, "UNKNOWN"),
-            False,
-            "pass",
-            "green",
-            True,
-            False,
-        )
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-        core._sleep = save_sleep
-    check(
-        "resolve-pending: unsettled UNKNOWN returns MERGEABILITY_PENDING",
-        bucket == core.MERGEABILITY_PENDING,
-    )
-    check(
-        "resolve-pending: it is NOT a worklist bucket",
-        core.MERGEABILITY_PENDING not in core.NEEDS_MAINTAINER,
-    )
-    check(
-        "resolve-pending: polled the full budget",
-        len(reads) == core.MERGEABLE_SETTLE_READS,
-    )
-
-
-def test_resolve_bucket_known_mergeable_no_reread():
-    called = []
-    save_read = core.gh_graphql_pr_mergeable
-    core.gh_graphql_pr_mergeable = lambda o, n, num: called.append(num) or "MERGEABLE"
-    try:
-        bucket = core._resolve_pr_bucket(
-            "owner",
-            "demo",
-            _pr_green(7, "MERGEABLE"),
-            False,
-            "pass",
-            "green",
-            True,
-            False,
-        )
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-    check(
-        "resolve-fast: authoritative MERGEABLE stays merge-ready",
-        bucket == "merge-ready",
-    )
-    check("resolve-fast: no wasteful re-read for a known-mergeable PR", called == [])
-
-
-def test_resolve_bucket_reread_settles_mergeable():
-    save_read = core.gh_graphql_pr_mergeable
-    save_sleep = core._sleep
-    core.gh_graphql_pr_mergeable = lambda o, n, num: "MERGEABLE"
-    core._sleep = lambda d: None
-    try:
-        bucket = core._resolve_pr_bucket(
-            "owner",
-            "demo",
-            _pr_green(8, "UNKNOWN"),
-            False,
-            "pass",
-            "green",
-            True,
-            False,
-        )
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-        core._sleep = save_sleep
-    check("resolve: re-read proves MERGEABLE -> merge-ready", bucket == "merge-ready")
-
-
-def test_resolve_review_needed_unknown_settles_or_freezes():
-    pr = _pr_green(9, "UNKNOWN")
-    checks = (
-        ("CONFLICTING", "needs-rebase"),
-        ("MERGEABLE", "review-needed"),
-        ("UNKNOWN", core.MERGEABILITY_PENDING),
-    )
-    save_read = core.gh_graphql_pr_mergeable
-    save_sleep = core._sleep
-    try:
-        for settled, expected in checks:
-            core.gh_graphql_pr_mergeable = lambda o, n, num, value=settled: value
-            core._sleep = lambda d: None
-            bucket = core._resolve_pr_bucket(
-                "owner", "demo", pr, False, "pass", "none", True, False
-            )
-            check(
-                "resolve-review-needed: UNKNOWN settling %s -> %s"
-                % (settled, expected),
-                bucket == expected,
-            )
-    finally:
-        core.gh_graphql_pr_mergeable = save_read
-        core._sleep = save_sleep
-
-
-# --------------------------------------------------------------------------- #
-# build_repo integration: pagination + UNKNOWN-mergeable in the real scan
-# --------------------------------------------------------------------------- #
 def _check_run(name, conclusion="SUCCESS"):
     return {
         "__typename": "CheckRun",
@@ -891,9 +704,14 @@ def _check_run(name, conclusion="SUCCESS"):
 
 
 def _green_rollup():
+    nodes = [_check_run("Gate"), _check_run("test")]
     return {
         "state": "SUCCESS",
-        "contexts": {"nodes": [_check_run("Gate"), _check_run("test")]},
+        "contexts": {
+            "totalCount": len(nodes),
+            "pageInfo": {"hasNextPage": False},
+            "nodes": nodes,
+        },
     }
 
 
@@ -910,10 +728,16 @@ def _full_pr(number, *, mergeable="MERGEABLE", cross_repo=False, has_tests=True)
         "headRefName": "feature-%d" % number,
         "headRefOid": "sha%d" % number,
         "baseRefName": "main",
-        "headRepository": {"name": "demo", "owner": {"login": "owner"}},
+        "baseRefOid": "base-main",
+        "headRepository": {"name": "demo", "nameWithOwner": "owner/demo", "isFork": False, "owner": {"login": "owner", "__typename": "User"}},
+        "maintainerCanModify": False,
         "baseRepository": {"name": "demo", "owner": {"login": "owner"}},
         "labels": {"totalCount": 0, "nodes": []},
-        "closingIssuesReferences": {"totalCount": 0, "nodes": []},
+        "closingIssuesReferences": {
+            "totalCount": 0,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [],
+        },
         "commits": {
             "nodes": [
                 {
@@ -923,7 +747,11 @@ def _full_pr(number, *, mergeable="MERGEABLE", cross_repo=False, has_tests=True)
                             if has_tests
                             else {
                                 "state": "SUCCESS",
-                                "contexts": {"nodes": [_check_run("Gate")]},
+                                "contexts": {
+                                    "totalCount": 1,
+                                    "pageInfo": {"hasNextPage": False},
+                                    "nodes": [_check_run("Gate")],
+                                },
                             }
                         )
                     }
@@ -973,16 +801,6 @@ def _run_build_repo(
             raise RuntimeError("HTTP 502 mid-page after retries")
         return pr_pages[after]
 
-    reads = list(mergeable_reads or [])
-
-    def fake_mergeable(owner, name, num):
-        if settlement_events is not None:
-            settlement_events.append(("read", num))
-        value = reads.pop(0) if reads else "UNKNOWN"
-        if isinstance(value, BaseException):
-            raise value
-        return value
-
     def fake_rest(path, method=None, fields=None, jq=None, paginate=False, slurp=False):
         if method == "POST" and "/comments" in path:
             posts.append({"path": path, "body": (fields or {}).get("body", "")})
@@ -996,18 +814,22 @@ def _run_build_repo(
     saves = (
         core.gh_graphql,
         core.gh_graphql_pr_page,
-        core.gh_graphql_pr_mergeable,
         core.gh_rest,
         core.load_config,
         core._sleep,
+        core.immutable_compare_files,
         os.environ.get("OWNER"),
         os.environ.get("GITHUB_REPOSITORY_OWNER"),
     )
     core.gh_graphql = fake_graphql
     core.gh_graphql_pr_page = fake_pr_page
-    core.gh_graphql_pr_mergeable = fake_mergeable
     core.gh_rest = fake_rest
     core.load_config = lambda: {"repos": {"demo": repo_cfg}, "maintainer": ""}
+    core.immutable_compare_files = lambda _slug, _base, _head, expected: (
+        ["src/file-%d.py" % index for index in range(int(expected or 0))],
+        True,
+        True,
+    )
     if settlement_events is None:
         core._sleep = lambda d: None
     else:
@@ -1022,10 +844,10 @@ def _run_build_repo(
         (
             core.gh_graphql,
             core.gh_graphql_pr_page,
-            core.gh_graphql_pr_mergeable,
-            core.gh_rest,
+                core.gh_rest,
             core.load_config,
             core._sleep,
+            core.immutable_compare_files,
             old_owner,
             old_repo_owner,
         ) = saves
@@ -1044,13 +866,13 @@ def test_build_repo_multipage_ok_and_complete():
     first = {
         "totalCount": 45,
         "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
-        "nodes": [_full_pr(i) for i in range(30)],
+        "nodes": [_full_pr(i) for i in range(1, 31)],
     }
     pages = {
         "c1": {
             "totalCount": 45,
             "pageInfo": {"hasNextPage": False, "endCursor": "c2"},
-            "nodes": [_full_pr(i) for i in range(30, 45)],
+            "nodes": [_full_pr(i) for i in range(31, 46)],
         }
     }
     result, items, _ = _run_build_repo(first, pr_pages=pages)
@@ -1064,7 +886,7 @@ def test_build_repo_midpage_failure_truncates():
     first = {
         "totalCount": 45,
         "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
-        "nodes": [_full_pr(i) for i in range(30)],
+        "nodes": [_full_pr(i) for i in range(1, 31)],
     }
     result, items, _ = _run_build_repo(first, pr_page_raises=True)
     check(
@@ -1080,173 +902,6 @@ def test_build_repo_midpage_failure_truncates():
         len(result["open_pr_numbers"]) == 30,
     )
 
-
-def test_build_repo_unknown_mergeable_conflict_nudges_no_card():
-    # A green PR whose bulk mergeable is UNKNOWN, but a targeted re-read proves
-    # CONFLICTING -> it must leave the maintainer queue (no card) and get nudged.
-    first = {
-        "totalCount": 1,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [_full_pr(50, mergeable="UNKNOWN")],
-    }
-    result, items, posts = _run_build_repo(first, mergeable_reads=["CONFLICTING"])
-    check("build-unknown-conflict: no merge-ready card emitted", items == [])
-    check("build-unknown-conflict: contributor was nudged once", len(posts) == 1)
-    check("build-unknown-conflict: repo scan stays ok", result["ok"] is True)
-
-
-def test_build_repo_unknown_mergeable_settles_mergeable_card():
-    # UNKNOWN that settles MERGEABLE -> normal merge-ready card (membership: in).
-    first = {
-        "totalCount": 1,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [_full_pr(52, mergeable="UNKNOWN")],
-    }
-    result, items, posts = _run_build_repo(
-        first, mergeable_reads=["UNKNOWN", "MERGEABLE"]
-    )
-    check(
-        "build-unknown-mergeable: merge-ready card emitted",
-        len(items) == 1 and items[0]["bucket"] == "merge-ready",
-    )
-    check(
-        "build-unknown-mergeable: not frozen",
-        result.get("indeterminate_pr_numbers") == [],
-    )
-    check("build-unknown-mergeable: no nudge", posts == [])
-
-
-def test_build_repo_unknown_mergeable_unsettled_freezes():
-    # A green PR whose mergeable never settles: NO false merge-ready, and no
-    # membership flip. It emits NO worklist item and is reported as indeterminate
-    # so reconcile freezes it. No nudge (an UNKNOWN reading is not CONFLICTING).
-    first = {
-        "totalCount": 1,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [_full_pr(51, mergeable="UNKNOWN")],
-    }
-    result, items, posts = _run_build_repo(
-        first, mergeable_reads=[]
-    )  # all reads UNKNOWN
-    check("build-unknown-frozen: no worklist item emitted", items == [])
-    check(
-        "build-unknown-frozen: reported in indeterminate_pr_numbers",
-        result["indeterminate_pr_numbers"] == [51],
-    )
-    check(
-        "build-unknown-frozen: PR stays in open_pr_numbers (still open)",
-        51 in result["open_pr_numbers"],
-    )
-    check("build-unknown-frozen: no nudge off an UNKNOWN reading", posts == [])
-    check("build-unknown-frozen: repo scan stays ok", result["ok"] is True)
-
-
-def test_build_repo_mergeability_read_failure_is_unhealthy():
-    first = {
-        "totalCount": 1,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [_full_pr(56, mergeable="UNKNOWN")],
-    }
-    result, items, posts = _run_build_repo(
-        first, mergeable_reads=[RuntimeError("HTTP 502")]
-    )
-    check("build-mergeability-error: repo is unhealthy", result["ok"] is False)
-    check("build-mergeability-error: no worklist item emitted", items == [])
-    check("build-mergeability-error: no rebase nudge", posts == [])
-    check(
-        "build-mergeability-error: failed PR remains indeterminate",
-        result["indeterminate_pr_numbers"] == [56],
-    )
-    check(
-        "build-mergeability-error: warning preserves the query failure",
-        "mergeability settlement query failed" in result["warning"]
-        and "HTTP 502" in result["warning"],
-    )
-
-
-def test_build_repo_mergeability_read_error_that_recovers_is_healthy():
-    first = {
-        "totalCount": 1,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [_full_pr(57, mergeable="UNKNOWN")],
-    }
-    result, items, _ = _run_build_repo(
-        first, mergeable_reads=[RuntimeError("HTTP 502"), "MERGEABLE"]
-    )
-    check("build-mergeability-recovery: repo remains healthy", result["ok"] is True)
-    check(
-        "build-mergeability-recovery: settled card emitted",
-        len(items) == 1 and items[0]["number"] == 57,
-    )
-
-
-def test_build_repo_review_needed_unknown_settles_conflicting():
-    first = {
-        "totalCount": 1,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [_full_pr(55, mergeable="UNKNOWN", has_tests=False)],
-    }
-    result, items, posts = _run_build_repo(first, mergeable_reads=["CONFLICTING"])
-    check("build-review-needed-conflict: no card emitted", items == [])
-    check(
-        "build-review-needed-conflict: no frozen PR remains",
-        result["indeterminate_pr_numbers"] == [],
-    )
-    check("build-review-needed-conflict: contributor was nudged once", len(posts) == 1)
-
-
-def test_build_repo_settles_unknown_prs_in_rounds():
-    first = {
-        "totalCount": 2,
-        "pageInfo": {"hasNextPage": False},
-        "nodes": [
-            _full_pr(53, mergeable="UNKNOWN"),
-            _full_pr(54, mergeable="UNKNOWN"),
-        ],
-    }
-    events = []
-    result, items, _ = _run_build_repo(
-        first,
-        mergeable_reads=["UNKNOWN", "UNKNOWN", "MERGEABLE", "MERGEABLE"],
-        settlement_events=events,
-    )
-    first_sleep = next(i for i, event in enumerate(events) if event[0] == "sleep")
-    check(
-        "build-unknown-rounds: every first read precedes the first backoff",
-        events[:first_sleep] == [("read", 53), ("read", 54)],
-    )
-    check(
-        "build-unknown-rounds: settled PRs retain their worklist cards",
-        result["indeterminate_pr_numbers"] == []
-        and [item["number"] for item in items] == [53, 54],
-    )
-
-
-def test_build_repo_static_conflict_never_enters_worklist():
-    # #111 acceptance: a statically CONFLICTING PR classifies needs-rebase on
-    # every readable scan and NEVER emits a worklist item (so it can never mint a
-    # duplicate card), across three scan flavors: readable CONFLICTING, and the
-    # post-base-push UNKNOWN that settles CONFLICTING on re-read.
-    def scan(mergeable, reads):
-        first = {
-            "totalCount": 1,
-            "pageInfo": {"hasNextPage": False},
-            "nodes": [_full_pr(111, mergeable=mergeable)],
-        }
-        return _run_build_repo(first, mergeable_reads=reads)
-
-    r1, items1, _ = scan("CONFLICTING", [])
-    r2, items2, _ = scan("UNKNOWN", ["CONFLICTING"])
-    r3, items3, _ = scan("UNKNOWN", ["UNKNOWN", "CONFLICTING"])
-    check("acceptance: readable CONFLICTING emits no card", items1 == [])
-    check("acceptance: UNKNOWN settling CONFLICTING emits no card", items2 == [])
-    check("acceptance: UNKNOWN-then-CONFLICTING (2 reads) emits no card", items3 == [])
-    check(
-        "acceptance: conflicting PR is never frozen-indeterminate once readable",
-        r1["indeterminate_pr_numbers"] == []
-        and r2["indeterminate_pr_numbers"] == []
-        and r3["indeterminate_pr_numbers"] == [],
-    )
 
 
 def main():
@@ -1273,23 +928,8 @@ def main():
     test_checks_command_reads_every_pr_page()
     test_cmd_scan_health_missing_scanfile_fails_open()
     test_cmd_scan_health_ledger_io_error_fails_open()
-    test_settle_mergeable_returns_first_conclusive()
-    test_settle_mergeable_fails_open_on_error()
-    test_resolve_bucket_reread_catches_conflict()
-    test_resolve_bucket_unsettled_returns_pending()
-    test_resolve_bucket_known_mergeable_no_reread()
-    test_resolve_bucket_reread_settles_mergeable()
-    test_resolve_review_needed_unknown_settles_or_freezes()
     test_build_repo_multipage_ok_and_complete()
     test_build_repo_midpage_failure_truncates()
-    test_build_repo_unknown_mergeable_conflict_nudges_no_card()
-    test_build_repo_unknown_mergeable_settles_mergeable_card()
-    test_build_repo_unknown_mergeable_unsettled_freezes()
-    test_build_repo_mergeability_read_failure_is_unhealthy()
-    test_build_repo_mergeability_read_error_that_recovers_is_healthy()
-    test_build_repo_review_needed_unknown_settles_conflicting()
-    test_build_repo_settles_unknown_prs_in_rounds()
-    test_build_repo_static_conflict_never_enters_worklist()
     print()
     if _failures:
         print("%d FAILED: %s" % (len(_failures), ", ".join(_failures)))

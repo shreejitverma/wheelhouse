@@ -8,7 +8,7 @@ normalized item.json that render_card.py can turn into a card.
 
 Expected fields (all but repo/number optional):
   repo, number, kind, head_sha, updated_at, title, author, bucket, comp, tests,
-  summary, recommendation, priority, options (list or comma string),
+  summary, priority, options (list or comma string),
   auto_triage (false as an item-level opt-out for pr-review),
   auto_triage_issues (false as an item-level opt-out for issue-triage)
 
@@ -46,7 +46,11 @@ from render_card import CHECKBOX_OPTIONS, checkbox_options  # noqa: E402
 from wheelhouse_core import (  # noqa: E402
     _auto_triage_enabled,
     _auto_triage_issues_enabled,
+    _triage_attempt_cap,
+    _triage_context_allowance,
     load_config,
+    TRIAGE_ATTEMPT_CAP_DEFAULT,
+    TRIAGE_CONTEXT_ALLOWANCE_DEFAULT,
 )
 
 VALID_KINDS = {"pr-review", "ci-approval", "issue-triage"}
@@ -78,7 +82,6 @@ def from_payload():
         "updated_at": os.environ.get("INPUT_UPDATED_AT", ""),
         "title": os.environ.get("INPUT_TITLE", ""),
         "summary": os.environ.get("INPUT_SUMMARY", ""),
-        "recommendation": os.environ.get("INPUT_RECOMMENDATION", ""),
         "priority": os.environ.get("INPUT_PRIORITY", ""),
         "options": os.environ.get("INPUT_OPTIONS", ""),
     }
@@ -118,9 +121,34 @@ def normalize(d):
         auto_triage_issues = _auto_triage_issues_enabled(
             repo_cfg, cfg["auto_triage_issues"]
         )
+        cap_map = cfg.get("triage_attempt_caps", {})
+        triage_attempt_cap = (
+            cap_map[repo]
+            if repo in cap_map
+            else _triage_attempt_cap(
+                repo_cfg,
+                cfg.get(
+                    "triage_attempt_cap_per_revision", TRIAGE_ATTEMPT_CAP_DEFAULT
+                ),
+            )
+        )
+        allowance_map = cfg.get("triage_context_allowances", {})
+        triage_context_allowance = (
+            allowance_map[repo]
+            if repo in allowance_map
+            else _triage_context_allowance(
+                repo_cfg,
+                cfg.get(
+                    "triage_context_refresh_allowance",
+                    TRIAGE_CONTEXT_ALLOWANCE_DEFAULT,
+                ),
+            )
+        )
     except SystemExit:
         auto_triage = True
         auto_triage_issues = True
+        triage_attempt_cap = 1
+        triage_context_allowance = 0
     if "auto_triage" in d and not boolish(d.get("auto_triage")):
         auto_triage = boolish(d.get("auto_triage"))
     if "auto_triage_issues" in d and not boolish(d.get("auto_triage_issues")):
@@ -139,11 +167,12 @@ def normalize(d):
         "tests": str(d.get("tests", "") or "n/a"),
         "url": url,
         "summary": str(d.get("summary", "") or ""),
-        "recommendation": str(d.get("recommendation", "") or "Needs your call."),
         "priority": str(d.get("priority", "") or "med"),
         "options": options,
         "auto_triage": auto_triage,
         "auto_triage_issues": auto_triage_issues,
+        "triage_attempt_cap_per_revision": triage_attempt_cap,
+        "triage_context_refresh_allowance": triage_context_allowance,
     }
 
 

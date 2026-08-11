@@ -71,11 +71,18 @@ def build_command(
             "WHEELHOUSE_BUNDLE_ROOT": str(Path(bundle)),
             "WHEELHOUSE_PROVIDER_SOCKET": provider_socket,
             "WHEELHOUSE_SEARCH_SOCKET": search_socket,
+            "WHEELHOUSE_AUTH_SOURCE": auth_source,
         }
         return worker_command, environment
 
     root = str(Path(__file__).resolve().parents[1])
     command = [
+        # GitHub's Ubuntu 24.04 runner prohibits an unprivileged process from
+        # bringing up loopback in its new network namespace.  Bubblewrap needs
+        # that privilege only while it builds the namespace; it clears the
+        # environment and drops every capability before the worker starts.
+        "sudo",
+        "--non-interactive",
         proof["binary"],
         "--die-with-parent",
         "--new-session",
@@ -109,7 +116,8 @@ def build_command(
         command.extend(["--ro-bind", str(prefix), "/runtime/codex-install"])
         worker_path = "/runtime/codex-install/node_modules/.bin:" + worker_path
     elif binary_path:
-        command.extend(["--ro-bind", str(binary.resolve()), "/runtime/codex"])
+        binary_name = "claude" if binary.name == "claude" else "codex"
+        command.extend(["--ro-bind", str(binary.resolve()), "/runtime/" + binary_name])
         worker_path = "/runtime:" + worker_path
     node = shutil.which("node")
     if node:
@@ -145,6 +153,7 @@ def build_command(
             "--setenv", "WHEELHOUSE_BUNDLE_ROOT", "/run/wheelhouse",
             "--setenv", "WHEELHOUSE_PROVIDER_SOCKET", "/run/wheelhouse/provider.sock" if provider_socket else "",
             "--setenv", "WHEELHOUSE_SEARCH_SOCKET", "/run/wheelhouse/search.sock" if search_socket else "",
+            "--setenv", "WHEELHOUSE_AUTH_SOURCE", "/auth-source/credential" if auth_source else "",
             "--chdir", "/work",
             "--",
         ]

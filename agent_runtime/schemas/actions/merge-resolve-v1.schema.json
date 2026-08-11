@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wheelhouse/merge-resolve/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "reason", "resolutions"],
+  "properties": {
+    "status": {"type": "string", "enum": ["resolved", "cannot_safely_resolve"]},
+    "reason": {"type": "string", "maxLength": 2000},
+    "resolutions": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "hunk", "selection", "rationale"],
+        "properties": {
+          "file": {"type": "string", "minLength": 1, "maxLength": 240},
+          "hunk": {"type": "integer", "minimum": 0, "maximum": 999},
+          "selection": {
+            "type": "string",
+            "enum": ["ours", "theirs", "ours-then-theirs", "theirs-then-ours"]
+          },
+          "rationale": {"type": "string", "maxLength": 500}
+        }
+      }
+    }
+  }
+}

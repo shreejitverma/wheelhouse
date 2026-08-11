@@ -23,8 +23,8 @@ Every auto-merge requires ALL of (see the numbered contract in AGENTS.md):
       aligns with the base VISION.md, no ineligible existing/default behavior
       change, recommends merge (class C also strictly opt-in + default off)
   G7  immediately re-check the card, head SHA, base SHA, default-branch VISION.md,
-      mergeability, clean state, escape hatch, and configured check contexts,
-      then do_merge
+      mergeability, clean state, escape hatch, configured check contexts, and
+      same-closing-issue ambiguity, then do_merge
 Plus a per-PR `wheelhouse:no-auto-merge` escape hatch, global/per-repo switches
 (shipped code default OFF; this repository's committed global switch is ON), a
 durable audit ledger, and a resolved decision record.
@@ -136,12 +136,12 @@ _LIVE_STATUS_GQL = (
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
     pullRequest(number:$number) {
-      headRefOid
+      number headRefOid
       commits(last:1) { nodes { commit { statusCheckRollup {
         state
         contexts(first:%d) { totalCount pageInfo { hasNextPage } nodes {
           __typename
-          ... on CheckRun { name conclusion status }
+          ... on CheckRun { databaseId detailsUrl name conclusion status }
           ... on StatusContext { context state }
         }}
       }}}}
@@ -162,12 +162,32 @@ def normalize_behavior_class(value):
     return text if text in ELIGIBLE_BEHAVIOR_CLASSES else ""
 
 
-def behavior_verdict_facts(verdict):
+def _scan_same_closing_issue_clear(item):
+    """Require the complete fleet scan to prove no same-issue ambiguity."""
+    if "same_closing_issue_overlap" not in item or not isinstance(
+        item.get("same_closing_issue_overlap"), str
+    ):
+        return (
+            False,
+            "same-closing-issue overlap evidence is unavailable (failing closed)",
+        )
+    note = item["same_closing_issue_overlap"]
+    if note:
+        return (False, "same-closing-issue ambiguity: %s" % note[:240])
+    return (True, "")
+
+
+def behavior_verdict_facts(verdict, triaged_vision_sha=""):
     """Return the structured facts that make up the behavior-verdict gate.
 
     `verdict_eligible` and the card UI consume these exact facts, so a displayed
     result cannot drift from enforcement. The first failing fact preserves the
     historical hold reason and ordering.
+
+    `triaged_vision_sha` is the card state's already-known triage-time VISION.md
+    revision. It only makes the vision-bound rows honest: when it is present,
+    VISION.md provably WAS read, so the rows must not claim one is required.
+    It never changes a status, an ordering, or eligibility.
     """
     facts = {}
 
@@ -216,43 +236,108 @@ def behavior_verdict_facts(verdict):
         "class %s" % cls if cls else class_reason,
         class_reason,
     )
-    fact(
-        "g6_vision_alignment",
-        verdict.get("aligns_with_vision") is True,
-        "alignment confirmed"
-        if verdict.get("aligns_with_vision") is True
-        else "alignment not confirmed",
-        "verdict does not confirm alignment with VISION.md",
-    )
+    if cls:
+        admission_status, admission_evidence, admission_reason = (
+            render_card.behavior_admission_status(verdict)
+        )
+        facts["g6_behavior_class"] = {
+            "status": {
+                "admitted": criteria_schema.STATUS_MET,
+                "contradictory": criteria_schema.STATUS_UNMET,
+            }.get(admission_status, criteria_schema.STATUS_UNAVAILABLE),
+            "evidence": admission_evidence,
+            "reason": admission_reason,
+        }
+    changes = verdict.get("changes_existing_or_default_behavior")
+    if changes is True:
+        # The fact is known, not unknown: the verdict affirmatively reports a
+        # change, so the row must not hedge as if nobody knows (card #2148).
+        default_evidence = (
+            "the triage verdict reports an existing/default behavior change"
+        )
+        default_reason = (
+            "verdict reports an ineligible existing/default behavior change"
+        )
+    else:
+        default_evidence = (
+            "existing/default behavior change not ruled out (no usable verdict fact)"
+        )
+        default_reason = (
+            "verdict does not rule out an ineligible existing/default behavior change"
+        )
     fact(
         "g6_default_behavior",
-        verdict.get("changes_existing_or_default_behavior") is False,
-        "no existing/default behavior change"
-        if verdict.get("changes_existing_or_default_behavior") is False
-        else "existing/default behavior change not ruled out",
-        "verdict does not rule out an ineligible existing/default behavior change",
+        changes is False,
+        "no existing/default behavior change" if changes is False else default_evidence,
+        default_reason,
     )
-    fact(
-        "g6_verdict_merge",
-        verdict.get("recommend_merge") is True,
-        "merge recommended"
-        if verdict.get("recommend_merge") is True
-        else "merge not recommended",
-        "verdict does not recommend merge",
+    if not cls:
+        facts["g6_class_c_mode"] = {
+            "status": criteria_schema.STATUS_UNAVAILABLE,
+            "evidence": "not evaluated because behavior class is invalid",
+            "reason": "eligible behavior class is required before class-C mode",
+        }
+    elif cls != "C":
+        fact(
+            "g6_class_c_mode",
+            True,
+            "not applicable to class %s" % cls,
+        )
+    else:
+        class_c_ok = verdict.get("optin_default_off") is True
+        fact(
+            "g6_class_c_mode",
+            class_c_ok,
+            (
+                "strictly opt-in and default-off"
+                if class_c_ok
+                else "class C opt-in/default-off not confirmed"
+            ),
+            "class C but verdict does not confirm strictly opt-in and default off",
+        )
+    vision_fields_present = any(
+        field in verdict for field in ("aligns_with_vision", "recommend_merge")
     )
-    class_c_ok = cls != "C" or verdict.get("optin_default_off") is True
-    fact(
-        "g6_class_c_mode",
-        class_c_ok,
-        "not applicable to class %s" % cls
-        if cls and cls != "C"
-        else (
-            "strictly opt-in and default-off"
-            if class_c_ok
-            else "class C opt-in/default-off not confirmed"
-        ),
-        "class C but verdict does not confirm strictly opt-in and default off",
-    )
+    if not vision_fields_present:
+        # Absence has two distinct causes and the card must not report the wrong
+        # one: no VISION.md was read at triage time, or one was read and the
+        # verdict simply carried no vision-bound alignment fact.
+        vision_sha = str(triaged_vision_sha or "").strip()
+        if vision_sha:
+            vision_evidence = (
+                "VISION.md %s was read, but the triage verdict carries no "
+                "vision-bound alignment fact" % vision_sha[:8]
+            )
+            vision_reason = "triage verdict carries no vision-bound alignment fact"
+        else:
+            vision_evidence = (
+                "not evaluated because a trusted default-branch VISION.md "
+                "is required"
+            )
+            vision_reason = "trusted default-branch VISION.md is required"
+        for key in ("g6_vision_alignment", "g6_verdict_merge"):
+            facts[key] = {
+                "status": criteria_schema.STATUS_UNAVAILABLE,
+                "evidence": vision_evidence,
+                "reason": vision_reason,
+            }
+    else:
+        fact(
+            "g6_vision_alignment",
+            verdict.get("aligns_with_vision") is True,
+            "alignment confirmed"
+            if verdict.get("aligns_with_vision") is True
+            else "alignment not confirmed",
+            "verdict does not confirm alignment with VISION.md",
+        )
+        fact(
+            "g6_verdict_merge",
+            verdict.get("recommend_merge") is True,
+            "merge recommended"
+            if verdict.get("recommend_merge") is True
+            else "merge not recommended",
+            "verdict does not recommend merge",
+        )
     return facts, cls
 
 
@@ -263,6 +348,7 @@ def verdict_eligible(verdict):
 
     Fields (each defaulting to its disqualifying value if absent):
       behavior_class                        one of A/B/C, else ineligible
+      behavior_admission             (dict)  required, with restoration for B
       aligns_with_vision            (bool)  must be True
       changes_existing_or_default_behavior (bool) must be False
       recommend_merge               (bool)  must be True
@@ -322,6 +408,44 @@ def _pr_label_names(pr):
         elif isinstance(label, str):
             names.add(label)
     return names
+
+
+def _bulk_confirmation_label_hold(pr):
+    labels = (pr or {}).get("labels")
+    if not isinstance(labels, list):
+        return (True, "target labels could not be read")
+    if core.AWAITING_CAPTAIN_CONFIRM_LABEL in _pr_label_names(pr):
+        return (True, "assisted resolution awaits captain confirmation")
+    if (pr or {}).get("labels_truncated") is not False:
+        return (True, "target label observation is incomplete")
+    return (False, "")
+
+
+def _live_confirmation_label_hold(owner, repo, number):
+    state = core.target_label_state(
+        owner, repo, number, core.AWAITING_CAPTAIN_CONFIRM_LABEL
+    )
+    if state is None:
+        return (True, "assisted-confirmation label could not be re-read")
+    if state:
+        return (True, "assisted resolution awaits captain confirmation")
+    return (False, "")
+
+
+def _assisted_confirmation_hold(state, head_sha):
+    state = state if isinstance(state, dict) else {}
+    if render_card.MERGE_ASSIST_FIELD not in state:
+        return (False, "")
+    status, record = render_card.merge_assist_status(state, head_sha)
+    if status == "malformed":
+        return (True, "assisted-merge confirmation record is malformed")
+    if (
+        status == "matching"
+        and record.get("phase") == render_card.MERGE_ASSIST_PHASE_AWAITING
+        and record.get("resolution_head_sha") == head_sha
+    ):
+        return (True, "assisted resolution awaits the captain's confirmation")
+    return (False, "")
 
 
 def auto_merge_triage_available():
@@ -461,6 +585,9 @@ def live_check_status(owner, repo, number, head_sha, repo_cfg):
             or total_count != len(context_nodes)
         ):
             return (False, "configured check contexts are incomplete")
+        core.enrich_compliance_evidence(
+            owner, repo, pr, repo_cfg, number=number
+        )
         comp, tests, _, _ = core.check_status(pr, repo_cfg)
     except (KeyError, TypeError, RuntimeError, ValueError) as error:
         return (False, "could not re-read configured checks: %s" % str(error)[:160])
@@ -488,46 +615,8 @@ def mergeable_clean(pr):
 
 
 def immutable_compare_files(slug, base_sha, head_sha, expected_count):
-    base_sha = str(base_sha or "").strip()
-    head_sha = str(head_sha or "").strip()
-    if not _GIT_OBJECT_ID_RE.fullmatch(base_sha) or not _GIT_OBJECT_ID_RE.fullmatch(
-        head_sha
-    ):
-        return ([], False, False)
-    try:
-        comparison = core.gh_rest(
-            "/repos/%s/compare/%s...%s" % (slug, base_sha, head_sha)
-        )
-    except RuntimeError:
-        return ([], False, False)
-    if not isinstance(comparison, dict) or not isinstance(
-        comparison.get("files"), list
-    ):
-        return ([], False, False)
-    files = []
-    entry_count = 0
-    for changed in comparison["files"]:
-        if not isinstance(changed, dict):
-            return ([], False, False)
-        filename = str(changed.get("filename") or "").strip()
-        if not filename:
-            return ([], False, False)
-        files.append(filename)
-        entry_count += 1
-        if "previous_filename" in changed:
-            previous_filename = changed.get("previous_filename")
-            if not isinstance(previous_filename, str):
-                return ([], False, False)
-            previous_filename = previous_filename.strip()
-            if not previous_filename:
-                return ([], False, False)
-            files.append(previous_filename)
-    try:
-        count = int(expected_count)
-    except (TypeError, ValueError):
-        return ([], False, False)
-    complete = count >= 0 and entry_count == count
-    return (files, True, complete)
+    """Share the observation reducer's exact immutable changed-path read."""
+    return core.immutable_compare_files(slug, base_sha, head_sha, expected_count)
 
 
 # --------------------------------------------------------------------------- #
@@ -667,62 +756,16 @@ def fresh_verdict_facts(state, head_sha):
     """Return every persisted triage/verdict fact for one candidate head.
 
     The ordered first failure is the existing G6 decision. The full fact map is
-    also rendered on cards, but is never read back as authorization.
+    also rendered on cards, but is never read back as authorization. The
+    admission-dependent facts are owned by render_card.triage_admission_facts
+    so a card write can recompute exactly them from the state being written
+    (card #2148 display race).
     """
     state = state if isinstance(state, dict) else {}
-    head_sha = str(head_sha or "")
-    facts = {}
-
-    def fact(key, ok, evidence, reason):
-        facts[key] = {
-            "status": criteria_schema.STATUS_MET
-            if ok
-            else criteria_schema.STATUS_UNMET,
-            "evidence": evidence,
-            "reason": "" if ok else reason,
-        }
-
-    current_head_ok = bool(head_sha)
-    triage_ok = current_head_ok and state.get("triage_status") == "succeeded"
-    revision_ok = triage_ok and str(state.get("triaged_sha") or "") == head_sha
-    card_head_ok = revision_ok and str(state.get("head_sha") or "") == head_sha
-    triage_reason = (
-        "current head SHA is unavailable"
-        if not current_head_ok
-        else (
-            "no successful auto-triage verdict on the card"
-            if not triage_ok
-            else (
-                "behavior verdict is stale (not for the current head SHA)"
-                if not revision_ok
-                else ("card head SHA is not current" if not card_head_ok else "")
-            )
-        )
-    )
-    fact(
-        "g6_triage_success",
-        card_head_ok,
-        "successful triage for head %s" % head_sha[:8]
-        if card_head_ok
-        else triage_reason,
-        triage_reason,
-    )
-    recommendation = state.get("triage_recommendation")
-    action = (
-        render_card.normalize_recommendation_action(recommendation.get("action"))
-        if isinstance(recommendation, dict)
-        else ""
-    )
-    recommendation_ok = card_head_ok and action == "merge"
-    recommendation_reason = "top-level triage recommendation is not an explicit merge"
-    fact(
-        "g6_merge_recommendation",
-        recommendation_ok,
-        "explicit merge recommendation" if recommendation_ok else recommendation_reason,
-        recommendation_reason,
-    )
+    facts = dict(render_card.triage_admission_facts(state, head_sha))
     behavior_facts, behavior_class = behavior_verdict_facts(
-        state.get("automerge_verdict")
+        state.get("automerge_verdict"),
+        triaged_vision_sha=state.get("triaged_vision_sha", ""),
     )
     facts.update(behavior_facts)
     return facts, behavior_class
@@ -890,6 +933,15 @@ def evaluate_candidate(
     # their actual scan result.
     met("scan_complete", "candidate came from a complete healthy scan")
 
+    closing_issue_clear, closing_issue_reason = _scan_same_closing_issue_clear(item)
+    if closing_issue_clear:
+        result["gates"]["same_closing_issue_overlap"] = "none"
+    else:
+        if not result["hold_reason"]:
+            result["hold_reason"] = closing_issue_reason
+        if not full_evaluation:
+            return finish(False)
+
     enabled = core._auto_merge_enabled(repo_cfg, global_auto_merge)
     if enabled:
         met("g0_repo_enabled", "enabled by effective repository policy")
@@ -904,12 +956,15 @@ def evaluate_candidate(
 
     triage_available = auto_merge_triage_available()
     if triage_available:
-        met("g6_triage_available", "CLAUDE_CODE_OAUTH_TOKEN is configured")
+        met(
+            "g6_triage_available",
+            "model credential is configured; card triage eligibility is evaluated separately",
+        )
     else:
         stopped = fail(
             "g6_triage_available",
-            "CLAUDE_CODE_OAUTH_TOKEN is unavailable",
-            "G6 CLAUDE_CODE_OAUTH_TOKEN is unavailable",
+            "model credential is unavailable",
+            "G6 model credential is unavailable",
             unavailable=True,
         )
         if stopped:
@@ -991,7 +1046,10 @@ def evaluate_candidate(
         if stopped:
             return stopped
     verdict = state.get("automerge_verdict")
-    structured_verdict = isinstance(verdict, dict)
+    vision_bound_verdict = isinstance(verdict, dict) and all(
+        isinstance(verdict.get(field), bool)
+        for field in ("aligns_with_vision", "recommend_merge")
+    )
 
     vision_present, vision_sha = vision_on_default_branch(slug)
     if vision_present:
@@ -999,18 +1057,26 @@ def evaluate_candidate(
     else:
         stopped = fail(
             "g0_vision_present",
-            "VISION.md missing or unreadable on the default branch",
+            criteria_schema.G0_VISION_MISSING_EVIDENCE,
             "G0 no committed VISION.md on %s default branch" % repo,
             unavailable=True,
         )
         if stopped:
             return stopped
-    if not structured_verdict:
+    if not vision_present:
         stopped = fail(
             "g6_vision_revision",
-            "not evaluated because no structured behavior verdict exists to bind "
-            "to a VISION.md revision",
-            "G6 no structured behavior verdict",
+            "not evaluated because a trusted default-branch VISION.md is required",
+            "G6 trusted default-branch VISION.md is required",
+            unavailable=True,
+        )
+        if stopped:
+            return stopped
+    elif not vision_bound_verdict:
+        stopped = fail(
+            "g6_vision_revision",
+            "not evaluated because no vision-bound behavior verdict exists",
+            "G6 no vision-bound behavior verdict",
             unavailable=True,
         )
         if stopped:
@@ -1068,7 +1134,25 @@ def evaluate_candidate(
     else:
         met("safety_target_open", "target PR is open and unmerged")
 
-    if core.NO_AUTO_MERGE_LABEL in _pr_label_names(pr):
+    pr_labels = pr.get("labels")
+    label_hold, label_reason = _bulk_confirmation_label_hold(item)
+    if not label_hold:
+        label_hold, label_reason = _live_confirmation_label_hold(
+            owner, repo, number
+        )
+    confirmation_hold, confirmation_reason = _assisted_confirmation_hold(
+        state, head_sha
+    )
+    if not isinstance(pr_labels, list):
+        stopped = fail(
+            "safety_escape_hatch",
+            "target labels could not be read",
+            "target labels are unavailable",
+            unavailable=True,
+        )
+        if stopped:
+            return stopped
+    elif core.NO_AUTO_MERGE_LABEL in _pr_label_names(pr):
         stopped = fail(
             "safety_escape_hatch",
             "%s is present" % core.NO_AUTO_MERGE_LABEL,
@@ -1076,8 +1160,25 @@ def evaluate_candidate(
         )
         if stopped:
             return stopped
+    elif label_hold:
+        stopped = fail(
+            "safety_escape_hatch",
+            label_reason,
+            label_reason,
+            unavailable=core.AWAITING_CAPTAIN_CONFIRM_LABEL not in _pr_label_names(pr),
+        )
+        if stopped:
+            return stopped
+    elif confirmation_hold:
+        stopped = fail(
+            "safety_escape_hatch",
+            confirmation_reason,
+            confirmation_reason,
+        )
+        if stopped:
+            return stopped
     else:
-        met("safety_escape_hatch", "%s is absent" % core.NO_AUTO_MERGE_LABEL)
+        met("safety_escape_hatch", "no target or assisted-confirmation hold is present")
 
     live_head = str((pr.get("head") or {}).get("sha") or "")
     if live_head and live_head == head_sha:
@@ -1092,12 +1193,20 @@ def evaluate_candidate(
             return stopped
 
     base_sha = str((pr.get("base") or {}).get("sha") or "")
-    if not structured_verdict:
+    if not vision_present:
         stopped = fail(
             "g6_base_revision",
-            "not evaluated because no structured behavior verdict exists to bind "
-            "to a base revision",
-            "G6 no structured behavior verdict",
+            "not evaluated because a trusted default-branch VISION.md is required",
+            "G6 trusted default-branch VISION.md is required",
+            unavailable=True,
+        )
+        if stopped:
+            return stopped
+    elif not vision_bound_verdict:
+        stopped = fail(
+            "g6_base_revision",
+            "not evaluated because no vision-bound behavior verdict exists",
+            "G6 no vision-bound behavior verdict",
             unavailable=True,
         )
         if stopped:
@@ -1316,7 +1425,9 @@ def evaluate_candidate(
         )
         unmet("g7_immediate_recheck", evidence)
         if not result["hold_reason"]:
-            result["hold_reason"] = "G7 manual-merge hold state is %s" % workflow_hold_status
+            result["hold_reason"] = (
+                "G7 manual-merge hold state is %s" % workflow_hold_status
+            )
         return finish(False)
     unmet(
         "g7_immediate_recheck",
@@ -1389,28 +1500,12 @@ def collect_card_criteria(scan, cards):
         else:
             criteria = result["criteria"]
             repo_ok, repo_reason = _repo_result_ok(scan, repo)
-            indeterminate = item.get("number") in set(
-                (
-                    ((scan.get("repos") or {}).get(repo) or {}).get(
-                        "indeterminate_pr_numbers"
-                    )
-                    or []
-                )
-            )
-            if repo_ok and not indeterminate:
+            if repo_ok:
                 scan_status = criteria_schema.STATUS_MET
-                scan_evidence = "repo scan is ok, complete, and mergeability settled"
+                scan_evidence = "repo scan is ok and complete"
             else:
-                scan_status = (
-                    criteria_schema.STATUS_UNAVAILABLE
-                    if not repo_ok
-                    else criteria_schema.STATUS_UNMET
-                )
-                scan_evidence = (
-                    repo_reason
-                    if not repo_ok
-                    else "mergeability is indeterminate this scan"
-                )
+                scan_status = criteria_schema.STATUS_UNAVAILABLE
+                scan_evidence = repo_reason
             for row in criteria:
                 if row.get("id") == "scan_complete":
                     row["status"] = scan_status
@@ -1446,6 +1541,11 @@ def _release_card_claim(number):
             "could not release auto-merge claim: %s"
             % str(getattr(result, "stderr", "") or "gh error").strip()
         )
+    print(
+        "::notice::wheelhouse automerge released card=%s card_writes=1"
+        % number,
+        file=sys.stderr,
+    )
 
 
 def _pending_audit_record(state, card_issue=None):
@@ -1617,33 +1717,36 @@ def _workflow_hold_snapshot_matches(expected, current):
 
 
 def _update_workflow_hold_card(number, body, labels):
-    repository = str(os.environ.get("GITHUB_REPOSITORY") or "").strip()
-    if not re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
-        raise RuntimeError("card repository identity is unavailable")
-    args = [
-        "api",
-        "--method",
-        "PATCH",
-        "repos/%s/issues/%s" % (repository, number),
-        "--raw-field",
-        "body=%s" % body,
-    ]
-    for label in sorted(labels):
-        args.extend(["--raw-field", "labels[]=%s" % label])
-    result = render_card._gh(args)
-    try:
-        updated = json.loads(result.stdout or "{}")
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("manual-merge hold update response is unreadable") from error
+    import projection_writer
+
+    current = render_card.get_card(number)
+    if not current or not render_card.issue_is_open(current):
+        raise RuntimeError("manual-merge hold card is unavailable")
+    state = core.parse_state_block(current.get("body") or "") or {}
+    managed = render_card._projection_managed_labels(
+        current.get("labels"), add={render_card.AUTOMERGE_WORKFLOW_HOLD_LABEL}
+    )
+    outcome = projection_writer.commit_preplanned(
+        number,
+        current,
+        title=current.get("title", ""),
+        body=body,
+        managed_labels=managed,
+        cause="decision-or-action",
+        observation_id=((state.get(render_card.REVIEW_OBSERVATION_FIELD) or {}).get("observation_id", "")),
+        context_id=((state.get(render_card.DECISION_CONTEXT_FIELD) or {}).get("context_id", "")),
+    )
+    if outcome != "committed":
+        raise RuntimeError("manual-merge hold projection was deferred")
+    updated = render_card.get_card(number)
     updated_at = str(render_card.card_updated_at(updated) or "")
     if (
-        int(updated.get("number") or 0) != int(number)
-        or not render_card.issue_is_open(updated)
+        not updated
         or updated.get("body") != body
         or _card_label_names(updated) != set(labels)
         or not updated_at
     ):
-        raise RuntimeError("manual-merge hold update response is untrusted")
+        raise RuntimeError("manual-merge hold update did not verify")
     return updated_at
 
 
@@ -1673,7 +1776,9 @@ def persist_workflow_hold(record, card_token=""):
             raise RuntimeError("manual-merge hold card claim is not current")
         if not _audit_intent_record(state, handoff["card_issue"]):
             raise RuntimeError("manual-merge hold audit intent is unavailable")
-        if _card_has_pending_decision(labels) or _selected_card_option(card.get("body")):
+        if _card_has_pending_decision(labels) or _selected_card_option(
+            card.get("body")
+        ):
             raise RuntimeError("owner decision appeared before hold persistence")
         owner_action, owner_reason = _card_has_pending_owner_action(card)
         if owner_action:
@@ -1870,12 +1975,108 @@ def _workflow_hold_denies_claim(state, head_sha, repo, number):
     return True
 
 
-def claim_cards(scan, cards):
+def _preclaim_id(value):
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    import hashlib
+
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def preclaim_candidates(scan, cards):
+    """Run complete read-only G0-G6 before any action-lock mutation."""
+    owner = core.get_owner()
+    cfg = core.load_config()
+    global_auto_merge = cfg["auto_merge"]
+    maintainers = {login.casefold() for login in core.maintainers()}
+    index = _card_index(cards)
+    admitted = []
+    for item in (scan or {}).get("items") or []:
+        if item.get("kind") != "pr-review" or item.get("bucket") != "merge-ready":
+            continue
+        repo = str(item.get("repo") or "")
+        number = str(item.get("number") or "")
+        repo_ok, repo_reason = _repo_result_ok(scan, repo)
+        if not repo_ok:
+            reason = repo_reason
+            print(
+                "::warning::wheelhouse automerge preclaim_denied %s#%s "
+                "criterion=scan_complete card_writes=0 reason=%s"
+                % (repo, number, core._workflow_command_text(reason)),
+                file=sys.stderr,
+            )
+            continue
+        card_entry = index.get((repo, number))
+        try:
+            result = evaluate_candidate(
+                owner,
+                item,
+                card_entry,
+                (cfg.get("repos") or {}).get(repo, {}),
+                global_auto_merge,
+                maintainers,
+                full_evaluation=False,
+                require_claim=False,
+            )
+        except Exception as error:
+            result = {"eligible": False, "hold_reason": "evaluation raised: %s" % str(error)[:160], "criteria": []}
+        if not result.get("eligible"):
+            first = next(
+                (
+                    row.get("id")
+                    for row in result.get("criteria") or []
+                    if row.get("status") != criteria_schema.STATUS_MET
+                    and row.get("id") != "g1_card_claim"
+                ),
+                "unavailable",
+            )
+            print(
+                "::warning::wheelhouse automerge preclaim_denied %s#%s "
+                "criterion=%s card_writes=0 reason=%s"
+                % (
+                    repo,
+                    number,
+                    first,
+                    core._workflow_command_text(result.get("hold_reason") or "unavailable"),
+                ),
+                file=sys.stderr,
+            )
+            continue
+        entry = {
+            "repo": repo,
+            "number": number,
+            "head_sha": str(item.get("head_sha") or ""),
+            "card_issue": card_entry.get("issue") if card_entry else 0,
+            "card_updated_at": card_entry.get("updated_at") if card_entry else "",
+            "card_body_sha256": _preclaim_id(card_entry.get("body", "")) if card_entry else "",
+        }
+        entry["preclaim_id"] = _preclaim_id(entry)
+        admitted.append(entry)
+        print(
+            "::notice::wheelhouse automerge preclaim_passed %s#%s preclaim=%s card_writes=0"
+            % (repo, number, entry["preclaim_id"][:24]),
+            file=sys.stderr,
+        )
+    return admitted
+
+
+def claim_cards(scan, cards, preclaims=None):
     cfg = core.load_config()
     global_auto_merge = cfg["auto_merge"]
     index = _card_index(cards)
     claimed = []
     recover_stale_card_claims(cards)
+    preclaim_index = {}
+    for value in preclaims or []:
+        if not isinstance(value, dict) or set(value) != {
+            "repo", "number", "head_sha", "card_issue", "card_updated_at",
+            "card_body_sha256", "preclaim_id"
+        }:
+            continue
+        without = dict(value)
+        claimed_id = without.pop("preclaim_id", None)
+        if claimed_id != _preclaim_id(without):
+            continue
+        preclaim_index[(value["repo"], value["number"])] = value
     for (repo, number), expected in index.items():
         if not _card_is_claimed(
             expected.get("labels") or set()
@@ -1897,13 +2098,28 @@ def claim_cards(scan, cards):
     for item in (scan or {}).get("items") or []:
         if item.get("kind") != "pr-review" or item.get("bucket") != "merge-ready":
             continue
+        closing_issue_clear, _ = _scan_same_closing_issue_clear(item)
+        if not closing_issue_clear:
+            continue
         repo = item.get("repo")
         number = str(item.get("number") or "")
+        preclaim = preclaim_index.get((repo, number))
+        if (
+            not preclaim
+            or preclaim.get("head_sha") != str(item.get("head_sha") or "")
+        ):
+            continue
         repo_cfg = (cfg["repos"] or {}).get(repo, {})
         if not core._auto_merge_enabled(repo_cfg, global_auto_merge):
             continue
         expected = index.get((repo, number))
-        if not expected:
+        if (
+            not expected
+            or preclaim.get("card_issue") != expected.get("issue")
+            or preclaim.get("card_updated_at") != expected.get("updated_at")
+            or preclaim.get("card_body_sha256")
+            != _preclaim_id(expected.get("body", ""))
+        ):
             continue
         if _workflow_hold_denies_claim(
             expected.get("state"), item.get("head_sha"), repo, number
@@ -1964,6 +2180,12 @@ def claim_cards(scan, cards):
                 _release_card_claim(expected["issue"])
                 continue
             claimed.append(claimed_card)
+            print(
+                "::notice::wheelhouse automerge claimed %s#%s card=%s "
+                "card_writes=1"
+                % (repo, number, expected["issue"]),
+                file=sys.stderr,
+            )
         except Exception as e:
             print(
                 "::warning::wheelhouse auto-merge could not claim %s#%s: %s"
@@ -1973,12 +2195,28 @@ def claim_cards(scan, cards):
     return claimed
 
 
-def cmd_claim(scan_path, cards_path):
+def cmd_preclaim(scan_path, cards_path):
     scan = _load_json(scan_path, {})
     cards = _load_json(cards_path, [])
     if not isinstance(cards, list):
         cards = []
-    claimed = claim_cards(scan, cards)
+    admitted = preclaim_candidates(scan, cards)
+    out_path = os.environ.get(
+        "WHEELHOUSE_AUTOMERGE_PRECLAIMS", "automerge-preclaims.json"
+    )
+    _write_json_atomically(out_path, admitted)
+    print("wheelhouse auto-merge: %d read-only preclaim passer(s)" % len(admitted))
+
+
+def cmd_claim(scan_path, cards_path, preclaims_path):
+    scan = _load_json(scan_path, {})
+    cards = _load_json(cards_path, [])
+    preclaims = _load_json(preclaims_path, [])
+    if not isinstance(cards, list):
+        cards = []
+    if not isinstance(preclaims, list):
+        preclaims = []
+    claimed = claim_cards(scan, cards, preclaims)
     out_path = os.environ.get("WHEELHOUSE_AUTOMERGE_CLAIMS", "automerge-claims.json")
     _write_claim_handoff(out_path, claimed, "claims")
     print("wheelhouse auto-merge: %d card claim(s)" % len(claimed))
@@ -2040,10 +2278,18 @@ def _read_card_with_card_token(number, card_token):
             os.environ["GH_TOKEN"] = original_token
 
 
-def final_auto_merge_guard(expected_card, repo, number, card_token):
+def final_auto_merge_guard(expected_card, owner, repo, number, card_token):
     def guard(pr):
-        if core.NO_AUTO_MERGE_LABEL in _pr_label_names(pr):
+        if not isinstance((pr or {}).get("labels"), list):
+            return (False, "target labels could not be re-read")
+        labels = _pr_label_names(pr)
+        if core.NO_AUTO_MERGE_LABEL in labels:
             return (False, "escape hatch label appeared before merging")
+        label_hold, label_reason = _live_confirmation_label_hold(
+            owner, repo, number
+        )
+        if label_hold:
+            return (False, label_reason)
         current_card = _read_card_with_card_token(
             expected_card.get("issue"), card_token
         )
@@ -2054,6 +2300,23 @@ def final_auto_merge_guard(expected_card, repo, number, card_token):
         )
         if not card_ok:
             return (False, "card claim changed: %s" % card_reason)
+        current_entry = _card_index([current_card]).get((repo, str(number)))
+        confirmation_hold, confirmation_reason = _assisted_confirmation_hold(
+            (current_entry or {}).get("state"),
+            str(((pr or {}).get("head") or {}).get("sha") or ""),
+        )
+        if confirmation_hold:
+            return (False, confirmation_reason)
+        overlap_read, overlap_note = core.same_closing_issue_overlap(
+            owner, repo, number
+        )
+        if not overlap_read:
+            return (
+                False,
+                "same-closing-issue overlap could not be re-read",
+            )
+        if overlap_note:
+            return (False, "same-closing-issue ambiguity: %s" % overlap_note[:240])
         return (True, "")
 
     return guard
@@ -2090,6 +2353,16 @@ def act_merge(
         return held("could not re-read PR before merging")
     if pr.get("merged") or str(pr.get("state") or "").lower() != "open":
         return held("PR left the open merge-ready state before acting")
+    if not isinstance(pr.get("labels"), list):
+        return held("target labels could not be re-read before acting")
+    label_hold, label_reason = _live_confirmation_label_hold(owner, repo, number)
+    if label_hold:
+        return held(label_reason)
+    confirmation_hold, confirmation_reason = _assisted_confirmation_hold(
+        (expected_card or {}).get("state"), head_sha
+    )
+    if confirmation_hold:
+        return held(confirmation_reason)
     live_head = str((pr.get("head") or {}).get("sha") or "")
     if not live_head or live_head != head_sha:
         return held("head moved immediately before acting")
@@ -2115,7 +2388,7 @@ def act_merge(
         expected_base_sha=base_sha,
         require_clean_merge_state=True,
         auto_merge_guard=final_auto_merge_guard(
-            expected_card, repo, number, card_token
+            expected_card, owner, repo, number, card_token
         ),
     )
     if terminal == "resolved" and message.startswith("Merged "):
@@ -2131,7 +2404,9 @@ def act_merge(
     if terminal == "resolved":
         # do_merge saw already-merged / not-open (a race) - not our merge.
         return ("held", message, "", workflow_gate)
-    if terminal in ("blocked", "retryable"):
+    # "none" covers recoverable do_merge outcomes (e.g. merge conflict) that
+    # leave the decision card pending without durable blocked; treat like held.
+    if terminal in ("blocked", "retryable", "none"):
         return ("held", message, "", workflow_gate)
     return ("error", message, "", workflow_gate)
 
@@ -2388,14 +2663,6 @@ def act_on_scan(scan, cards):
         if not ok_repo:
             _warn(repo, number, ok_reason)
             holds.append({"repo": repo, "number": number, "hold_reason": ok_reason})
-            continue
-        indeterminate = ((scan.get("repos") or {}).get(repo) or {}).get(
-            "indeterminate_pr_numbers"
-        ) or []
-        if item["number"] in indeterminate:
-            reason = "mergeability indeterminate this scan (frozen)"
-            _warn(repo, number, reason)
-            holds.append({"repo": repo, "number": number, "hold_reason": reason})
             continue
         card_entry = index.get((repo, number))
         # Fail CLOSED on any unexpected error evaluating or acting on one
@@ -3117,9 +3384,7 @@ def cmd_record(results_path, validated_claims_path=None):
     # independently confirmed in this record phase. Ignore the act-phase release
     # handoff for it until that verification succeeds.
     releases = [
-        record
-        for record in releases
-        if record.get("card_issue") not in workflow_cards
+        record for record in releases if record.get("card_issue") not in workflow_cards
     ]
     for workflow_hold in workflow_holds:
         try:
@@ -3281,8 +3546,10 @@ def _load_json(path, default):
 
 
 def main():
-    if len(sys.argv) >= 4 and sys.argv[1] == "claim":
-        cmd_claim(sys.argv[2], sys.argv[3])
+    if len(sys.argv) == 4 and sys.argv[1] == "preclaim":
+        cmd_preclaim(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 5 and sys.argv[1] == "claim":
+        cmd_claim(sys.argv[2], sys.argv[3], sys.argv[4])
     elif len(sys.argv) == 3 and sys.argv[1] == "validate":
         cmd_validate(sys.argv[2])
     elif len(sys.argv) in (4, 5) and sys.argv[1] == "act":

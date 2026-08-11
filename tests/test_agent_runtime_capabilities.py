@@ -7,7 +7,6 @@ import copy
 import base64
 import hashlib
 import io
-import json
 import os
 import tarfile
 import tempfile
@@ -22,7 +21,6 @@ from agent_runtime.adapters.codex import CodexAppServerAdapter, CodexProbeError,
 from agent_runtime.capabilities import CapabilityError, codex_descriptor, negotiate
 from agent_runtime.config import ConfigError, resolve_selection
 from agent_runtime.supervisor import _error, _preflight_code
-from agent_runtime.contract import canonical_sha256
 from agent_runtime_testlib import make_task
 from scripts.agent_runtime import _verify_package_tarball
 
@@ -48,13 +46,18 @@ def main():
     runtime = __import__("agent_runtime.config", fromlist=["load_runtime_config"]).load_runtime_config()
     check("selection: Claude is named production primary", runtime["primary_profile"] == "claude-action-current-pinned")
     check("selection: current production target resolves as Claude", selection["mode"] == "claude")
-    check("selection: pinned direct Claude adapter selected", selection["profile"]["adapter"] == "claude-action-compat")
+    check("selection: non-repair action remains on pinned action", selection["profile"]["adapter"] == "claude-action-compat")
     check("selection: fallback disabled", selection["fallback"] == "none")
     check("selection: unsupported emergency provider override rejected", fails(lambda: resolve_selection("triage.issue.local", emergency="codex"), ConfigError))
     check("selection: former legacy override rejected", fails(lambda: resolve_selection("triage.issue.local", emergency="legacy"), ConfigError))
     check("selection: Codex absent from active profiles", "codex-subscription-pinned" not in runtime["profiles"])
+    schema_actions = {"triage.schema-repair", "nl-decision.schema-repair"}
+    direct = {action: resolve_selection(action) for action in schema_actions}
+    pinned = {action: resolve_selection(action) for action in runtime_config.ACTIONS - schema_actions}
+    check("selection: both schema-repair actions use direct Claude CLI", all(row["profileName"] == "claude-cli-pinned" and row["profile"]["adapter"] == "claude-cli" for row in direct.values()))
+    check("selection: every other action remains on pinned action", len(pinned) == 9 and all(row["profileName"] == "claude-action-current-pinned" and row["profile"]["adapter"] == "claude-action-compat" for row in pinned.values()))
     check("selection: Codex recorded only as disabled adapter evidence", runtime["disabled_adapters"] == {"codex-app-server": "unsupported-public-chatgpt-pro-auth"})
-    check("selection: no production activation promise remains", "production_activation" not in runtime and "codex_auth_gate" not in runtime)
+    check("selection: activation is limited to the complete schema-repair profile", runtime["production_activation"] == {action: "claude-cli-pinned" for action in schema_actions} and runtime["temporary_rollback_profile"] is None and "codex_auth_gate" not in runtime)
     check("selection: every action remains on Claude", all(row["target"] == "claude" for row in runtime["actions"].values()))
     core = Path("agent_runtime/config.py").read_text(encoding="utf-8")
     check("selection: core contains no OpenCode or Z.AI policy", "OpenCode" not in core and "Z.AI" not in core and "glm" not in core.lower())
@@ -62,6 +65,19 @@ def main():
     invalid_target["actions"]["triage.issue.local"]["target"] = "codex"
     with mock.patch.object(runtime_config, "load_runtime_config", return_value=invalid_target):
         check("selection: any Codex-targeted action invalidates configuration", fails(lambda: resolve_selection("triage.issue.local"), ConfigError))
+    reachable_direct = copy.deepcopy(runtime)
+    reachable_direct["production_activation"]["triage.issue.local"] = "claude-cli-pinned"
+    with mock.patch.object(runtime_config, "load_runtime_config", return_value=reachable_direct):
+        check("selection: direct Claude CLI cannot reach another action", fails(lambda: resolve_selection("triage.issue.local"), ConfigError))
+    split_profile = copy.deepcopy(runtime)
+    del split_profile["production_activation"]["nl-decision.schema-repair"]
+    with mock.patch.object(runtime_config, "load_runtime_config", return_value=split_profile):
+        check("selection: schema-repair profile cannot be split", fails(lambda: resolve_selection("triage.schema-repair"), ConfigError))
+    rollback = copy.deepcopy(runtime)
+    rollback["temporary_rollback_profile"] = "claude-action-current-pinned"
+    with mock.patch.object(runtime_config, "load_runtime_config", return_value=rollback):
+        check("selection: one rollback setting restores both schema repairs", all(resolve_selection(action)["profile"]["adapter"] == "claude-action-compat" for action in schema_actions))
+        check("selection: rollback leaves the other nine pinned", all(resolve_selection(action)["profile"]["adapter"] == "claude-action-compat" for action in runtime_config.ACTIONS - schema_actions))
 
     with tempfile.TemporaryDirectory() as directory:
         task, _, _ = make_task(Path(directory), "triage.issue.local")

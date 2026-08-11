@@ -13,15 +13,14 @@ contributor-authored risky or uncertain ones raise a card, excluded-author
 failures log suppressed-card, and verified no-pending runs emit no stale card).
 The auto path logs exactly one stderr workflow-command line per CI-approval
 candidate it handles, so approvals, no-pending results, approve failures, and
-fail-closed verdicts are visible in the scan-backstop run log. Conflicted
-PR-review candidates leave the maintainer worklist as needs-rebase, with one
-contributor rebase nudge per head SHA.
+fail-closed verdicts are visible in the scan-backstop run log. Mergeability is
+observed for display and auto-merge execution only: a conflicted PR stays in
+the captain's queue and contributors are never asked to rebase.
 Approval verifies each awaiting run against the target PR: populated
 workflow_run.pull_requests must name that PR, while fork-originated empty
 associations must match the PR head SHA and branch.
-Verified duplicate pending runs sharing a stable workflowDatabaseId are deduped
-to the highest/newest run before approval; runs without that stable workflow
-identity are left distinct.
+Every verified current-head pending run is approved, including same-workflow
+duplicates that GitHub still exposes as independently actionable.
 Incomplete PR, issue, or closing-reference pagination is reported as a warning
 and marks the repo result as truncated, so reconcile will not self-heal close
 cards from an incomplete view of the repo.
@@ -32,7 +31,7 @@ replaces has been dropped: the local single-flight lock (-> Actions
 state), per-repo `owner` (-> derived from github.repository_owner).
 
 Usage:
-  wheelhouse_core.py scan [repo] [--cards cards.json]  scan configured repos -> JSON worklist; may auto-approve safe fork CI, nudge conflicted PR-review candidates, run stale pending-contributor cleanup, and log outcomes
+  wheelhouse_core.py scan [repo] [--cards cards.json]  scan configured repos -> JSON worklist; may auto-approve safe fork CI, apply source-permission policy routing, run explicit request-changes cleanup, and log outcomes
   wheelhouse_core.py scan-health <scan.json>  update the persisted per-repo consecutive-failure ledger; ::error:: + non-zero exit when a repo is dark past the threshold (uses default GITHUB_TOKEN)
   wheelhouse_core.py approve-ci <repo> <pr>   security-gated fork-CI approval (exit 4 = HOLD)
   wheelhouse_core.py checks <repo>        list distinct check names on a repo's PRs (onboarding)
@@ -60,6 +59,10 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
+from urllib.parse import quote, urlparse
+
+import target_observation as target_contracts
+import decision_context as decision_context_contracts
 
 try:
     import yaml
@@ -92,20 +95,53 @@ ISSUE_PAGE_SIZE = 50
 PR_LABELS_PAGE_SIZE = 20
 CLOSING_REFS_PAGE_SIZE = 20
 STATUS_CONTEXTS_PAGE_SIZE = 100
+ACTION_REQUIRED_RUN_LIMIT = 30
+# Event-aware compliance enrichment is opt-in per repository. Actions run pages
+# are bounded so a pathological same-head history degrades to unknown rather
+# than turning a fleet scan into an unbounded API crawl.
+COMPLIANCE_EVIDENCE_SCHEMA = "wheelhouse.actions-current-body/v1"
+COMPLIANCE_EVIDENCE_RUN_PAGE_SIZE = 100
+COMPLIANCE_EVIDENCE_RUN_LIMIT = 300
+_COMPLIANCE_EVIDENCE_KEY = "_wheelhouse_compliance_evidence"
+_COMPLIANCE_EVENT_ACTIONS = frozenset(
+    {"opened", "edited", "synchronize", "reopened"}
+)
+_COMPLIANCE_RUN_STATUSES = frozenset(
+    {"queued", "in_progress", "completed", "waiting", "requested", "pending"}
+)
+_COMPLIANCE_RUN_CONCLUSIONS = frozenset(
+    {
+        "success",
+        "failure",
+        "cancelled",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+        "neutral",
+        "skipped",
+        "stale",
+    }
+)
+_COMPLIANCE_RUN_TITLE_RE = re.compile(
+    r"^PR #([1-9][0-9]*) body compliance - "
+    r"(opened|edited|synchronize|reopened) - "
+    r"event ([1-9][0-9]*) \(run ([1-9][0-9]*)\)$"
+)
 
 _PR_NODE_FIELDS = """
-        number title isDraft updatedAt changedFiles isCrossRepository mergeable
+        number title body isDraft updatedAt changedFiles isCrossRepository mergeable
+        maintainerCanModify
         author { login __typename }
         headRefName headRefOid baseRefName baseRefOid
-        headRepository { name owner { login } }
+        headRepository { name nameWithOwner isFork owner { login __typename } }
         baseRepository { name owner { login } }
         labels(first:%d){ totalCount pageInfo { hasNextPage } nodes{ name } }
         closingIssuesReferences(first:%d){ totalCount pageInfo { hasNextPage endCursor } nodes{ number } }
         commits(last:1){ nodes{ commit{ statusCheckRollup{
           state
-          contexts(first:%d){ nodes{
+          contexts(first:%d){ totalCount pageInfo { hasNextPage } nodes{
             __typename
-            ... on CheckRun { name conclusion status }
+            ... on CheckRun { databaseId detailsUrl name conclusion status }
             ... on StatusContext { context state }
           }}
         }}}}
@@ -184,6 +220,25 @@ query($owner:String!, $name:String!, $number:Int!, $after:String!) {
     % CLOSING_REFS_PAGE_SIZE
 )
 
+OPEN_PR_CLOSING_REFS_GQL = """
+query($owner:String!, $name:String!, $after:String) {
+  repository(owner:$owner, name:$name) {
+    pullRequests(states:OPEN, first:%d, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        closingIssuesReferences(first:%d) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+          nodes { number }
+        }
+      }
+    }
+  }
+}
+""" % (PR_PAGE_SIZE, CLOSING_REFS_PAGE_SIZE)
+
 PR_MERGEABLE_GQL = """
 query($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner, name:$name) {
@@ -191,6 +246,36 @@ query($owner:String!, $name:String!, $number:Int!) {
   }
 }
 """
+
+# Exact, bounded target observation for Stage 1 card projection. This repeats
+# the bulk query's check-context shape so ``check_status`` remains the sole
+# reducer/classifier input. The explicit total/page metadata is load-bearing:
+# a target re-read that cannot prove the complete current-head context set is
+# an unknown observation, never a current green projection.
+PR_OBSERVATION_GQL = """
+query($owner:String!, $name:String!, $number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      state
+      number title body changedFiles isDraft updatedAt isCrossRepository mergeable
+      maintainerCanModify
+      author { login __typename }
+      headRefName headRefOid baseRefName baseRefOid
+      headRepository { name nameWithOwner isFork owner { login __typename } }
+      baseRepository { name owner { login } }
+      labels(first:%d) { totalCount pageInfo { hasNextPage } nodes { name } }
+      commits(last:1) { nodes { commit { statusCheckRollup {
+        state
+        contexts(first:%d) { totalCount pageInfo { hasNextPage } nodes {
+          __typename
+          ... on CheckRun { databaseId detailsUrl name conclusion status }
+          ... on StatusContext { context state }
+        }}
+      }}}}
+    }
+  }
+}
+""" % (PR_LABELS_PAGE_SIZE, STATUS_CONTEXTS_PAGE_SIZE)
 
 PR_USER_CONTENT_EDITS_GQL = """
 query($owner:String!, $name:String!, $number:Int!, $after:String) {
@@ -207,8 +292,13 @@ query($owner:String!, $name:String!, $number:Int!, $after:String) {
 """
 
 # Buckets that need the maintainer's call vs. ones waiting on the contributor.
-NEEDS_MAINTAINER = {"merge-ready", "needs-ci-approval", "review-needed"}
-# (waiting-on-contributor: needs-reraise, needs-rebase, fix-tests, draft, ci-running)
+NEEDS_MAINTAINER = {
+    "merge-ready",
+    "needs-ci-approval",
+    "review-needed",
+}
+# (waiting-on-contributor: needs-reraise, fix-tests, draft, ci-running)
+# Retained only to parse and silently disarm historical rebase-cleanup markers.
 REBASE_NUDGE_MARKER_PREFIX = "wheelhouse-rebase-nudge"
 PENDING_CONTRIBUTOR_LABEL = "wheelhouse:pending-contributor-action"
 PENDING_CONTRIBUTOR_KEEP_OPEN_LABEL = "wheelhouse:keep-open"
@@ -216,10 +306,18 @@ PENDING_CONTRIBUTOR_KEEP_OPEN_LABEL = "wheelhouse:keep-open"
 # scan-time auto-merge (see auto_merge.py). It never affects the manual merge
 # path or any other decision - it only forces the auto-merge gate to hold.
 NO_AUTO_MERGE_LABEL = "wheelhouse:no-auto-merge"
+# Per-PR escape hatch for the CAPTAIN-INITIATED assisted in-place merge
+# (merge_assist.py). Applying it to a TARGET PR means Wheelhouse never pushes a
+# conflict resolution to that pull request's branch; the conflict stays a
+# manual captain resolution. It changes no other decision.
+NO_ASSISTED_MERGE_LABEL = "wheelhouse:no-assisted-merge"
+AWAITING_CAPTAIN_CONFIRM_LABEL = "wheelhouse:awaiting-captain-confirm"
 PENDING_CONTRIBUTOR_MARKER_PREFIX = "wheelhouse-pending-contributor-action"
 PENDING_CONTRIBUTOR_REMINDER_PREFIX = "wheelhouse-pending-contributor-reminder"
 PENDING_CONTRIBUTOR_CLOSE_PREFIX = "wheelhouse-pending-contributor-close"
-PENDING_CONTRIBUTOR_ASK_KINDS_PR = {"request-changes", "needs-rebase"}
+# New cleanup asks are only explicit captain request-changes reviews. Historical
+# `needs-rebase` records remain readable below solely so rollout can disarm them.
+PENDING_CONTRIBUTOR_ASK_KINDS_PR = {"request-changes"}
 PENDING_CONTRIBUTOR_TIMELINE_LIMIT = 1000
 _PENDING_CONTRIBUTOR_TARGETS_UNSET = object()
 
@@ -237,6 +335,31 @@ PRIORITY = {
     "issue-triage": "low",
 }
 
+TRIAGE_ATTEMPT_CAP_DEFAULT = 2
+TRIAGE_ATTEMPT_CAP_MIN = 1
+TRIAGE_ATTEMPT_CAP_MAX = 5
+# Separate small allowance for queued re-triages triggered ONLY by a verified
+# base-SHA or VISION-SHA movement against an unchanged head (audit F13). Zero
+# disables it; each use binds the exact (head, base, VISION) identity so a
+# repeated context grants nothing.
+TRIAGE_CONTEXT_ALLOWANCE_DEFAULT = 2
+TRIAGE_CONTEXT_ALLOWANCE_MIN = 0
+TRIAGE_CONTEXT_ALLOWANCE_MAX = 5
+TRIAGE_DAILY_CEILING_DEFAULT = 1200
+TRIAGE_DAILY_CEILING_MIN = 1
+TRIAGE_DAILY_CEILING_MAX = 2000
+
+# Captain-initiated assisted in-place merge (scripts/merge_assist.py). The caps
+# bound how much conflict a single bounded model turn may even look at; going
+# over them is an escalation, never a larger request. Both are validated with
+# the same fail-closed integer contract the triage budgets use.
+ASSISTED_MERGE_MAX_FILES_DEFAULT = 5
+ASSISTED_MERGE_MAX_FILES_MIN = 1
+ASSISTED_MERGE_MAX_FILES_MAX = 20
+ASSISTED_MERGE_MAX_LINES_DEFAULT = 200
+ASSISTED_MERGE_MAX_LINES_MIN = 1
+ASSISTED_MERGE_MAX_LINES_MAX = 2000
+
 
 # --------------------------------------------------------------------------- #
 # config + owner
@@ -248,15 +371,153 @@ def config_path():
     sys.exit("no wheelhouse.config.yml found (looked in repo root and .github/)")
 
 
+def _invalid_bounded_int(key, fallback, scope="global"):
+    print(
+        "::error::wheelhouse config: %s %s is invalid; failing closed to %s"
+        % (scope, key, fallback),
+        file=sys.stderr,
+    )
+    return fallback
+
+
+def _bounded_config_int(value, key, minimum, maximum, fallback, scope="global"):
+    """Validate one spend-relevant integer without bool/int coercion.
+
+    YAML booleans are Python integers, so the explicit bool rejection is
+    load-bearing. Invalid values always return the caller's fail-closed value
+    and emit a GitHub Actions error annotation on stderr.
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < minimum
+        or value > maximum
+    ):
+        return _invalid_bounded_int(key, fallback, scope)
+    return value
+
+
+def _triage_attempt_cap(repo_cfg, global_default):
+    """Effective queued-attempt cap for one repository.
+
+    The global and per-repository values both use the approved [1, 5] range.
+    A malformed override fails closed to one rather than falling back to a
+    potentially larger global value.
+    """
+    if "triage_attempt_cap_per_revision" not in (repo_cfg or {}):
+        return _bounded_config_int(
+            global_default,
+            "triage_attempt_cap_per_revision",
+            TRIAGE_ATTEMPT_CAP_MIN,
+            TRIAGE_ATTEMPT_CAP_MAX,
+            1,
+        )
+    name = str((repo_cfg or {}).get("name") or "?")
+    return _bounded_config_int(
+        repo_cfg.get("triage_attempt_cap_per_revision"),
+        "triage_attempt_cap_per_revision",
+        TRIAGE_ATTEMPT_CAP_MIN,
+        TRIAGE_ATTEMPT_CAP_MAX,
+        1,
+        scope="repo %s" % name,
+    )
+
+
+def _triage_context_allowance(repo_cfg, global_default):
+    """Effective verified-context (base/VISION move) refresh allowance.
+
+    The global and per-repository values both use the approved [0, 5] range;
+    zero disables the separate allowance. A malformed override fails closed to
+    zero (no allowance) rather than falling back to a potentially larger
+    global value.
+    """
+    if "triage_context_refresh_allowance" not in (repo_cfg or {}):
+        return _bounded_config_int(
+            global_default,
+            "triage_context_refresh_allowance",
+            TRIAGE_CONTEXT_ALLOWANCE_MIN,
+            TRIAGE_CONTEXT_ALLOWANCE_MAX,
+            0,
+        )
+    name = str((repo_cfg or {}).get("name") or "?")
+    return _bounded_config_int(
+        repo_cfg.get("triage_context_refresh_allowance"),
+        "triage_context_refresh_allowance",
+        TRIAGE_CONTEXT_ALLOWANCE_MIN,
+        TRIAGE_CONTEXT_ALLOWANCE_MAX,
+        0,
+        scope="repo %s" % name,
+    )
+
+
 def load_config():
     if yaml is None:
         sys.exit("PyYAML is required (pip install pyyaml)")
     with open(config_path()) as f:
         cfg = yaml.safe_load(f) or {}
     repos = cfg.get("repos") or []
+    global_attempt_cap = (
+        TRIAGE_ATTEMPT_CAP_DEFAULT
+        if "triage_attempt_cap_per_revision" not in cfg
+        else _bounded_config_int(
+            cfg.get("triage_attempt_cap_per_revision"),
+            "triage_attempt_cap_per_revision",
+            TRIAGE_ATTEMPT_CAP_MIN,
+            TRIAGE_ATTEMPT_CAP_MAX,
+            1,
+        )
+    )
+    daily_ceiling = (
+        TRIAGE_DAILY_CEILING_DEFAULT
+        if "triage_daily_ceiling" not in cfg
+        else _bounded_config_int(
+            cfg.get("triage_daily_ceiling"),
+            "triage_daily_ceiling",
+            TRIAGE_DAILY_CEILING_MIN,
+            TRIAGE_DAILY_CEILING_MAX,
+            0,
+        )
+    )
+    global_context_allowance = (
+        TRIAGE_CONTEXT_ALLOWANCE_DEFAULT
+        if "triage_context_refresh_allowance" not in cfg
+        else _bounded_config_int(
+            cfg.get("triage_context_refresh_allowance"),
+            "triage_context_refresh_allowance",
+            TRIAGE_CONTEXT_ALLOWANCE_MIN,
+            TRIAGE_CONTEXT_ALLOWANCE_MAX,
+            0,
+        )
+    )
     by_name = {}
+    triage_attempt_caps = {}
+    triage_context_allowances = {}
     for r in repos:
         if isinstance(r, dict) and r.get("name"):
+            triage_attempt_caps[r["name"]] = _triage_attempt_cap(r, global_attempt_cap)
+            triage_context_allowances[r["name"]] = _triage_context_allowance(
+                r, global_context_allowance
+            )
+            _, compliance_evidence_error = compliance_evidence_config(r)
+            if compliance_evidence_error:
+                print(
+                    "::error::wheelhouse config: repo %s compliance_evidence is invalid: %s"
+                    % (r["name"], compliance_evidence_error),
+                    file=sys.stderr,
+                )
+            if "triage_daily_ceiling" in r:
+                # The daily budget is one fleet-wide ledger. A repository-level
+                # value would falsely imply an independent budget and is
+                # therefore an invalid ceiling configuration, not an override.
+                daily_ceiling = _invalid_bounded_int(
+                    "triage_daily_ceiling",
+                    0,
+                    scope="repo %s (per-repo overrides are not supported)"
+                    % r.get("name"),
+                )
+            # Preserve the repository entry byte-for-byte in the public config
+            # mapping. Effective typed caps live in the parallel map so callers
+            # that depend on raw repo policy still see exactly what was loaded.
             by_name[r["name"]] = r
     return {
         "repos": by_name,
@@ -272,12 +533,34 @@ def load_config():
         # until the owner opts in globally or per repo AND commits a VISION.md on
         # the target's default branch (see auto_merge.py / AGENTS.md "Auto-merge").
         "auto_merge": cfg.get("auto_merge", False) is True,
+        # Captain-initiated assisted in-place merge is DEFAULT OFF (opt-in): it
+        # pushes a resolution commit to a contributor's own branch and needs a
+        # separate push credential, so a fork enables it deliberately. See
+        # scripts/merge_assist.py and README "Assisted-merge push credential".
+        "assisted_merge": cfg.get("assisted_merge", False) is True,
+        "assisted_merge_max_conflict_files": cfg.get(
+            "assisted_merge_max_conflict_files", ASSISTED_MERGE_MAX_FILES_DEFAULT
+        ),
+        "assisted_merge_max_conflict_lines": cfg.get(
+            "assisted_merge_max_conflict_lines", ASSISTED_MERGE_MAX_LINES_DEFAULT
+        ),
         # Advisory LLM triage is DEFAULT ON when the Claude token exists. The
         # flag is only a spend-control opt-out; absence keeps fresh forks useful.
         "auto_triage": bool(cfg.get("auto_triage", True)),
         # Same idea, but for issue-triage cards. Independent of `auto_triage`:
         # either can be toggled off without affecting the other.
         "auto_triage_issues": bool(cfg.get("auto_triage_issues", True)),
+        # Spend guards apply to every automatic triage queueing path. The cap
+        # is per card-kind source revision and may be lowered/raised per repo;
+        # the daily ceiling is one global UTC budget with no repo override.
+        "triage_attempt_cap_per_revision": global_attempt_cap,
+        "triage_attempt_caps": triage_attempt_caps,
+        "triage_daily_ceiling": daily_ceiling,
+        # Separate small allowance (audit F13) for queued re-triages triggered
+        # only by a verified base-SHA/VISION-SHA move against an unchanged
+        # head; per-repo overridable, zero disables it.
+        "triage_context_refresh_allowance": global_context_allowance,
+        "triage_context_allowances": triage_context_allowances,
         # Contributor-etiquette DEFAULT ON: a successful merge posts a short,
         # friendly @-mention thank-you on the contributor's PR. Set false (globally
         # or per-repo) to restore silent merges.
@@ -506,17 +789,36 @@ def gh_graphql_closing_refs_page(owner, name, number, after):
     return pr["closingIssuesReferences"]
 
 
-def gh_graphql_pr_mergeable(owner, name, number):
-    """Read just `mergeable` for one PR. Fetching a single PR forces GitHub to
-    compute mergeability (the bulk list often returns UNKNOWN under load), so this
-    is the targeted re-read used to settle a merge-ready candidate."""
+def gh_graphql_open_pr_closing_refs_page(owner, name, after=None):
+    args = [
+        "gh",
+        "api",
+        "graphql",
+        "-f",
+        "query=" + OPEN_PR_CLOSING_REFS_GQL,
+        "-f",
+        "owner=" + owner,
+        "-f",
+        "name=" + name,
+    ]
+    if after is not None:
+        args.extend(["-f", "after=" + after])
+    data = _gh_graphql_data(args)
+    repository = data["data"]["repository"]
+    if not repository:
+        raise RuntimeError("repository %s/%s not found" % (owner, name))
+    return repository["pullRequests"]
+
+
+def gh_graphql_pr(owner, name, number):
+    """Read one PR with the complete bounded check shape used by the scanner."""
     data = _gh_graphql_data(
         [
             "gh",
             "api",
             "graphql",
             "-f",
-            "query=" + PR_MERGEABLE_GQL,
+            "query=" + PR_OBSERVATION_GQL,
             "-f",
             "owner=" + owner,
             "-f",
@@ -525,10 +827,13 @@ def gh_graphql_pr_mergeable(owner, name, number):
             "number=%s" % number,
         ]
     )
-    pr = data["data"]["repository"]["pullRequest"]
+    repository = data["data"].get("repository")
+    if not repository:
+        raise RuntimeError("repository %s/%s not found" % (owner, name))
+    pr = repository.get("pullRequest")
     if not pr:
         raise RuntimeError("pull request #%s not found" % number)
-    return pr.get("mergeable")
+    return pr
 
 
 def gh_graphql_pr_user_content_edits_page(owner, name, number, after=None):
@@ -593,29 +898,59 @@ def _page_open_issues(owner, name, first_page):
 
 
 def _closing_issue_numbers(owner, name, pr):
-    first_page = pr.get("closingIssuesReferences") or {}
-    nodes = list(first_page.get("nodes") or [])
-    page_info = first_page.get("pageInfo") or {}
-    if not page_info:
-        return (
-            [i["number"] for i in nodes],
-            first_page.get("totalCount", len(nodes)) <= len(nodes),
-        )
+    pr_number = pr.get("number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number < 1:
+        raise RuntimeError("closing issue PR number is unavailable")
+    first_page = pr.get("closingIssuesReferences")
+    if not isinstance(first_page, dict):
+        raise RuntimeError("closing issue references are unavailable")
+    total_count = first_page.get("totalCount")
+    page_info = first_page.get("pageInfo")
+    first_nodes = first_page.get("nodes")
+    if (
+        isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count < 0
+        or not isinstance(first_nodes, list)
+        or not isinstance(page_info, dict)
+        or not isinstance(page_info.get("hasNextPage"), bool)
+    ):
+        raise RuntimeError("closing issue reference page is incomplete")
+    nodes = list(first_nodes)
     seen_cursors = set()
     while page_info.get("hasNextPage"):
         cursor = page_info.get("endCursor")
-        if not cursor or cursor in seen_cursors:
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
             raise RuntimeError("closing issue pagination did not advance")
         seen_cursors.add(cursor)
-        page = gh_graphql_closing_refs_page(owner, name, pr["number"], cursor)
-        nodes.extend(page.get("nodes") or [])
-        page_info = page.get("pageInfo") or {}
-        if not page_info:
-            return (
-                [i["number"] for i in nodes],
-                page.get("totalCount", len(nodes)) <= len(nodes),
-            )
-    return [i["number"] for i in nodes], True
+        page = gh_graphql_closing_refs_page(owner, name, pr_number, cursor)
+        if not isinstance(page, dict) or page.get("totalCount") != total_count:
+            raise RuntimeError("closing issue reference pagination changed shape")
+        page_nodes = page.get("nodes")
+        page_info = page.get("pageInfo")
+        if (
+            not isinstance(page_nodes, list)
+            or not isinstance(page_info, dict)
+            or not isinstance(page_info.get("hasNextPage"), bool)
+        ):
+            raise RuntimeError("closing issue reference page is incomplete")
+        nodes.extend(page_nodes)
+    numbers = []
+    seen_numbers = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise RuntimeError("closing issue reference node is incomplete")
+        number = node.get("number")
+        if (
+            isinstance(number, bool)
+            or not isinstance(number, int)
+            or number < 1
+            or number in seen_numbers
+        ):
+            raise RuntimeError("closing issue reference node is invalid")
+        seen_numbers.add(number)
+        numbers.append(number)
+    return numbers, len(numbers) == total_count
 
 
 def _closing_map(prs):
@@ -624,6 +959,124 @@ def _closing_map(prs):
         for number in pr.get("closes") or []:
             closing.setdefault(number, []).append(pr["number"])
     return closing
+
+
+def _open_pr_closing_refs(owner, name):
+    """Read every open PR and its first page of closing references strictly."""
+    first_page = gh_graphql_open_pr_closing_refs_page(owner, name)
+    if not isinstance(first_page, dict):
+        raise RuntimeError("open PR closing-reference read returned unexpected data")
+    total_count = first_page.get("totalCount")
+    if (
+        isinstance(total_count, bool)
+        or not isinstance(total_count, int)
+        or total_count < 0
+    ):
+        raise RuntimeError("open PR closing-reference total is unavailable")
+    first_nodes = first_page.get("nodes")
+    if not isinstance(first_nodes, list):
+        raise RuntimeError("open PR closing-reference page is incomplete")
+    nodes = list(first_nodes)
+    page_info = first_page.get("pageInfo")
+    if not isinstance(page_info, dict) or not isinstance(
+        page_info.get("hasNextPage"), bool
+    ):
+        raise RuntimeError("open PR closing-reference pagination is unavailable")
+    seen_cursors = set()
+    while page_info["hasNextPage"]:
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            raise RuntimeError("open PR closing-reference pagination did not advance")
+        seen_cursors.add(cursor)
+        page = gh_graphql_open_pr_closing_refs_page(owner, name, cursor)
+        if not isinstance(page, dict) or page.get("totalCount") != total_count:
+            raise RuntimeError("open PR closing-reference pagination changed shape")
+        page_nodes = page.get("nodes")
+        next_page_info = page.get("pageInfo")
+        if not isinstance(page_nodes, list) or not isinstance(next_page_info, dict):
+            raise RuntimeError("open PR closing-reference page is incomplete")
+        if not isinstance(next_page_info.get("hasNextPage"), bool):
+            raise RuntimeError("open PR closing-reference pagination is incomplete")
+        nodes.extend(page_nodes)
+        page_info = next_page_info
+    if len(nodes) != total_count:
+        raise RuntimeError(
+            "open PR closing-reference read is incomplete (%d of %d)"
+            % (len(nodes), total_count)
+        )
+    return nodes
+
+
+def same_closing_issue_overlap(owner, name, number):
+    """Return (read_complete, existing overlap note) for one open PR.
+
+    The note is produced by the same `_closing_map` / `_overlap_note` path used
+    by the fleet scan. Any malformed, incomplete, duplicated, or raced read is
+    reported as incomplete so an acting caller can fail closed.
+    """
+    try:
+        if isinstance(number, bool):
+            return (False, "")
+        target_number = int(number)
+        if target_number < 1 or str(target_number) != str(number):
+            return (False, "")
+        prs = _open_pr_closing_refs(owner, name)
+        enriched = []
+        seen_prs = set()
+        target_seen = 0
+        target_closes = None
+        for pr in prs:
+            if not isinstance(pr, dict):
+                return (False, "")
+            pr_number = pr.get("number")
+            if (
+                isinstance(pr_number, bool)
+                or not isinstance(pr_number, int)
+                or pr_number < 1
+                or pr_number in seen_prs
+            ):
+                return (False, "")
+            seen_prs.add(pr_number)
+            closing_refs = pr.get("closingIssuesReferences")
+            if not isinstance(closing_refs, dict):
+                return (False, "")
+            closing_total = closing_refs.get("totalCount")
+            closing_nodes = closing_refs.get("nodes")
+            closing_page_info = closing_refs.get("pageInfo")
+            if (
+                isinstance(closing_total, bool)
+                or not isinstance(closing_total, int)
+                or closing_total < 0
+                or not isinstance(closing_nodes, list)
+                or not isinstance(closing_page_info, dict)
+                or not isinstance(closing_page_info.get("hasNextPage"), bool)
+            ):
+                return (False, "")
+            closes, complete = _closing_issue_numbers(owner, name, pr)
+            if (
+                not complete
+                or not isinstance(closes, list)
+                or len(closes) != closing_total
+            ):
+                return (False, "")
+            if any(
+                isinstance(issue, bool) or not isinstance(issue, int) or issue < 1
+                for issue in closes
+            ) or len(set(closes)) != len(closes):
+                return (False, "")
+            enriched.append({"number": pr_number, "closes": closes})
+            if pr_number == target_number:
+                target_seen += 1
+                target_closes = closes
+        if target_seen != 1 or target_closes is None:
+            return (False, "")
+        closing = _closing_map(enriched)
+        return (
+            True,
+            _overlap_note(target_number, target_closes, closing, set()),
+        )
+    except Exception:  # noqa: BLE001 - every unreadable shape must fail closed
+        return (False, "")
 
 
 def _dedupe_numbered_nodes(nodes):
@@ -665,104 +1118,837 @@ def gh_rest(path, method=None, fields=None, jq=None, paginate=False, slurp=False
 # --------------------------------------------------------------------------- #
 # classification (ported)
 # --------------------------------------------------------------------------- #
-def check_status(pr, cfg):
-    """Return (compliance, tests, ci_present, names).
+def _check_run_outcome(conclusion, status):
+    """Map one CheckRun to pass/fail/pending/cancelled.
+
+    CANCELLED is a distinct outcome so same-name aggregation can ignore a
+    concurrency-cancelled duplicate only when a completed SUCCESS exists for
+    that equivalent check on the current head (card #1537). Cancelled-only
+    evidence never becomes pass.
+    """
+    concl = (conclusion or "").upper()
+    st = (status or "").upper()
+    done = st == "COMPLETED" or st == ""
+    if not done:
+        return "pending"
+    if concl == "SUCCESS":
+        return "pass"
+    if concl == "CANCELLED":
+        return "cancelled"
+    if concl in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+        return "fail"
+    # Unknown/neutral completed conclusions wait rather than invent pass.
+    return "pending"
+
+
+def _status_context_outcome(state):
+    st = (state or "").upper()
+    if st == "SUCCESS":
+        return "pass"
+    if st == "PENDING":
+        return "pending"
+    if st in ("FAILURE", "ERROR"):
+        return "fail"
+    return "pending"
+
+
+def _reduce_check_outcomes(outcomes):
+    """Reduce outcomes for one equivalent check identity on the current head.
+
+    Order-independent. Substantive fail wins; pending waits; a completed SUCCESS
+    makes CANCELLED siblings ignorable; cancelled-only is fail (never pass).
+    """
+    if not outcomes:
+        return "pending"
+    if "fail" in outcomes:
+        return "fail"
+    if "pending" in outcomes:
+        return "pending"
+    if "pass" in outcomes:
+        return "pass"
+    if "cancelled" in outcomes:
+        return "fail"
+    return "pending"
+
+
+def _status_contexts_complete(contexts):
+    if not isinstance(contexts, dict):
+        return False
+    nodes = contexts.get("nodes")
+    page_info = contexts.get("pageInfo")
+    total_count = contexts.get("totalCount")
+    return (
+        isinstance(nodes, list)
+        and isinstance(page_info, dict)
+        and page_info.get("hasNextPage") is False
+        and type(total_count) is int
+        and total_count >= 0
+        and total_count == len(nodes)
+    )
+
+
+def _positive_api_int(value):
+    """Strictly normalize one GitHub-owned positive integer identity."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isdigit() and not value.startswith("0"):
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def compliance_evidence_config(cfg):
+    """Return (normalized, error) for the opt-in Actions evidence contract.
+
+    An absent key means legacy same-name reduction. A present but malformed key
+    is not silently ignored: callers attach unavailable evidence so compliance
+    cannot fall back to an older success.
+    """
+    if not isinstance(cfg, dict) or "compliance_evidence" not in cfg:
+        return (None, "")
+    raw = cfg.get("compliance_evidence")
+    expected = {"schema", "workflow_path", "workflow_name"}
+    if not isinstance(raw, dict) or set(raw) != expected:
+        return (None, "compliance_evidence must contain schema, workflow_path, workflow_name")
+    if raw.get("schema") != COMPLIANCE_EVIDENCE_SCHEMA:
+        return (None, "unsupported compliance_evidence schema")
+    workflow_path = raw.get("workflow_path")
+    workflow_name = raw.get("workflow_name")
+    compliance_check = cfg.get("compliance_check")
+    if (
+        not isinstance(workflow_path, str)
+        or workflow_path != workflow_path.strip()
+        or len(workflow_path) > 200
+        or not re.fullmatch(
+            r"\.github/workflows/[A-Za-z0-9_.-]+\.(?:yml|yaml)", workflow_path
+        )
+    ):
+        return (None, "compliance_evidence workflow_path is invalid")
+    if (
+        not isinstance(workflow_name, str)
+        or not workflow_name
+        or workflow_name != workflow_name.strip()
+        or len(workflow_name) > 100
+    ):
+        return (None, "compliance_evidence workflow_name is invalid")
+    if (
+        not isinstance(compliance_check, str)
+        or not compliance_check
+        or compliance_check != compliance_check.strip()
+        or len(compliance_check) > 200
+    ):
+        return (None, "compliance_evidence requires a valid compliance_check")
+    return (
+        {
+            "schema": COMPLIANCE_EVIDENCE_SCHEMA,
+            "workflow_path": workflow_path,
+            "workflow_name": workflow_name,
+            "compliance_check": compliance_check,
+        },
+        "",
+    )
+
+
+def _unavailable_compliance_evidence(reason, runs_seen=0, runs_total=0):
+    return {
+        "schema": COMPLIANCE_EVIDENCE_SCHEMA,
+        "complete": False,
+        "error": str(reason or "event evidence unavailable")[:300],
+        "runs_seen": max(0, int(runs_seen or 0)),
+        "runs_total": max(0, int(runs_total or 0)),
+        "latest": None,
+        "bindings": [],
+    }
+
+
+def _read_compliance_workflow(slug, evidence_cfg, cache=None):
+    cache_key = (
+        "workflow",
+        slug,
+        evidence_cfg["workflow_path"],
+        evidence_cfg["workflow_name"],
+    )
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    encoded = quote(evidence_cfg["workflow_path"], safe="")
+    workflow = gh_rest("/repos/%s/actions/workflows/%s" % (slug, encoded))
+    workflow_id = _positive_api_int(
+        workflow.get("id") if isinstance(workflow, dict) else None
+    )
+    if (
+        not isinstance(workflow, dict)
+        or workflow_id is None
+        or workflow.get("path") != evidence_cfg["workflow_path"]
+        or workflow.get("name") != evidence_cfg["workflow_name"]
+        or workflow.get("state") != "active"
+    ):
+        raise RuntimeError("configured compliance workflow identity did not match")
+    normalized = {
+        "id": workflow_id,
+        "path": evidence_cfg["workflow_path"],
+        "name": evidence_cfg["workflow_name"],
+    }
+    if cache is not None:
+        cache[cache_key] = normalized
+    return normalized
+
+
+def _read_complete_compliance_runs(slug, workflow, head_sha, cache=None):
+    """Read every pull_request run for one configured workflow and exact head."""
+    cache_key = ("runs", slug, workflow["id"], str(head_sha))
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+    collected = []
+    total = None
+    page = 1
+    while True:
+        path = (
+            "/repos/%s/actions/workflows/%s/runs?event=pull_request&head_sha=%s"
+            "&per_page=%d&page=%d"
+            % (
+                slug,
+                workflow["id"],
+                quote(str(head_sha), safe=""),
+                COMPLIANCE_EVIDENCE_RUN_PAGE_SIZE,
+                page,
+            )
+        )
+        response = gh_rest(path)
+        if not isinstance(response, dict):
+            raise RuntimeError("compliance workflow run list returned unexpected data")
+        page_total = response.get("total_count")
+        runs = response.get("workflow_runs")
+        if (
+            isinstance(page_total, bool)
+            or not isinstance(page_total, int)
+            or page_total < 0
+            or not isinstance(runs, list)
+            or any(not isinstance(run, dict) for run in runs)
+        ):
+            raise RuntimeError("compliance workflow run list was malformed")
+        if total is None:
+            total = page_total
+            if total > COMPLIANCE_EVIDENCE_RUN_LIMIT:
+                raise RuntimeError(
+                    "compliance workflow run list exceeds bounded limit %d"
+                    % COMPLIANCE_EVIDENCE_RUN_LIMIT
+                )
+        elif page_total != total:
+            raise RuntimeError("compliance workflow run count changed during pagination")
+        if len(runs) > COMPLIANCE_EVIDENCE_RUN_PAGE_SIZE:
+            raise RuntimeError("compliance workflow run page exceeded requested size")
+        collected.extend(runs)
+        if len(collected) > total:
+            raise RuntimeError("compliance workflow run pages exceeded total_count")
+        if len(collected) == total:
+            break
+        if not runs or len(runs) < COMPLIANCE_EVIDENCE_RUN_PAGE_SIZE:
+            raise RuntimeError("compliance workflow run pagination was incomplete")
+        page += 1
+        if page > (COMPLIANCE_EVIDENCE_RUN_LIMIT // COMPLIANCE_EVIDENCE_RUN_PAGE_SIZE) + 1:
+            raise RuntimeError("compliance workflow run pagination exceeded bound")
+    result = (collected, total)
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
+def _normalize_compliance_run(run, workflow, pr_number, head_sha):
+    run_id = _positive_api_int(run.get("id"))
+    run_number = _positive_api_int(run.get("run_number"))
+    run_attempt = _positive_api_int(run.get("run_attempt"))
+    workflow_id = _positive_api_int(run.get("workflow_id"))
+    status = str(run.get("status") or "").strip().lower()
+    raw_conclusion = run.get("conclusion")
+    conclusion = str(raw_conclusion or "").strip().lower()
+    title = run.get("display_title")
+    match = _COMPLIANCE_RUN_TITLE_RE.fullmatch(title) if isinstance(title, str) else None
+    if (
+        run_id is None
+        or run_number is None
+        or run_attempt is None
+        or workflow_id != workflow["id"]
+        or run.get("path") != workflow["path"]
+        or run.get("event") != "pull_request"
+        or str(run.get("head_sha") or "") != str(head_sha)
+        or status not in _COMPLIANCE_RUN_STATUSES
+        or match is None
+    ):
+        raise ValueError("run identity, head, event, workflow, or title mismatch")
+    title_pr, action, title_number, title_id = match.groups()
+    # With an explicit run-name, GitHub's run API exposes that controlled title
+    # in both ``name`` and ``display_title``. The workflow's stable human name
+    # remains separately bound through workflow_id -> workflow metadata above.
+    if (
+        run.get("name") != title
+        or int(title_pr) != int(pr_number)
+        or int(title_number) != run_number
+        or int(title_id) != run_id
+        or action not in _COMPLIANCE_EVENT_ACTIONS
+    ):
+        raise ValueError("run title event identity or order mismatch")
+    if status == "completed":
+        if conclusion not in _COMPLIANCE_RUN_CONCLUSIONS:
+            raise ValueError("completed run conclusion is missing or unsupported")
+    elif raw_conclusion not in (None, ""):
+        raise ValueError("non-terminal run unexpectedly has a conclusion")
+    pull_requests = run.get("pull_requests")
+    if not isinstance(pull_requests, list):
+        raise ValueError("run pull request associations are unavailable")
+    if pull_requests:
+        if len(pull_requests) != 1 or not isinstance(pull_requests[0], dict):
+            raise ValueError("run pull request associations are ambiguous")
+        associated = _positive_api_int(pull_requests[0].get("number"))
+        if associated != int(pr_number):
+            raise ValueError("run pull request association mismatch")
+    return {
+        "run_id": run_id,
+        "run_number": run_number,
+        "run_attempt": run_attempt,
+        "action": action,
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def _compliance_run_outcome(run):
+    if run["status"] != "completed":
+        return "pending"
+    conclusion = run["conclusion"]
+    if conclusion == "success":
+        return "pass"
+    if conclusion == "cancelled":
+        return "fail"
+    if conclusion in {
+        "failure",
+        "timed_out",
+        "action_required",
+        "startup_failure",
+    }:
+        return "fail"
+    return "pending"
+
+
+def _compliance_context_identity(context, owner, repo):
+    check_run_id = _positive_api_int(context.get("databaseId"))
+    details_url = context.get("detailsUrl")
+    if check_run_id is None or not isinstance(details_url, str):
+        return None
+    parsed = urlparse(details_url)
+    parts = parsed.path.split("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or len(parts) != 8
+        or parts[0]
+        or parts[1].casefold() != str(owner).casefold()
+        or parts[2].casefold() != str(repo).casefold()
+        or parts[3:5] != ["actions", "runs"]
+        or parts[6] != "job"
+    ):
+        return None
+    run_id = _positive_api_int(parts[5])
+    url_job_id = _positive_api_int(parts[7])
+    if run_id is None or url_job_id != check_run_id:
+        return None
+    return (check_run_id, run_id)
+
+
+def _context_outcome_matches_run(context, run):
+    context_outcome = _check_run_outcome(
+        context.get("conclusion"), context.get("status")
+    )
+    if run["status"] != "completed":
+        return context_outcome == "pending"
+    expected = {
+        "success": "pass",
+        "failure": "fail",
+        "timed_out": "fail",
+        "action_required": "fail",
+        "startup_failure": "fail",
+        "cancelled": "cancelled",
+    }.get(run["conclusion"], "pending")
+    return context_outcome == expected
+
+
+def _build_compliance_evidence(
+    owner, repo, pr_number, head_sha, evidence_cfg, workflow, api_runs, total, contexts
+):
+    if not _status_contexts_complete(contexts):
+        return _unavailable_compliance_evidence(
+            "check contexts are incomplete", len(api_runs), total
+        )
+    normalized_runs = []
+    try:
+        for run in api_runs:
+            normalized_runs.append(
+                _normalize_compliance_run(
+                    run, workflow, int(pr_number), str(head_sha)
+                )
+            )
+    except (TypeError, ValueError) as error:
+        return _unavailable_compliance_evidence(
+            str(error), len(api_runs), total
+        )
+    if not normalized_runs:
+        return _unavailable_compliance_evidence(
+            "no current-head compliance event run was found", 0, total
+        )
+    by_id = {}
+    by_number = {}
+    for run in normalized_runs:
+        if run["run_id"] in by_id or run["run_number"] in by_number:
+            return _unavailable_compliance_evidence(
+                "compliance event run identity or order is duplicated ambiguously",
+                len(api_runs),
+                total,
+            )
+        by_id[run["run_id"]] = run
+        by_number[run["run_number"]] = run
+    bindings = []
+    bound_run_ids = set()
+    bound_check_ids = set()
+    compliance_check = evidence_cfg["compliance_check"]
+    for context in contexts["nodes"]:
+        if not isinstance(context, dict):
+            return _unavailable_compliance_evidence(
+                "check context entry is malformed", len(api_runs), total
+            )
+        context_name = (
+            context.get("name")
+            if context.get("__typename") == "CheckRun"
+            else context.get("context")
+        )
+        if context_name != compliance_check:
+            continue
+        if context.get("__typename") != "CheckRun":
+            return _unavailable_compliance_evidence(
+                "event-aware compliance context is not an Actions check run",
+                len(api_runs),
+                total,
+            )
+        identity = _compliance_context_identity(context, owner, repo)
+        if identity is None:
+            return _unavailable_compliance_evidence(
+                "compliance check run identity is missing or mismatched",
+                len(api_runs),
+                total,
+            )
+        check_run_id, run_id = identity
+        run = by_id.get(run_id)
+        if run is None:
+            return _unavailable_compliance_evidence(
+                "compliance context references an unlisted workflow run",
+                len(api_runs),
+                total,
+            )
+        if (
+            run_id in bound_run_ids
+            or check_run_id in bound_check_ids
+            or not _context_outcome_matches_run(context, run)
+        ):
+            return _unavailable_compliance_evidence(
+                "compliance context binding is duplicated or contradicts its run",
+                len(api_runs),
+                total,
+            )
+        bound_run_ids.add(run_id)
+        bound_check_ids.add(check_run_id)
+        bindings.append(
+            {
+                "check_run_id": check_run_id,
+                "run_id": run_id,
+                "run_number": run["run_number"],
+            }
+        )
+    latest = max(normalized_runs, key=lambda run: run["run_number"])
+    latest_outcome = _compliance_run_outcome(latest)
+    latest_binding = next(
+        (binding for binding in bindings if binding["run_id"] == latest["run_id"]),
+        None,
+    )
+    if latest["status"] == "completed" and latest["conclusion"] in {
+        "success",
+        "failure",
+        "timed_out",
+        "startup_failure",
+    } and latest_binding is None:
+        return _unavailable_compliance_evidence(
+            "latest terminal compliance run has no matching check context",
+            len(api_runs),
+            total,
+        )
+    latest_result = dict(latest)
+    latest_result["outcome"] = latest_outcome
+    latest_result["check_run_id"] = (
+        latest_binding["check_run_id"] if latest_binding else None
+    )
+    return {
+        "schema": COMPLIANCE_EVIDENCE_SCHEMA,
+        "complete": True,
+        "error": "",
+        "runs_seen": len(api_runs),
+        "runs_total": total,
+        "latest": latest_result,
+        "bindings": sorted(bindings, key=lambda binding: binding["run_number"]),
+    }
+
+
+def enrich_compliance_evidence(owner, repo, pr, cfg, number=None, cache=None):
+    """Attach trusted Actions run ordering to one GraphQL PR observation.
+
+    Reads happen only for an explicitly configured repository. Every failure is
+    converted to incomplete evidence; callers continue scanning but must project
+    compliance as pending/unknown instead of falling back to an older context.
+    """
+    evidence_cfg, config_error = compliance_evidence_config(cfg)
+    if evidence_cfg is None and not config_error:
+        if isinstance(pr, dict):
+            pr.pop(_COMPLIANCE_EVIDENCE_KEY, None)
+        return None
+    if not isinstance(pr, dict):
+        return _unavailable_compliance_evidence("pull request observation is malformed")
+    if config_error:
+        evidence = _unavailable_compliance_evidence(config_error)
+        pr[_COMPLIANCE_EVIDENCE_KEY] = evidence
+        return evidence
+    pr_number = number if number is not None else pr.get("number")
+    head_sha = str(pr.get("headRefOid") or "")
+    if _positive_api_int(pr_number) is None or not head_sha:
+        evidence = _unavailable_compliance_evidence(
+            "pull request number or head identity is missing"
+        )
+        pr[_COMPLIANCE_EVIDENCE_KEY] = evidence
+        return evidence
+    rollup = None
+    commits = ((pr.get("commits") or {}).get("nodes") or [])
+    if commits and isinstance(commits[0], dict):
+        rollup = (commits[0].get("commit") or {}).get("statusCheckRollup")
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    try:
+        slug = "%s/%s" % (owner, repo)
+        workflow = _read_compliance_workflow(slug, evidence_cfg, cache=cache)
+        runs, total = _read_complete_compliance_runs(
+            slug, workflow, head_sha, cache=cache
+        )
+        evidence = _build_compliance_evidence(
+            owner,
+            repo,
+            int(pr_number),
+            head_sha,
+            evidence_cfg,
+            workflow,
+            runs,
+            total,
+            contexts,
+        )
+    except (KeyError, RuntimeError, TypeError, ValueError) as error:
+        evidence = _unavailable_compliance_evidence(str(error))
+    pr[_COMPLIANCE_EVIDENCE_KEY] = evidence
+    return evidence
+
+
+def _event_compliance_outcome(pr, cfg):
+    evidence_cfg, config_error = compliance_evidence_config(cfg)
+    if evidence_cfg is None and not config_error:
+        return None
+    evidence = pr.get(_COMPLIANCE_EVIDENCE_KEY) if isinstance(pr, dict) else None
+    if (
+        config_error
+        or not isinstance(evidence, dict)
+        or evidence.get("schema") != COMPLIANCE_EVIDENCE_SCHEMA
+        or evidence.get("complete") is not True
+        or not isinstance(evidence.get("latest"), dict)
+        or evidence["latest"].get("outcome") not in {"pass", "fail", "pending"}
+    ):
+        return "pending"
+    return evidence["latest"]["outcome"]
+
+
+def _event_rollup_failure_is_accounted(contexts, cfg, evidence):
+    """Allow only superseded event failures and normal cancelled siblings.
+
+    This is the event-aware equivalent of the raw rollup exception. Every
+    same-name compliance context must bind to a validated Actions run. Other
+    check names retain the legacy substantive-failure and cancelled-only rules.
+    """
+    if (
+        not _status_contexts_complete(contexts)
+        or not isinstance(evidence, dict)
+        or evidence.get("complete") is not True
+        or not isinstance(evidence.get("latest"), dict)
+        or evidence["latest"].get("outcome") != "pass"
+    ):
+        return False
+    latest_number = evidence["latest"].get("run_number")
+    latest_check_id = evidence["latest"].get("check_run_id")
+    binding_by_check = {
+        binding.get("check_run_id"): binding
+        for binding in evidence.get("bindings", [])
+        if isinstance(binding, dict)
+    }
+    if _positive_api_int(latest_number) is None or _positive_api_int(latest_check_id) is None:
+        return False
+    comp_name = cfg.get("compliance_check")
+    other_by_name = {}
+    saw_accounted_nonpass = False
+    for context in contexts["nodes"]:
+        if not isinstance(context, dict):
+            return False
+        if context.get("__typename") == "CheckRun":
+            name = context.get("name") or ""
+            outcome = _check_run_outcome(
+                context.get("conclusion"), context.get("status")
+            )
+            if name == comp_name:
+                check_id = _positive_api_int(context.get("databaseId"))
+                binding = binding_by_check.get(check_id)
+                if not binding or binding.get("run_number", 0) > latest_number:
+                    return False
+                if binding.get("run_number") == latest_number:
+                    if check_id != latest_check_id or outcome != "pass":
+                        return False
+                elif outcome in ("fail", "cancelled"):
+                    saw_accounted_nonpass = True
+                elif outcome != "pass":
+                    return False
+                continue
+            other_by_name.setdefault(name, []).append(outcome)
+        elif context.get("__typename") == "StatusContext" or "context" in context:
+            name = context.get("context") or ""
+            if name == comp_name:
+                return False
+            other_by_name.setdefault(name, []).append(
+                _status_context_outcome(context.get("state"))
+            )
+        else:
+            return False
+    for outcomes in other_by_name.values():
+        if _reduce_check_outcomes(outcomes) != "pass" or "pass" not in outcomes:
+            return False
+        if any(outcome not in ("pass", "cancelled") for outcome in outcomes):
+            return False
+        if "cancelled" in outcomes:
+            saw_accounted_nonpass = True
+    return saw_accounted_nonpass
+
+
+def _rollup_failure_only_ignorable_cancels(contexts):
+    """True when every non-pass rollup context is a CANCELLED CheckRun whose
+    same-name equivalent also has a completed SUCCESS on this head.
+
+    Used to avoid re-poisoning compliance when GitHub's aggregate rollup is
+    FAILURE solely from concurrency-cancelled duplicates (card #1537). Any
+    unaccounted failure, missing success sibling, pending run, or StatusContext
+    non-success keeps the fail-safe backstop active.
+    """
+    if not _status_contexts_complete(contexts):
+        return False
+    by_name = {}
+    for c in contexts["nodes"]:
+        if not isinstance(c, dict):
+            return False
+        if c.get("__typename") == "CheckRun":
+            name = c.get("name") or ""
+            by_name.setdefault(name, []).append(
+                _check_run_outcome(c.get("conclusion"), c.get("status"))
+            )
+        elif c.get("__typename") == "StatusContext" or "context" in c:
+            # Status contexts have no CANCELLED twin; any non-pass is unaccounted.
+            if _status_context_outcome(c.get("state")) != "pass":
+                return False
+        else:
+            return False
+    if not by_name:
+        return False
+    saw_ignorable_cancel = False
+    for outcomes in by_name.values():
+        reduced = _reduce_check_outcomes(outcomes)
+        # Every name-group must reduce to pass (success, or success + cancelled).
+        if reduced != "pass":
+            return False
+        if "pass" not in outcomes:
+            return False
+        if any(o not in ("pass", "cancelled") for o in outcomes):
+            return False
+        if "cancelled" in outcomes:
+            saw_ignorable_cancel = True
+    # Pure all-SUCCESS with rollup FAILURE still fails closed (unaccounted check).
+    # Only excuse when at least one CANCELLED sibling was actually observed.
+    return saw_ignorable_cancel
+
+
+def check_status(pr, cfg, return_rows=False):
+    """Return aggregate check facts, optionally with compact configured rows.
+
+    The optional fifth value is produced from the exact same equivalent-name
+    groups and worst-wins reducer as ``comp`` and ``tests``. ReviewObservation
+    therefore never interprets raw conclusions a second way.
 
     compliance in pass/fail/pending/missing/n/a/none; tests in green/fail/pending/none.
-    Matching compliance contexts aggregate worst-wins, and a GitHub rollup
-    FAILURE/ERROR clamps an otherwise pass/n/a compliance read to fail.
+
+    The default policy aggregates matching compliance (and same-name test)
+    contexts by equivalent check identity on the current head: substantive
+    FAILURE/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE still fail, pending still
+    waits, and a CANCELLED concurrency duplicate is ignored only when a
+    completed SUCCESS for that same check name exists. Cancelled-only evidence
+    never becomes pass.
+
+    A repository may explicitly opt into ``wheelhouse.actions-current-body/v1``.
+    Its compliance value comes from the latest validated Actions event by
+    monotonic run_number, with run_id, workflow, PR, head, title, and check-run
+    bindings verified by ``enrich_compliance_evidence``. Missing enrichment is
+    pending, never an excuse to reuse an older success. GitHub rollup
+    FAILURE/ERROR still clamps unexplained failures in both modes.
     """
+    event_compliance = _event_compliance_outcome(pr, cfg)
     commits = pr["commits"]["nodes"]
     rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
     if not rollup or not rollup["contexts"]["nodes"]:
-        return ("none", "none", False, [])
+        result = (event_compliance or "none", "none", False, [])
+        if not return_rows:
+            return result
+        rows = []
+        comp_name = cfg.get("compliance_check")
+        if event_compliance is not None and comp_name:
+            rows.append(
+                {
+                    "name": comp_name,
+                    "role": "compliance",
+                    "outcome": (
+                        "pass"
+                        if event_compliance == "pass"
+                        else ("fail" if event_compliance == "fail" else "pending")
+                    ),
+                }
+            )
+        return result + (rows,)
     comp_name = cfg.get("compliance_check")
     patterns = cfg.get("test_check_patterns", []) or []
-    comp_results = []
-    tests = []
+    # Group by exact check name / status context so only truly equivalent
+    # duplicates (same head, same name) can cancel each other out. Different
+    # matrix legs (e.g. ubuntu vs macos) keep distinct names and stay independent.
+    comp_by_name = {}
+    test_by_name = {}
+    informational_by_name = {}
     names = []
-    comp_terminal_fail = (
-        "FAILURE",
-        "TIMED_OUT",
-        "CANCELLED",
-        "ACTION_REQUIRED",
-        "STARTUP_FAILURE",
-    )
     for c in rollup["contexts"]["nodes"]:
         if c["__typename"] == "CheckRun":
             name = c.get("name") or ""
             names.append(name)
-            concl = (c.get("conclusion") or "").upper()
-            status = (c.get("status") or "").upper()
-            done = status == "COMPLETED" or status == ""
+            outcome = _check_run_outcome(c.get("conclusion"), c.get("status"))
             if comp_name and name == comp_name:
-                comp_results.append(
-                    "pass"
-                    if concl == "SUCCESS"
-                    else "fail"
-                    if concl in comp_terminal_fail
-                    else "pending"
-                )
+                comp_by_name.setdefault(name, []).append(outcome)
             elif any(p in name for p in patterns):
-                tests.append(
-                    "pass"
-                    if (done and concl == "SUCCESS")
-                    else "fail"
-                    if (done and concl in ("FAILURE", "TIMED_OUT", "CANCELLED"))
-                    else "pending"
-                )
+                test_by_name.setdefault(name, []).append(outcome)
+            elif name:
+                informational_by_name.setdefault(name, []).append(outcome)
         else:  # StatusContext
             ctx = c.get("context") or ""
             names.append(ctx)
-            st = (c.get("state") or "").upper()
+            outcome = _status_context_outcome(c.get("state"))
             if comp_name and ctx == comp_name:
-                comp_results.append(
-                    "pass"
-                    if st == "SUCCESS"
-                    else "fail"
-                    if st in ("FAILURE", "ERROR")
-                    else "pending"
-                )
+                comp_by_name.setdefault(ctx, []).append(outcome)
             elif any(p in ctx for p in patterns):
-                tests.append(
-                    "pass"
-                    if st == "SUCCESS"
-                    else "pending"
-                    if st == "PENDING"
-                    else "fail"
-                )
-    # compliance is aggregated worst-wins across every context sharing
-    # comp_name, exactly like `tests` below - GitHub can return more than one
-    # check-run with the same name (e.g. a cancelled duplicate alongside the
-    # real successful run), and a scalar last-write-wins overwrite here would
-    # silently pick whichever context the API happened to return last.
-    if not comp_name:
+                test_by_name.setdefault(ctx, []).append(outcome)
+            elif ctx:
+                informational_by_name.setdefault(ctx, []).append(outcome)
+    # Reduce each equivalent-name group, then worst-wins across groups.
+    # Scalar last-write-wins would silently pick API order (card #392).
+    if event_compliance is not None:
+        compliance = event_compliance
+    elif not comp_name:
         compliance = "n/a"
-    elif not comp_results:
+    elif not comp_by_name:
         compliance = "missing"
-    elif "fail" in comp_results:
-        compliance = "fail"
-    elif "pending" in comp_results:
-        compliance = "pending"
     else:
-        compliance = "pass"
-    if not tests:
+        comp_results = [
+            _reduce_check_outcomes(outcomes) for outcomes in comp_by_name.values()
+        ]
+        if "fail" in comp_results:
+            compliance = "fail"
+        elif "pending" in comp_results:
+            compliance = "pending"
+        else:
+            compliance = "pass"
+    if not test_by_name:
         tstate = "none"
-    elif "fail" in tests:
-        tstate = "fail"
-    elif "pending" in tests:
-        tstate = "pending"
     else:
-        tstate = "green"
-    # Fail-toward-safe backstop: GitHub's own authoritative rollup state is
-    # already fetched below and, until now, was never consulted. If it says
-    # the commit is not green, never let compliance come out pass/n/a-with-
-    # green-tests - deliberately conservative even though this can hold a
-    # card whose only failing check is one this config doesn't track; a false
-    # hold the owner can inspect is acceptable, a false green is not.
+        test_results = [
+            _reduce_check_outcomes(outcomes) for outcomes in test_by_name.values()
+        ]
+        if "fail" in test_results:
+            tstate = "fail"
+        elif "pending" in test_results:
+            tstate = "pending"
+        else:
+            tstate = "green"
+    # Fail-toward-safe backstop: GitHub's authoritative rollup state is
+    # FAILURE/ERROR. Never let compliance come out pass/n/a when an unaccounted
+    # failure may exist - deliberately conservative even for untracked checks.
+    # Exception: every non-pass context is an ignorable CANCELLED sibling of a
+    # proven same-name SUCCESS on this head (concurrency cancel-in-progress).
     if rollup.get("state") in ("FAILURE", "ERROR") and compliance in ("pass", "n/a"):
-        compliance = "fail"
-    return (compliance, tstate, True, names)
+        if event_compliance is not None:
+            accounted = _event_rollup_failure_is_accounted(
+                rollup.get("contexts"),
+                cfg,
+                pr.get(_COMPLIANCE_EVIDENCE_KEY),
+            )
+        else:
+            accounted = _rollup_failure_only_ignorable_cancels(
+                rollup.get("contexts")
+            )
+        if not accounted:
+            compliance = "fail"
+    result = (compliance, tstate, True, names)
+    if not return_rows:
+        return result
+    rows = []
+    if event_compliance is not None and comp_name:
+        rows.append(
+            {
+                "name": comp_name,
+                "role": "compliance",
+                "outcome": (
+                    "pass"
+                    if event_compliance == "pass"
+                    else ("fail" if event_compliance == "fail" else "pending")
+                ),
+            }
+        )
+    else:
+        rows.extend(
+            {
+                "name": name,
+                "role": "compliance",
+                "outcome": _reduce_check_outcomes(outcomes),
+            }
+            for name, outcomes in comp_by_name.items()
+        )
+    rows.extend(
+        {
+            "name": name,
+            "role": "test",
+            "outcome": _reduce_check_outcomes(outcomes),
+        }
+        for name, outcomes in test_by_name.items()
+    )
+    rows.extend(
+        {
+            "name": name,
+            "role": "informational",
+            "outcome": _reduce_check_outcomes(outcomes),
+        }
+        for name, outcomes in informational_by_name.items()
+    )
+    rows.sort(key=lambda row: (row["role"], row["name"]))
+    return result + (rows,)
 
 
 def _repo_identity(repo):
@@ -793,207 +1979,372 @@ def _pr_is_cross_repo(pr):
     return head != base
 
 
-def _mergeable_is_conflicting(mergeable):
-    return str(mergeable or "").strip().upper() == "CONFLICTING"
-
-
-def _mergeable_is_mergeable(mergeable):
-    return str(mergeable or "").strip().upper() == "MERGEABLE"
-
-
-def _mergeable_is_unknown(mergeable):
-    """GitHub's GraphQL `mergeable` is a non-null enum on a valid response:
-    MERGEABLE / CONFLICTING / UNKNOWN. UNKNOWN is the EXPECTED PENDING STATE
-    (GitHub is still computing it, typically right after a base push) - never an
-    answer. A missing/None value is not something the bulk list produces for an
-    open PR, so it is left to classify's existing fail-open rather than triggering
-    a poll."""
-    return str(mergeable or "").strip().upper() == "UNKNOWN"
-
-
-def _mergeable_is_conclusive(mergeable):
-    """Only MERGEABLE and CONFLICTING are authoritative answers."""
-    return _mergeable_is_mergeable(mergeable) or _mergeable_is_conflicting(mergeable)
-
-
-# Sentinel bucket for a PR whose mergeability could not be settled this scan.
-# It is deliberately NOT in NEEDS_MAINTAINER, PR_KIND, or PRIORITY, and is NOT
-# `needs-rebase`, so build_repo emits no worklist item and no rebase nudge for
-# it: an UNKNOWN reading must never create, close, consume, or nudge. The PR is
-# frozen (its number is reported in `indeterminate_pr_numbers`) until a later
-# scan reads a conclusive value.
-MERGEABILITY_PENDING = "mergeability-pending"
-
-# UNKNOWN-mergeable poll budget. GitHub computes PR mergeability LAZILY: a push
-# to the base branch invalidates every open PR's cached mergeability to UNKNOWN,
-# and NOTHING recomputes it until the PR is queried - the first query returns
-# UNKNOWN and merely TRIGGERS the async compute, which settles to
-# MERGEABLE/CONFLICTING within seconds-to-a-minute (confirmed live: a repo went
-# 32 UNKNOWN -> 0 within ~2 min of being queried; matches GitHub's documented
-# REST "mergeable is null until computed, poll until non-null" contract). So a
-# single-PR re-read with short backoff both TRIGGERS and then CATCHES the settled
-# value. If the scan is the only regular requester, an un-polled UNKNOWN would
-# make a statically-conflicting PR flip in/out of the worklist once per base push
-# (the lavish-axi#111 duplicate-card oscillation).
-MERGEABLE_SETTLE_READS = 4
-MERGEABLE_SETTLE_BASE = 1.5  # seconds; backoff grows 1.5 -> 3 -> 6 (capped)
-MERGEABLE_SETTLE_CAP = 6.0
-_MERGEABLE_SETTLEMENT_UNSET = object()
-
-
-def _settle_mergeables(owner, name, numbers):
-    values = {number: None for number in dict.fromkeys(numbers)}
-    errors = {}
-    pending = list(values)
-    for i in range(MERGEABLE_SETTLE_READS):
-        next_round = []
-        for number in pending:
-            try:
-                value = gh_graphql_pr_mergeable(owner, name, number)
-            except Exception as e:
-                errors[number] = str(e)
-                next_round.append(number)
-                continue
-            values[number] = value
-            if _mergeable_is_conclusive(value):
-                errors.pop(number, None)
-                continue
-            next_round.append(number)
-        pending = next_round
-        if pending and i + 1 < MERGEABLE_SETTLE_READS:
-            _sleep(min(MERGEABLE_SETTLE_BASE * (2**i), MERGEABLE_SETTLE_CAP))
-    return values, errors
-
-
-def _settle_mergeable(owner, name, number):
-    values, _ = _settle_mergeables(owner, name, [number])
-    return values[number]
-
-
-def _settlement_failure_result(
-    slug,
-    name,
-    prs,
-    issues,
-    numbers,
-    settled_mergeables,
-    settlement_errors,
-    truncated,
-    indeterminate_numbers=(),
-):
-    if not settlement_errors:
-        return None
-    indeterminate = set(indeterminate_numbers)
-    indeterminate.update(
-        number
-        for number in numbers
-        if not _mergeable_is_conclusive(settled_mergeables.get(number))
-    )
-    failed_numbers = sorted(settlement_errors)
-    failed_reason = settlement_errors[failed_numbers[0]]
-    return {
-        "name": name,
-        "ok": False,
-        "warning": (
-            "%s scan failed: mergeability settlement query failed for "
-            "PR(s) %s: %s"
-            % (
-                slug,
-                ", ".join("#%s" % number for number in failed_numbers),
-                failed_reason[:160],
-            )
-        ),
-        "open_pr_numbers": [pr["number"] for pr in prs],
-        "open_issue_numbers": [it["number"] for it in issues],
-        "indeterminate_pr_numbers": sorted(indeterminate),
-        "truncated": truncated,
+PUSHABILITY_SAME_REPO = "same-repo"
+PUSHABILITY_PERSONAL_FORK_EDITABLE = "personal-fork-editable"
+PUSHABILITY_FORK_REJECT = "fork-reject"
+PUSHABILITY_UNVERIFIED = "pushability-unverified"
+PUSHABILITY_MODES = frozenset(
+    {
+        PUSHABILITY_SAME_REPO,
+        PUSHABILITY_PERSONAL_FORK_EDITABLE,
+        PUSHABILITY_FORK_REJECT,
+        PUSHABILITY_UNVERIFIED,
     }
+)
 
 
-def _resolve_pr_bucket(
-    owner,
-    name,
-    pr,
-    draft,
-    comp,
-    tests,
-    ci,
-    cross_repo,
-    settled_mergeable=_MERGEABLE_SETTLEMENT_UNSET,
-):
-    """Classify a PR, treating an UNKNOWN mergeable as an expected pending state.
-
-    `classify` fails open to a worklist bucket when mergeability is UNKNOWN or
-    missing. Left alone, that lets a statically-conflicting PR whose mergeability
-    was just invalidated by a base push (see MERGEABLE_SETTLE_READS) read as
-    `merge-ready` or `review-needed` and flip INTO the worklist for one scan -
-    minting a duplicate card that the next scan (once GitHub settles it to
-    CONFLICTING) soft-closes again. So when the fast path lands on either bucket
-    and mergeability is not authoritatively MERGEABLE, poll the single PR to
-    settle it, then re-classify: CONFLICTING -> `needs-rebase` (out, nudged), a
-    non-conflicting value -> the original worklist bucket (in). If it still can't
-    be settled within the budget, return `MERGEABILITY_PENDING` so
-    build_repo FREEZES the PR: an UNKNOWN reading must never flip worklist
-    membership (in stays in, out stays out; no card created/closed/consumed)."""
-    mergeable = pr.get("mergeable")
-    bucket = classify(draft, comp, tests, ci, cross_repo, mergeable)
-    # UNKNOWN threatens membership for every worklist bucket that a conflicting
-    # value would rewrite to needs-rebase. Only an explicit UNKNOWN is polled - a
-    # missing value keeps classify's fail-open.
-    if bucket not in ("merge-ready", "review-needed") or not _mergeable_is_unknown(
-        mergeable
-    ):
-        return bucket
-    settled = (
-        _settle_mergeable(owner, name, pr["number"])
-        if settled_mergeable is _MERGEABLE_SETTLEMENT_UNSET
-        else settled_mergeable
-    )
-    if _mergeable_is_conclusive(settled):
-        return classify(draft, comp, tests, ci, cross_repo, settled)
-    return MERGEABILITY_PENDING
+def _bounded_pushability_text(value, maximum=300):
+    value = str(value or "").strip()
+    return value[:maximum]
 
 
-def _with_mergeability(bucket, mergeable):
-    if bucket in ("merge-ready", "review-needed") and _mergeable_is_conflicting(
-        mergeable
-    ):
-        return "needs-rebase"
-    return bucket
+def derive_pushability(pr):
+    """Derive the source-branch push policy from one complete PR observation.
 
-
-def classify(draft, comp, tests, ci, cross_repo=True, mergeable=None):
-    """Return the PR routing bucket.
-
-    Only an authoritative GraphQL `mergeable=CONFLICTING` rewrites PR-review
-    buckets (`merge-ready` / `review-needed`) to waiting-on-contributor
-    `needs-rebase`. UNKNOWN or missing mergeability fails open, and fork
-    `needs-ci-approval` routing is independent of mergeability.
+    This deliberately does not infer consent from a head label, author text, or
+    REST's nullable ``maintainer_can_modify`` field. A missing or malformed
+    GraphQL source fact is ``pushability-unverified`` and cannot approve CI,
+    dispatch a model, comment, or close a target. The source tuple is retained
+    so the policy-close transaction can re-bind the exact PR before acting.
     """
+    pr = pr if isinstance(pr, dict) else {}
+    cross_repo = pr.get("isCrossRepository")
+    head_ref = _bounded_pushability_text(pr.get("headRefName"))
+    head_sha = _bounded_pushability_text(pr.get("headRefOid"))
+    head = pr.get("headRepository")
+    source = {
+        "head_ref": head_ref,
+        "head_sha": head_sha,
+        "repository": "",
+        "owner_login": "",
+        "owner_type": "",
+        "is_fork": None,
+        "maintainer_can_modify": pr.get("maintainerCanModify"),
+    }
+    if cross_repo is False:
+        if head_ref and head_sha:
+            return {"mode": PUSHABILITY_SAME_REPO, "reason": "same-repository branch", "source": source}
+        return {"mode": PUSHABILITY_UNVERIFIED, "reason": "same-repository source coordinates are incomplete", "source": source}
+    if cross_repo is not True:
+        return {"mode": PUSHABILITY_UNVERIFIED, "reason": "cross-repository status is unavailable", "source": source}
+    if head is None:
+        return {"mode": PUSHABILITY_UNVERIFIED, "reason": "fork source repository metadata is unavailable", "source": source}
+    if not isinstance(head, dict):
+        return {"mode": PUSHABILITY_UNVERIFIED, "reason": "fork source repository metadata is malformed", "source": source}
+    owner = head.get("owner")
+    owner_type = _bounded_pushability_text((owner or {}).get("__typename")) if isinstance(owner, dict) else ""
+    owner_login = _bounded_pushability_text((owner or {}).get("login")) if isinstance(owner, dict) else ""
+    repository = _bounded_pushability_text(head.get("nameWithOwner"))
+    is_fork = head.get("isFork")
+    source.update({"repository": repository, "owner_login": owner_login, "owner_type": owner_type, "is_fork": is_fork})
+    if not head_ref or not head_sha or not repository or not owner_login or not owner_type or not isinstance(is_fork, bool):
+        return {"mode": PUSHABILITY_UNVERIFIED, "reason": "fork source permission evidence is incomplete", "source": source}
+    if owner_type == "Organization":
+        return {"mode": PUSHABILITY_FORK_REJECT, "reason": "organization-owned forks cannot grant maintainer branch edits", "source": source}
+    if is_fork is False:
+        return {"mode": PUSHABILITY_FORK_REJECT, "reason": "cross-repository source is not a fork", "source": source}
+    editable = pr.get("maintainerCanModify")
+    if editable is False:
+        return {"mode": PUSHABILITY_FORK_REJECT, "reason": "the fork does not allow maintainer edits", "source": source}
+    if owner_type == "User" and editable is True:
+        return {"mode": PUSHABILITY_PERSONAL_FORK_EDITABLE, "reason": "personal fork allows maintainer edits", "source": source}
+    return {"mode": PUSHABILITY_UNVERIFIED, "reason": "fork source permission evidence is incomplete", "source": source}
+
+
+def classify(
+    draft, comp, tests, ci, cross_repo=True, mergeable=None, labels=None
+):
+    """Return the work-readiness bucket, independently of mergeability.
+
+    Mergeability is still observed for card display and remains a clean-state
+    execution gate for scan-time auto-merge. It is never a queue-routing fact:
+    a conflicted or GitHub-UNKNOWN PR with ready work is a captain decision.
+    """
+    del mergeable
     if draft:
         return "draft"
     if not ci:
-        if cross_repo is False:
-            return _with_mergeability("review-needed", mergeable)
-        return "needs-ci-approval"
+        return "review-needed" if cross_repo is False else "needs-ci-approval"
     if comp == "fail":
         return "needs-reraise"
     if comp == "pending":
         return "ci-running"
     if comp in ("pass", "n/a"):
         if tests == "green":
-            return _with_mergeability("merge-ready", mergeable)
+            return "merge-ready"
         if tests == "fail":
             return "fix-tests"
         if tests == "pending":
             return "ci-running"
         if tests == "none":
-            return _with_mergeability(
-                "review-needed", mergeable
-            )  # compliant but no test signal - look before trusting
-    return _with_mergeability(
-        "review-needed", mergeable
-    )  # comp missing-but-ci-present, or anything unmodeled
+            return "review-needed"
+    return "review-needed"
+
+
+def _pr_rollup(pr):
+    commits = ((pr.get("commits") or {}).get("nodes") or []) if isinstance(pr, dict) else []
+    if not commits:
+        return None
+    return ((commits[0].get("commit") or {}).get("statusCheckRollup"))
+
+
+def _check_observation_shape(pr):
+    """Return (complete, seen, total, phase) for the current-head rollup."""
+    rollup = _pr_rollup(pr)
+    if rollup is None:
+        return (True, 0, 0, "none")
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    if not isinstance(contexts, dict):
+        return (False, 0, 0, "unknown")
+    nodes = contexts.get("nodes")
+    total = contexts.get("totalCount")
+    seen = len(nodes) if isinstance(nodes, list) else 0
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or total < 0
+        or total < seen
+    ):
+        total = seen
+    complete = _status_contexts_complete(contexts)
+    phase = "terminal"
+    if not complete:
+        phase = "unknown"
+    else:
+        for context in nodes:
+            if not isinstance(context, dict):
+                phase = "unknown"
+                complete = False
+                break
+            if context.get("__typename") == "CheckRun":
+                if str(context.get("status") or "").upper() != "COMPLETED":
+                    phase = "pending"
+                    break
+            elif context.get("__typename") == "StatusContext" or "context" in context:
+                if str(context.get("state") or "").upper() not in {
+                    "SUCCESS",
+                    "FAILURE",
+                    "ERROR",
+                }:
+                    phase = "pending"
+                    break
+            else:
+                phase = "unknown"
+                complete = False
+                break
+    event_evidence = pr.get(_COMPLIANCE_EVIDENCE_KEY) if isinstance(pr, dict) else None
+    if isinstance(event_evidence, dict):
+        if event_evidence.get("complete") is not True:
+            complete = False
+            phase = "unknown"
+        elif (
+            isinstance(event_evidence.get("latest"), dict)
+            and event_evidence["latest"].get("outcome") == "pending"
+        ):
+            phase = "pending"
+    return (complete, seen, total, phase)
+
+
+def _pr_observation_contract(
+    owner,
+    name,
+    pr,
+    *,
+    comp,
+    tests,
+    ci,
+    bucket,
+    pending_ci_approval,
+    action_required_complete,
+    observed_at,
+    source,
+    expected_head_sha="",
+    target_complete=True,
+    configured_checks=None,
+    changed_paths=None,
+    error="",
+):
+    """Normalize scanner/exact facts into ReviewObservation v2."""
+    head_sha = str(pr.get("headRefOid") or "")
+    base_sha = str(pr.get("baseRefOid") or "")
+    head_ref = str(pr.get("headRefName") or "")
+    state = str(pr.get("state") or "OPEN").upper()
+    cross_repo = _pr_is_cross_repo(pr)
+    checks_complete, contexts_seen, contexts_total, check_phase = (
+        _check_observation_shape(pr)
+    )
+    expected_match = not expected_head_sha or head_sha == str(expected_head_sha)
+    target_complete = bool(
+        target_complete
+        and pr.get("number")
+        and head_sha
+        and base_sha
+        and head_ref
+        and state in {"OPEN", "CLOSED", "MERGED"}
+        and isinstance(cross_repo, bool)
+    )
+    # Mergeability remains a display/operational fact only. Worklist membership
+    # and ReviewObservation completeness must never depend on GitHub's lazy
+    # MERGEABLE/CONFLICTING/UNKNOWN computation.
+    classification_complete = True
+    mergeability = "not-required"
+    configured_checks = target_contracts.normalize_check_rows(
+        configured_checks or []
+    )
+    configured_checks_complete = bool(
+        checks_complete and configured_checks is not None
+    )
+    if configured_checks is None:
+        configured_checks = []
+    changed_paths = changed_paths or target_contracts.changed_path_facts()
+    changed_paths_complete = bool(changed_paths.get("complete"))
+    complete = bool(
+        target_complete
+        and checks_complete
+        and configured_checks_complete
+        and changed_paths_complete
+        and action_required_complete
+        and expected_match
+        and classification_complete
+    )
+    approval_phase = (
+        "approval-required" if pending_ci_approval else "not-required"
+    )
+    if pending_ci_approval:
+        check_phase = "pending"
+    elif check_phase == "none" and ci:
+        check_phase = "unknown"
+    return target_contracts.make_observation(
+        owner,
+        name,
+        pr.get("number"),
+        head_sha=head_sha,
+        base_sha=base_sha,
+        expected_head_sha=expected_head_sha,
+        observed_at=observed_at,
+        source=source,
+        completeness={
+            "complete": complete,
+            "target": target_complete,
+            "checks": checks_complete,
+            "configured_checks": configured_checks_complete,
+            "changed_paths": changed_paths_complete,
+            "action_required_runs": bool(action_required_complete),
+            "head_matches_expected": expected_match,
+            "check_contexts_seen": contexts_seen,
+            "check_contexts_total": contexts_total,
+            "mergeability": mergeability,
+        },
+        facts={
+            "open": state == "OPEN",
+            "title": str(pr.get("title") or "")[:500],
+            "author": str(_author_login(pr.get("author") or {}) or "")[:200],
+            "updated_at": str(pr.get("updatedAt") or "")[:100],
+            "draft": bool(pr.get("isDraft")),
+            "cross_repo": cross_repo,
+            "head_ref": head_ref[:300],
+            "mergeable": str(pr.get("mergeable") or "")[:100],
+            "ci": bool(ci),
+            "comp": str(comp or "unknown")[:100],
+            "tests": str(tests or "unknown")[:100],
+            "bucket": str(bucket or "ci-state-unknown")[:100],
+            "approval_phase": approval_phase,
+            "check_phase": check_phase,
+            "configured_checks": configured_checks,
+        },
+        changed_paths=changed_paths,
+        error=error,
+    )
+
+
+def observe_exact_pr(owner, repo_cfg, number, expected_head_sha=""):
+    """Read and classify one exact PR through the production semantics.
+
+    The returned contract is always identity/time/completeness bound. Transport,
+    shape, pagination, pending-run, mergeability, or head-binding uncertainty is
+    represented as an incomplete observation instead of an exception or guess.
+    """
+    name = repo_cfg.get("name") if isinstance(repo_cfg, dict) else ""
+    observed_at = target_contracts.utc_now()
+    observed_head_sha = ""
+    try:
+        pr = gh_graphql_pr(owner, name, int(number))
+        observed_head_sha = str(pr.get("headRefOid") or "")
+        if int(pr.get("number") or 0) != int(number):
+            raise RuntimeError("exact PR response identity mismatch")
+        enrich_compliance_evidence(owner, name, pr, repo_cfg, number=number)
+        comp, tests, ci, _, configured_checks = check_status(
+            pr, repo_cfg, return_rows=True
+        )
+        files, files_ok, files_complete = immutable_compare_files(
+            "%s/%s" % (owner, name),
+            pr.get("baseRefOid"),
+            pr.get("headRefOid"),
+            pr.get("changedFiles"),
+        )
+        changed_paths = target_contracts.changed_path_facts(
+            files if files_ok and files_complete else [],
+            complete=bool(files_ok and files_complete),
+            count=(len(set(files)) if files_ok and files_complete else None),
+        )
+        cross_repo = _pr_is_cross_repo(pr)
+        pending_ci_approval = False
+        action_required_complete = True
+        pending_error = ""
+        if (
+            str(pr.get("state") or "OPEN").upper() == "OPEN"
+            and not pr.get("isDraft")
+            and cross_repo is True
+        ):
+            pending_runs, pending_error = _list_action_required_runs(
+                "%s/%s" % (owner, name),
+                pr.get("headRefName"),
+                pr.get("headRefOid"),
+            )
+            action_required_complete = not pending_error
+            pending_ci_approval = bool(pending_runs) if not pending_error else False
+        bucket = classify(
+            bool(pr.get("isDraft")),
+            comp,
+            tests,
+            ci,
+            cross_repo,
+            pr.get("mergeable"),
+            ((pr.get("labels") or {}).get("nodes") or []),
+        )
+        if str(pr.get("state") or "OPEN").upper() != "OPEN":
+            bucket = "target-closed"
+        elif pending_ci_approval:
+            bucket = "needs-ci-approval"
+
+        return _pr_observation_contract(
+            owner,
+            name,
+            pr,
+            comp=comp,
+            tests=tests,
+            ci=ci,
+            bucket=bucket,
+            pending_ci_approval=pending_ci_approval,
+            action_required_complete=action_required_complete,
+            observed_at=observed_at,
+            source="exact-reread",
+            expected_head_sha=expected_head_sha,
+            configured_checks=configured_checks,
+            changed_paths=changed_paths,
+            error=pending_error,
+        )
+    except Exception as error:
+        return target_contracts.incomplete_observation(
+            owner,
+            name or str((repo_cfg or {}).get("name") or "unknown"),
+            number,
+            expected_head_sha=expected_head_sha,
+            observed_head_sha=observed_head_sha,
+            observed_at=observed_at,
+            source="exact-reread",
+            error=str(error)[:300],
+        )
 
 
 def config_warning(repo, comp, names):
@@ -1044,15 +2395,6 @@ def _overlap_note(number, closes, dup_clusters, addressed):
     return "; ".join(notes)
 
 
-def _recommendation(bucket):
-    return {
-        "merge-ready": "Merge - compliance and tests are green.",
-        "review-needed": "Review before merge - compliant but the test signal is missing/unclear.",
-        "needs-ci-approval": "Approve CI to get a test signal (security-gated; held automatically if the PR touches CI/action files).",
-        "issue-triage": "Triage - open issue with no linked PR yet.",
-    }.get(bucket, "Needs your call.")
-
-
 def _auto_approve_enabled(repo_cfg, global_default):
     """Effective auto_approve_ci for one repo: the per-repo `auto_approve_ci`
     override if set, else the global flag (which itself defaults to True). A
@@ -1075,13 +2417,77 @@ def _auto_merge_enabled(repo_cfg, global_default):
     return global_default is True if v is None else v is True
 
 
-def _default_branch_vision_sha(slug):
+def _assisted_merge_enabled(repo_cfg, global_default):
+    """Effective assisted in-place merge for one repo.
+
+    DEFAULT OFF in shipped code, exactly like `auto_merge`: the assisted path
+    pushes a resolution commit to a contributor's branch, so a fork must opt in
+    globally or per repo (and configure the push credential) before it can act.
+    A per-repo `assisted_merge: false` is the portable one-repo kill switch.
+    """
+    v = (repo_cfg or {}).get("assisted_merge")
+    return global_default is True if v is None else v is True
+
+
+def _assisted_merge_max_files(repo_cfg, global_default):
+    if "assisted_merge_max_conflict_files" not in (repo_cfg or {}):
+        return _bounded_config_int(
+            global_default,
+            "assisted_merge_max_conflict_files",
+            ASSISTED_MERGE_MAX_FILES_MIN,
+            ASSISTED_MERGE_MAX_FILES_MAX,
+            ASSISTED_MERGE_MAX_FILES_MIN,
+        )
+    return _bounded_config_int(
+        repo_cfg.get("assisted_merge_max_conflict_files"),
+        "assisted_merge_max_conflict_files",
+        ASSISTED_MERGE_MAX_FILES_MIN,
+        ASSISTED_MERGE_MAX_FILES_MAX,
+        ASSISTED_MERGE_MAX_FILES_MIN,
+        scope="repo %s" % str((repo_cfg or {}).get("name") or "?"),
+    )
+
+
+def _assisted_merge_max_lines(repo_cfg, global_default):
+    if "assisted_merge_max_conflict_lines" not in (repo_cfg or {}):
+        return _bounded_config_int(
+            global_default,
+            "assisted_merge_max_conflict_lines",
+            ASSISTED_MERGE_MAX_LINES_MIN,
+            ASSISTED_MERGE_MAX_LINES_MAX,
+            ASSISTED_MERGE_MAX_LINES_MIN,
+        )
+    return _bounded_config_int(
+        repo_cfg.get("assisted_merge_max_conflict_lines"),
+        "assisted_merge_max_conflict_lines",
+        ASSISTED_MERGE_MAX_LINES_MIN,
+        ASSISTED_MERGE_MAX_LINES_MAX,
+        ASSISTED_MERGE_MAX_LINES_MIN,
+        scope="repo %s" % str((repo_cfg or {}).get("name") or "?"),
+    )
+
+
+def _default_branch_vision_observation(slug):
     try:
         data = gh_rest("/repos/%s/contents/VISION.md" % slug)
-    except RuntimeError:
-        return ""
+    except RuntimeError as error:
+        if re.search(r"\bHTTP\s+404\b", str(error), re.IGNORECASE):
+            return {"status": "absent", "sha": ""}
+        return {"status": "unavailable", "sha": ""}
     sha = data.get("sha") if isinstance(data, dict) else ""
-    return str(sha or "") if isinstance(sha, str) else ""
+    if (
+        isinstance(data, dict)
+        and data.get("type") == "file"
+        and isinstance(sha, str)
+        and re.fullmatch(r"[0-9A-Fa-f]{7,64}", sha)
+    ):
+        return {"status": "present", "sha": sha}
+    return {"status": "unavailable", "sha": ""}
+
+
+def _default_branch_vision_sha(slug):
+    observation = _default_branch_vision_observation(slug)
+    return observation["sha"] if observation["status"] == "present" else ""
 
 
 def _auto_triage_enabled(repo_cfg, global_default):
@@ -1213,13 +2619,6 @@ def _workflow_command_text(value):
     return re.sub(r"[\r\n]+", " ", str(value))
 
 
-def _rebase_nudge_marker(head_sha):
-    return "<!-- %s:%s -->" % (
-        REBASE_NUDGE_MARKER_PREFIX,
-        str(head_sha or "").strip(),
-    )
-
-
 def _flatten_paginated_comments(data):
     if not isinstance(data, list):
         return []
@@ -1235,18 +2634,6 @@ def _trusted_ask_author(author, maintainer_logins):
     login = _author_login(author).casefold()
     trusted = {str(item).casefold() for item in (maintainer_logins or [])}
     return bool(login and login in trusted)
-
-
-def _has_rebase_nudge(comments, head_sha, maintainer_logins):
-    marker = _rebase_nudge_marker(head_sha)
-    for comment in _flatten_paginated_comments(comments):
-        if not isinstance(comment, dict):
-            continue
-        if marker in str(comment.get("body") or "") and _trusted_ask_author(
-            _event_author(comment), maintainer_logins
-        ):
-            return True
-    return False
 
 
 _PENDING_CONTRIBUTOR_RE = re.compile(
@@ -1382,6 +2769,12 @@ def _remove_target_label(slug, number, label):
             raise
 
 
+class PendingSourcePolicyError(RuntimeError):
+    def __init__(self, mode):
+        self.mode = mode
+        super().__init__("source permission policy requires reconciliation")
+
+
 def arm_pending_contributor_action(
     owner,
     repo,
@@ -1410,113 +2803,21 @@ def arm_pending_contributor_action(
         asked_by or owner,
         source_id,
     )
+    _require_pending_source_policy(owner, repo, number, head_sha)
     gh_rest(
         "/repos/%s/issues/%s/comments" % (slug, number),
         method="POST",
         fields={"body": _pending_contributor_marker(record)},
     )
-    _add_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
-    return record
-
-
-def _rebase_nudge_body(repo, number, head_sha):
-    marker = _rebase_nudge_marker(head_sha)
-    short = str(head_sha or "").strip()[:8] or "current head"
-    # Contributor-facing only: plain language, no product name, no queue jargon.
-    # Visible automation disclosure is required - FLEET_TOKEN posts as a human
-    # login, so without it the nudge reads as a personal maintainer message.
-    # See AGENTS.md "Contributor-facing copy". Mechanics (hidden marker below)
-    # stay load-bearing for fire-once-per-head-SHA idempotence.
-    return (
-        "Automated reminder: thanks for the PR! This branch currently has a "
-        "merge conflict with the base branch.\n\n"
-        "When you get a chance, please rebase onto (or merge) the latest base "
-        "branch, resolve the conflict, and push. After that, checks will "
-        "re-run and the PR will get looked at again.\n\n"
-        "<sub>Noted for %s#%s at `%s`.</sub>\n"
-        "%s" % (repo, number, short, marker)
-    )
-
-
-def _patch_comment_body(slug, comment_id, body):
+    _require_pending_source_policy(owner, repo, number, head_sha)
+    _ensure_repo_label(slug, PENDING_CONTRIBUTOR_LABEL)
+    _require_pending_source_policy(owner, repo, number, head_sha)
     gh_rest(
-        "/repos/%s/issues/comments/%s" % (slug, comment_id),
-        method="PATCH",
-        fields={"body": body},
-    )
-
-
-def _post_rebase_nudge_if_needed(
-    slug, repo, number, head_sha, maintainer_logins, arm_cleanup=False
-):
-    comments = gh_rest(
-        "/repos/%s/issues/%s/comments?per_page=100" % (slug, number),
-        paginate=True,
-        slurp=True,
-    )
-    if _has_rebase_nudge(comments, head_sha, maintainer_logins):
-        return False
-    body = _rebase_nudge_body(repo, number, head_sha)
-    posted = gh_rest(
-        "/repos/%s/issues/%s/comments" % (slug, number),
+        "/repos/%s/issues/%s/labels" % (slug, number),
         method="POST",
-        fields={"body": body},
+        fields={"labels[]": PENDING_CONTRIBUTOR_LABEL},
     )
-    comment_id = (posted or {}).get("id") if isinstance(posted, dict) else None
-    created_at = (posted or {}).get("created_at") if isinstance(posted, dict) else None
-    if arm_cleanup and comment_id and created_at:
-        record = _pending_record(
-            repo,
-            number,
-            "needs-rebase",
-            created_at,
-            head_sha,
-            "",
-            "",
-            comment_id,
-        )
-        _patch_comment_body(
-            slug,
-            comment_id,
-            body + "\n" + _pending_contributor_marker(record),
-        )
-        _add_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
-    elif arm_cleanup:
-        print(
-            "::warning::wheelhouse rebase-nudge could not arm stale cleanup %s#%s: missing comment timestamp"
-            % (repo, number),
-            file=sys.stderr,
-        )
-    return True
-
-
-def _maybe_nudge_rebase(slug, repo, pr, maintainer_logins, arm_cleanup=False):
-    try:
-        posted = _post_rebase_nudge_if_needed(
-            slug,
-            repo,
-            pr["number"],
-            pr.get("head_sha"),
-            maintainer_logins,
-            arm_cleanup=arm_cleanup,
-        )
-    except Exception as e:
-        print(
-            "::warning::wheelhouse rebase-nudge failed %s#%s: %s"
-            % (repo, pr["number"], _workflow_command_text(str(e)[:160])),
-            file=sys.stderr,
-        )
-        return
-    if posted:
-        print(
-            "::notice::wheelhouse rebase-nudge posted %s#%s for %s"
-            % (
-                repo,
-                pr["number"],
-                _workflow_command_text(str(pr.get("head_sha") or "")[:12]),
-            ),
-            file=sys.stderr,
-        )
+    return record
 
 
 def _label_names_from_nodes(nodes):
@@ -1720,7 +3021,9 @@ def _valid_pending_record(record, repo, number):
             return None
     except (TypeError, ValueError):
         return None
-    if record.get("ask_kind") not in PENDING_CONTRIBUTOR_ASK_KINDS_PR:
+    # Read legacy rebase records only to remove their active label during the
+    # one-way rollout. `_pending_record` above cannot create another one.
+    if record.get("ask_kind") not in PENDING_CONTRIBUTOR_ASK_KINDS_PR | {"needs-rebase"}:
         return None
     if not str(record.get("ask_id") or "").strip():
         return None
@@ -1811,7 +3114,6 @@ def _newest_active_pending_record(
     comments,
     reviews,
     has_pending_label,
-    allow_legacy_rebase,
     maintainer_logins,
     active_ask_kinds=None,
 ):
@@ -1821,10 +3123,6 @@ def _newest_active_pending_record(
         records = [r for r in records if r.get("ask_kind") in active]
     if has_pending_label and records:
         return max(records, key=lambda r: _parse_time(r["asked_at"]))
-    if allow_legacy_rebase:
-        return _legacy_rebase_record(
-            repo, number, head_sha, comments, maintainer_logins
-        )
     return None
 
 
@@ -1837,19 +3135,6 @@ def _same_time(a, b):
 def _prove_pending_ask(record, comments, reviews, maintainer_logins):
     kind = record.get("ask_kind")
     source = str(record.get("source_id") or "")
-    if kind == "needs-rebase":
-        marker = _rebase_nudge_marker(record.get("head_sha"))
-        for comment in comments:
-            if not isinstance(comment, dict):
-                continue
-            if str(comment.get("id")) != source:
-                continue
-            if not _trusted_ask_author(_event_author(comment), maintainer_logins):
-                return False
-            return marker in str(comment.get("body") or "") and _same_time(
-                comment.get("created_at"), record.get("asked_at")
-            )
-        return False
     if kind == "request-changes":
         for review in reviews:
             if not isinstance(review, dict):
@@ -2135,38 +3420,21 @@ def _has_close_attempt(comments, record, maintainer_logins, asked_dt):
 
 def _pending_reminder_body(record, reminded_at):
     marker = _pending_contributor_reminder_marker(record["ask_id"], reminded_at)
-    if record.get("ask_kind") == "needs-rebase":
-        # Same visible automation disclosure as the initial rebase nudge - this
-        # is an automated follow-up to that ask, not a personal maintainer ping.
-        text = (
-            "Automated reminder: this PR still looks blocked on a rebase or merge conflict fix.\n\n"
-            "If you are still interested, please rebase onto the current base branch, "
-            "resolve the conflict, and push.\n\n"
-            "If I do not hear back, I may close this as inactive."
-        )
-    else:
-        text = (
-            "Quick reminder: this is still waiting on your update.\n\n"
-            "If you are still interested, please push the requested changes or leave a quick comment.\n\n"
-            "If I do not hear back, I may close this as inactive."
-        )
+    text = (
+        "Quick reminder: this is still waiting on your update.\n\n"
+        "If you are still interested, please push the requested changes or leave a quick comment.\n\n"
+        "If I do not hear back, I may close this as inactive."
+    )
     return text + "\n\n" + marker
 
 
 def _pending_close_body(record, closed_at=None):
     asked = _parse_time(record.get("asked_at"))
     asked_date = asked.strftime("%Y-%m-%d") if asked else str(record.get("asked_at"))
-    if record.get("ask_kind") == "needs-rebase":
-        why = (
-            "I am closing this because it has been waiting on a rebase or merge-conflict "
-            "fix since %s, and I have not seen a comment or push since then."
-            % asked_date
-        )
-    else:
-        why = (
-            "I am closing this because I requested changes on %s, and I have not seen "
-            "a comment or push since then." % asked_date
-        )
+    why = (
+        "I am closing this because I requested changes on %s, and I have not seen "
+        "a comment or push since then." % asked_date
+    )
     body = (
         why
         + "\n\n"
@@ -2194,64 +3462,79 @@ def _patch_pending_target_closed(slug, number):
     )
 
 
-def _close_pending_target(slug, number, record, now):
+def _post_pending_close(slug, number, record, now):
     gh_rest(
         "/repos/%s/issues/%s/comments" % (slug, number),
         method="POST",
         fields={"body": _pending_close_body(record, _format_time(now))},
     )
-    _patch_pending_target_closed(slug, number)
 
 
-def _pr_conflicting_for_cleanup(pr):
-    """Whether a scanned PR may have an eligible rebase-nudge cleanup record.
+def _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+    try:
+        pushability = derive_pushability(gh_graphql_pr(owner, repo, number))
+    except Exception as error:
+        pushability = {
+            "mode": PUSHABILITY_UNVERIFIED,
+            "reason": str(error)[:300] or "source permission evidence is unavailable",
+            "source": {},
+        }
+    source_head = str((pushability.get("source") or {}).get("head_sha") or "")
+    if source_head != head_sha:
+        pushability = {
+            "mode": PUSHABILITY_UNVERIFIED,
+            "reason": "source revision changed during permission verification",
+            "source": pushability.get("source") or {},
+        }
+    pr["pushability"] = pushability
+    if pushability.get("mode") == PUSHABILITY_FORK_REJECT:
+        pr["bucket"] = "maintainer-edits-required"
+        return False
+    if pushability.get("mode") not in {
+        PUSHABILITY_SAME_REPO,
+        PUSHABILITY_PERSONAL_FORK_EDITABLE,
+    }:
+        pr["bucket"] = "source-permission-unverified"
+        return False
+    return True
 
-    `needs-rebase` is always eligible for proof lookup.
-    The ci-noop exception is eligible only for a cross-repo
-    `needs-ci-approval` PR whose scan-time mergeability is conclusively
-    `CONFLICTING`.
-    The caller must still prove the nudge itself before it can act.
-    """
-    if pr.get("bucket") == "needs-rebase":
-        return True
-    return _is_ci_noop_cleanup_candidate(pr) and _mergeable_is_conflicting(
-        pr.get("mergeable")
+
+def _require_pending_source_policy(owner, repo, number, head_sha, pr=None):
+    policy_item = pr if isinstance(pr, dict) else {}
+    if _refresh_pending_source_policy(owner, repo, number, head_sha, policy_item):
+        return
+    mode = str(
+        (policy_item.get("pushability") or {}).get("mode")
+        or PUSHABILITY_UNVERIFIED
     )
+    raise PendingSourcePolicyError(mode)
 
 
-def _is_ci_noop_cleanup_candidate(pr):
-    """Identify the fork ci-noop route without treating it as an ask or action.
-
-    A later conflict check and a provable rebase-nudge record are both required
-    before stale cleanup can do anything for this fast CI-approval lane.
-    """
-    return pr.get("bucket") == "needs-ci-approval" and pr.get("cross_repo") is True
+def _clear_pending_label_if_source_allowed(owner, repo, number, head_sha, pr):
+    try:
+        _require_pending_source_policy(owner, repo, number, head_sha, pr)
+    except PendingSourcePolicyError:
+        return False
+    _remove_target_label(
+        "%s/%s" % (owner, repo), number, PENDING_CONTRIBUTOR_LABEL
+    )
+    return True
 
 
 def _is_ci_approval_cleanup_lane(pr):
     return pr.get("kind") == "ci-approval" or pr.get("bucket") == "needs-ci-approval"
 
 
-def _ci_noop_conflict_is_current(owner, repo, pr):
-    """Re-check ci-noop mergeability immediately before a cleanup write.
-
-    Standard rebase cleanup already routes from a current `needs-rebase` scan
-    bucket.
-    The ci-noop exception must instead fail closed unless a fresh re-read is
-    still conclusively `CONFLICTING`.
-    """
-    if not _is_ci_noop_cleanup_candidate(pr):
-        return True
-    return _mergeable_is_conflicting(_settle_mergeable(owner, repo, pr["number"]))
-
-
 def _active_pending_ask_kinds(pr):
-    if _is_ci_approval_cleanup_lane(pr):
-        return {"needs-rebase"} if _pr_conflicting_for_cleanup(pr) else set()
-    kinds = {"request-changes"}
-    if _pr_conflicting_for_cleanup(pr):
-        kinds.add("needs-rebase")
-    return kinds
+    # Conflicts are never contributor work. Keep only the captain's explicit
+    # request-changes lane active; legacy needs-rebase records are disarmed.
+    del pr
+    return {"request-changes"}
+
+
+def _ci_approval_clear_only(pr):
+    """CI approval is a fast security gate, never a stale-close lane."""
+    return _is_ci_approval_cleanup_lane(pr)
 
 
 def _sweep_pending_pr(
@@ -2272,6 +3555,14 @@ def _sweep_pending_pr(
     if issue.get("state") != "open" or current_pr.get("state") != "open":
         return "skip"
 
+    head_sha = str(
+        ((current_pr.get("head") or {}).get("sha")) or pr.get("head_sha") or ""
+    )
+    if not head_sha:
+        return "skip"
+    if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+        return "source-policy"
+
     labels = set(_label_names_from_issue(issue))
     if PENDING_CONTRIBUTOR_KEEP_OPEN_LABEL in labels:
         return "skip"
@@ -2282,12 +3573,6 @@ def _sweep_pending_pr(
     if author_kind is not True:
         return "skip"
 
-    head_sha = str(
-        ((current_pr.get("head") or {}).get("sha")) or pr.get("head_sha") or ""
-    )
-    if not head_sha:
-        return "skip"
-
     active_ask_kinds = _active_pending_ask_kinds(pr)
     record = _newest_active_pending_record(
         repo,
@@ -2296,7 +3581,6 @@ def _sweep_pending_pr(
         state["comments"],
         state["reviews"],
         has_pending_label,
-        allow_legacy_rebase=_pr_conflicting_for_cleanup(pr),
         maintainer_logins=maintainer_logins,
         active_ask_kinds=active_ask_kinds,
     )
@@ -2315,7 +3599,10 @@ def _sweep_pending_pr(
                 repo, number, None, state["comments"], maintainer_logins
             )
             if (stale_rebase_records or legacy_rebase_record) and not active_records:
-                _remove_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
+                if not _clear_pending_label_if_source_allowed(
+                    owner, repo, number, head_sha, pr
+                ):
+                    return "source-policy"
                 return "activity"
         return "skip"
 
@@ -2323,8 +3610,10 @@ def _sweep_pending_pr(
     if asked_dt is None:
         return "skip"
     if str(record.get("head_sha") or "") != head_sha:
-        if has_pending_label:
-            _remove_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
+        if has_pending_label and not _clear_pending_label_if_source_allowed(
+            owner, repo, number, head_sha, pr
+        ):
+            return "source-policy"
         return "activity"
     if not _prove_pending_ask(
         record, state["comments"], state["reviews"], maintainer_logins
@@ -2332,9 +3621,17 @@ def _sweep_pending_pr(
         return "skip"
 
     if _has_qualifying_contributor_activity(state, asked_dt, maintainer_logins):
-        if has_pending_label:
-            _remove_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
+        if has_pending_label and not _clear_pending_label_if_source_allowed(
+            owner, repo, number, head_sha, pr
+        ):
+            return "source-policy"
         return "activity"
+
+    # Non-conflicting CI-approval is a fast security gate, not a stale-contributor
+    # close lane. After head-move / activity clears above, never remind or close
+    # here - even with a still-bound request-changes marker (card #1537).
+    if _ci_approval_clear_only(pr):
+        return "skip"
 
     reminder_at = asked_dt + timedelta(days=reminder_days)
     close_at = asked_dt + timedelta(days=cleanup_days)
@@ -2345,23 +3642,33 @@ def _sweep_pending_pr(
     action_due = now >= close_at or (now >= reminder_at and not reminded)
     if not action_due:
         return "skip"
-    if not _ci_noop_conflict_is_current(owner, repo, pr):
-        return "skip"
-
     if now >= close_at:
         if not reminded:
+            if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+                return "source-policy"
             _post_pending_reminder(slug, number, record, now)
             if not has_pending_label:
+                if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+                    return "source-policy"
                 _add_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
             return "reminded"
+        if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+            return "source-policy"
         if _has_close_attempt(state["comments"], record, maintainer_logins, asked_dt):
             _patch_pending_target_closed(slug, number)
         else:
-            _close_pending_target(slug, number, record, now)
+            _post_pending_close(slug, number, record, now)
+            if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+                return "source-policy"
+            _patch_pending_target_closed(slug, number)
         return "closed"
     if now >= reminder_at and not reminded:
+        if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+            return "source-policy"
         _post_pending_reminder(slug, number, record, now)
         if not has_pending_label:
+            if not _refresh_pending_source_policy(owner, repo, number, head_sha, pr):
+                return "source-policy"
             _add_target_label(slug, number, PENDING_CONTRIBUTOR_LABEL)
         return "reminded"
     return "skip"
@@ -2388,23 +3695,20 @@ def sweep_pending_contributor_actions(
     now = now or datetime.now(timezone.utc)
     closed = set()
     for pr in prs:
-        if pr.get("author_excluded"):
+        if pr.get("author_excluded") or (pr.get("pushability") or {}).get("mode") in {
+            PUSHABILITY_FORK_REJECT,
+            PUSHABILITY_UNVERIFIED,
+        }:
             continue
-        conflicting = _pr_conflicting_for_cleanup(pr)
         is_ci_approval = _is_ci_approval_cleanup_lane(pr)
-        # ci-approval is a fast security gate, not a stale-contributor lane.
-        # The narrow ci-noop exception requires both a proven rebase nudge and a
-        # conclusively conflicting cross-repo PR.
-        # A non-conflicting ci-approval PR is ignored even with a pending label,
-        # so the close path never fires without a fresh, authoritative conflict.
-        if is_ci_approval and not conflicting:
+        has_pending = PENDING_CONTRIBUTOR_LABEL in set(pr.get("labels") or [])
+        # CI approval is a fast security gate, not a stale-contributor close
+        # lane. Enter only when a pending label (or truncated labels) is present
+        # so an answered request-changes ask can clear after a head move or
+        # contributor activity, without reminding or closing (card #1537).
+        if is_ci_approval and not has_pending and not pr.get("labels_truncated"):
             continue
-        maybe_pending = (
-            pr.get("bucket") == "needs-rebase"
-            or conflicting
-            or PENDING_CONTRIBUTOR_LABEL in set(pr.get("labels") or [])
-            or pr.get("labels_truncated")
-        )
+        maybe_pending = has_pending or pr.get("labels_truncated")
         if not maybe_pending:
             continue
         try:
@@ -2490,105 +3794,108 @@ def _ci_safety_note(verdict):
 
 
 def _auto_approve_or_card(
-    owner, name, pr_number, posture, auto_enabled, changed_files=None
+    owner,
+    name,
+    pr_number,
+    posture,
+    auto_enabled,
+    changed_files=None,
+    expected_head_sha="",
+    initial_observation_id="",
 ):
-    """For one `needs-ci-approval` PR, decide auto-approve vs card.
+    """For one ``needs-ci-approval`` PR, decide auto-approve vs card.
 
-    Returns (handled, card_note, log_note, approve_status) where:
-      * handled=True  -> the run was auto-approved OR there is no pending run to
-        approve; emit NO card. `card_note` is unused (None) and `log_note` is
-        the audit line for the scan-step `::notice::`.
-      * handled=False -> return a card fallback; `card_note` is the safety warning
-        to surface on the card body (may be "", left EXACTLY as before), and
-        `log_note` is the per-PR outcome line for the scan-step `::warning::`.
-      * approve_status is the `approve_ci` status string when an approve was
-        attempted (`approved` / `noop` / `hold` / `error`), else None. Callers
-        use a `noop` status plus settled CONFLICTING mergeability to post the
-        existing rebase nudge before dropping the PR from the worklist - the
-        bucket stays `needs-ci-approval` (never rewritten to `needs-rebase`).
-    `log_note` ALWAYS carries the `ci_safety` verdict `reason`, plus - when an
-    approve was attempted - the `approve_ci` `status` + `message`. That is what
-    makes a silent approve failure (`error`/`hold`) impossible to hide in
-    the scan log; it is a logging string only (gh stderr/status text, never a
-    token) and does NOT change the card body.
-    Fails CLOSED: any uncertainty (unsafe verdict, hold, approve error/exception)
-    returns the caller-visible fallback outcome."""
+    Returns ``(handled, card_note, log_note, approve_status, receipt)``. Every
+    attempted approval has a versioned head-bound receipt. Changed or uncertain
+    effects explicitly invalidate approval/check/classification dimensions;
+    verified noops/holds are unchanged effects. Unsafe/disabled paths perform no
+    action and therefore emit no receipt.
+    """
     verdict = ci_safety("%s/%s" % (owner, name), str(pr_number), posture, changed_files)
     reason = verdict.get("reason", "")
     if auto_enabled and verdict["safe"]:
         try:
             status, message = approve_ci(
-                owner, name, str(pr_number), posture=posture, strict=True
+                owner,
+                name,
+                str(pr_number),
+                posture=posture,
+                strict=True,
+                expected_head_sha=expected_head_sha,
             )
         except Exception as e:  # an approve that throws must fall back to a card
             status, message = ("error", "auto-approve raised: %s" % str(e)[:160])
+        receipt = target_contracts.make_approval_receipt(
+            owner,
+            name,
+            pr_number,
+            expected_head_sha=expected_head_sha,
+            initial_observation_id=initial_observation_id,
+            status=status,
+        )
+        receipt_suffix = "; action-receipt=%s effect=%s invalidates=%s" % (
+            receipt["receipt_id"][:24],
+            receipt["effect"],
+            ",".join(receipt["invalidates"]) or "none",
+        )
         if status == "approved":
             return (
                 True,
                 None,
-                "auto-approved (%s): %s" % (reason, message),
+                "auto-approved (%s): %s%s" % (reason, message, receipt_suffix),
                 status,
+                receipt,
             )
         if status == "noop":
             return (
                 True,
                 None,
-                "verdict safe (%s); approve_ci noop: %s" % (reason, message),
+                "verdict safe (%s); approve_ci noop: %s%s"
+                % (reason, message, receipt_suffix),
                 status,
+                receipt,
             )
-        # hold / error -> fall through to caller fallback (fail-closed), keeping the why.
+        # hold / error -> caller fallback (fail-closed), keeping the why.
         card_note = "auto-approve did not complete (%s: %s)" % (status, message)
         safety_note = _ci_safety_note(verdict)
         if safety_note:
             card_note += "; " + safety_note
-        log_note = "verdict safe (%s); approve_ci %s: %s" % (reason, status, message)
-        return (False, card_note, log_note, status)
-    # Auto-approve disabled, or an unsafe verdict -> caller fallback; no approve attempted.
+        log_note = "verdict safe (%s); approve_ci %s: %s%s" % (
+            reason,
+            status,
+            message,
+            receipt_suffix,
+        )
+        return (False, card_note, log_note, status, receipt)
     log_note = "verdict %s (%s); not auto-approved%s" % (
         "safe" if verdict["safe"] else "unsafe",
         reason,
         "" if auto_enabled else " (auto-approve disabled)",
     )
-    return (False, _ci_safety_note(verdict), log_note, None)
+    return (False, _ci_safety_note(verdict), log_note, None, None)
 
 
-def _mergeable_for_ci_noop_nudge(pr, settled_mergeable=_MERGEABLE_SETTLEMENT_UNSET):
-    """Conclusive mergeability for a consumed ci-approval noop, or None.
+def _ci_wait_refresh_item(
+    slug, name, pr, auto_triage_enabled, action_receipt=None
+):
+    """A refresh-only Stage 1 input for an existing CI-wait PR card.
 
-    Only an authoritative CONFLICTING value may trigger the rebase nudge.
-    An explicit UNKNOWN uses the caller's batched settlement result; if it
-    never settles, return None with no nudge. Settlement errors are handled
-    before this helper runs and make the repo result unhealthy. Missing/None
-    mergeable keeps classify's fail-open and does not invent a conflict."""
-    mergeable = pr.get("mergeable")
-    if _mergeable_is_conclusive(mergeable):
-        return mergeable
-    if not _mergeable_is_unknown(mergeable):
-        return None
-    if _mergeable_is_conclusive(settled_mergeable):
-        return settled_mergeable
-    return None
-
-
-def _ci_wait_refresh_item(slug, name, pr, auto_triage_enabled):
-    """A refresh-ONLY pr-review item for a PR that is mid fork-CI approval/run wait.
-
-    When a source PR's fork CI is auto-approved this scan (or its already-approved
-    checks are still running), the PR emits NO worklist item while it awaits
-    terminal checks (`needs-ci-approval` is consumed by the auto-approve, and
-    `ci-running` is not in `NEEDS_MAINTAINER`). An EXISTING pr-review card for
-    that PR would therefore keep displaying the pre-rebase head's now-superseded
-    state - e.g. a stale `merge-ready`/`tests=green` - masquerading as current.
-    reconcile uses this item to REFRESH that existing card in place to the new
-    head's honest pending state so it can no longer masquerade after the scan
-    observes the head change. It NEVER creates a card from this item (new-card
-    creation still defers until checks are terminal) and reconcile never queues
-    triage for this transient revision. The `comp`/`tests` carried here are the
-    real scanned values at the new head (`none` when CI has not produced a
-    signal yet, or `pending` while checks run - NEVER `green`), so the refreshed
-    card visibly stops claiming a passed revision."""
+    The item carries the versioned bulk observation and optional approval
+    receipt, but reconcile must replace it with one exact post-action
+    observation before any card write. A successful receipt immediately
+    invalidates the bulk approval/check facts, so even this provisional payload
+    never repeats ``needs-ci-approval`` for the approved head.
+    """
     head = pr.get("head_sha", "") or ""
-    return {
+    observation = target_contracts.normalize_observation(
+        pr.get("target_observation")
+    )
+    receipt = target_contracts.normalize_action_receipt(action_receipt)
+    invalidated = bool(receipt and receipt.get("requires_reobservation"))
+    bucket = "ci-state-unknown" if invalidated else "ci-running"
+    comp = "unknown" if invalidated else pr["comp"]
+    tests = "unknown" if invalidated else pr["tests"]
+    item = {
         "repo": name,
         "number": pr["number"],
         "kind": "pr-review",
@@ -2596,18 +3903,59 @@ def _ci_wait_refresh_item(slug, name, pr, auto_triage_enabled):
         "updated_at": pr.get("updated_at", "") or "",
         "title": pr["title"],
         "author": pr["author"],
-        "bucket": pr["bucket"],
-        "comp": pr["comp"],
-        "tests": pr["tests"],
+        "bucket": bucket,
+        "comp": comp,
+        "tests": tests,
         "url": "https://github.com/%s/pull/%d" % (slug, pr["number"]),
-        "summary": "head moved to %s - fork CI was re-approved and its checks "
-        "are re-running; a fresh review is pending." % (head[:8] or "?"),
-        "recommendation": "Checks are re-running at the new head. Wait for them "
-        "to reach a terminal result, then re-review.",
+        "summary": (
+            "Fork-CI state changed at head %s and requires an exact final "
+            "observation before projection. Automatic triage is deferred until "
+            "checks finish; prior-head triage does not apply."
+            % (head[:8] or "?")
+            if invalidated
+            else "Current-head checks were pending in the complete fleet scan. "
+            "An exact final observation is required before projection; automatic "
+            "triage is deferred and prior-head triage does not apply."
+        ),
         "priority": "low",
         "base_sha": pr.get("base_sha") or "",
         "auto_triage": auto_triage_enabled,
     }
+    if observation:
+        item["target_observation"] = observation
+        item["projection_ref"] = target_contracts.make_projection_ref(
+            observation, "unknown" if invalidated else "pending", bucket
+        )
+    if receipt:
+        item["action_receipt"] = receipt
+    return item
+
+
+def _decision_context_candidate_rows(owner, name, enriched, closing_complete):
+    """Project every already-observed PR into neutral relation input."""
+    slug = "%s/%s" % (owner, name)
+    return [
+        {
+            "owner": owner,
+            "repo": name,
+            "number": pr["number"],
+            "head_sha": pr["head_sha"],
+            "title": pr["title"],
+            "paths_complete": bool(
+                pr["changed_paths"].get("complete")
+                and not pr["changed_paths"].get("paths_truncated")
+            ),
+            "paths": list(pr["changed_paths"].get("paths") or []),
+            "closing_complete": bool(closing_complete),
+            "closing_issues": sorted(set(pr.get("closes") or [])),
+            "references_complete": bool(pr.get("explicit_references_complete")),
+            "references": list(pr.get("explicit_references") or []),
+            "card_issue": 0,
+            "url": "https://github.com/%s/pull/%s" % (slug, pr["number"]),
+            "card_url": "",
+        }
+        for pr in enriched
+    ]
 
 
 def build_repo(
@@ -2623,52 +3971,24 @@ def build_repo(
     pending_contributor_cleanup_targets=_PENDING_CONTRIBUTOR_TARGETS_UNSET,
     ci_security_summary_cache=None,
     auto_merge=False,
+    triage_attempt_cap_per_revision=TRIAGE_ATTEMPT_CAP_DEFAULT,
+    triage_context_refresh_allowance=TRIAGE_CONTEXT_ALLOWANCE_DEFAULT,
 ):
-    """Scan one repo. Returns (repo_result, items).
+    """Scan one repository into trusted worklist items.
 
-    Decision cards are for other people's work, so scan-built PR-review and
-    issue-triage items skip known owner/maintainer/bot authors. Missing author
-    metadata fails open.
-
-    `auto_approve_ci` is the fleet-wide default (config `auto_approve_ci`, itself
-    defaulting True); a repo may override it per-repo. `auto_triage` mirrors that
-    model for the advisory Claude pass on pr-review cards, and `auto_triage_issues`
-    is the INDEPENDENT equivalent for issue-triage cards (its own global/per-repo
-    default, never affected by `auto_triage` or vice versa).
-    `pending_contributor_cleanup` is the opposite default: OFF unless the owner
-    opts in globally or per repo. When enabled for PR targets, this scan may
-    remind or close stale PRs only from provable target-side request-changes or
-    needs-rebase asks, and every uncertainty fails open. Same-repo PRs with no CI
-    signal route to normal review, not CI approval. Unknown fork status keeps a
-    manual CI-approval card with no auto-approve attempt for contributor-authored
-    PRs and logs a suppressed card for owner/maintainer/bot-authored PRs. When
-    enabled, or when the author is excluded from the decision queue, a fork PR
-    whose `ci_safety` verdict is provably safe is approved here (in the
-    FLEET_TOKEN scan context), or verified as having no pending run, and emits NO
-    card; risky/uncertain contributor PRs still become cards while excluded-author
-    PRs only log suppressed-card warnings. Each handled ci-approval PR also emits
-    exactly one stderr notice/warning outcome line. When the handled path is a
-    verified `approve_ci` noop and settled mergeability is CONFLICTING, the same
-    fire-once-per-head rebase nudge used for `needs-rebase` is posted before the
-    PR is dropped from the worklist - still no decision card and no bucket rewrite
-    (ci-approval stays independent of mergeability for classification).
-    `ci_security_summary_cache` is a best-effort, card-side display cache for
-    contributor CI-approval HOLD cards. It only avoids redundant read-only
-    analysis and never affects safety, routing, approval, or target writes.
-    Conflicted PR-review candidates become `needs-rebase`: no decision card is
-    emitted, and contributor-authored PRs get at most one rebase nudge per head
-    SHA via a hidden comment marker. This runs only on the ok:true success path
-    below, so an ok:false repo (early return) is never auto-approved or nudged.
-    A merge-ready or review-needed candidate whose bulk `mergeable` reads UNKNOWN
-    is polled to a conclusive value (`_resolve_pr_bucket`); if it still cannot be
-    settled it is reported in `indeterminate_pr_numbers` and emits no item, so an
-    UNKNOWN reading never flips worklist membership (reconcile freezes such a
-    card).
-    Open PRs, open issues, and PR closing issue references are paginated; if the
-    PR or closing-reference scan is incomplete, issue-triage items are withheld
-    because Wheelhouse cannot prove which issues are already addressed by PRs."""
+    Mergeability is a display/auto-merge-execution fact, never a readiness or
+    lifecycle gate. Before any fork-CI approval, target cleanup, normal routing,
+    or model queueing, each fork receives a deterministic source `pushability`
+    classification: provably non-modifiable forks become inert policy items,
+    incomplete facts become inert retryable items, and only editable personal
+    forks enter ordinary PR processing. Pending-contributor cleanup is limited to
+    explicit request-changes asks; legacy rebase records are silently disarmed.
+    """
     name = repo_cfg["name"]
     slug = "%s/%s" % (owner, name)
+    # Conservative lower bound: facts may be read any time after this instant.
+    # Using scan completion would make early-page PRs look fresher than they are.
+    bulk_observed_at = target_contracts.utc_now()
     try:
         data = gh_graphql(owner, name)
     except (
@@ -2735,56 +4055,170 @@ def build_repo(
     reminder_days = _pending_contributor_reminder_days(
         repo_cfg, pending_contributor_reminder_days
     )
-    arm_rebase_cleanup = cleanup_enabled and "pr" in cleanup_targets
     all_names = set()
     enriched = []
     closing_scan_complete = True
     closing_scan_warning = ""
     pr_contexts = []
-    settle_numbers = []
+    pending_ci_errors = {}
+    # Cache the immutable workflow identity once and each exact-head run list
+    # once during this repository scan. Exact rereads and G7 use fresh caches in
+    # their separate processes so approval or event races cannot reuse a scan
+    # snapshot as final evidence.
+    compliance_evidence_cache = {}
     for pr in prs:
         author = pr.get("author") or {}
-        comp, tests, ci, names = check_status(pr, repo_cfg)
-        all_names.update(names)
         cross_repo = _pr_is_cross_repo(pr)
-        bucket = classify(
-            pr["isDraft"], comp, tests, ci, cross_repo, pr.get("mergeable")
-        )
-        pr_contexts.append((pr, author, comp, tests, ci, cross_repo))
-        if bucket in ("merge-ready", "review-needed") and _mergeable_is_unknown(
-            pr.get("mergeable")
+        pushability = derive_pushability(pr)
+        # Source-policy rejects and uncertainty are deliberately established
+        # before compliance-evidence reads, CI approval discovery, normal
+        # readiness routing, cleanup, or any model dispatch. Their inert policy
+        # card needs only the source proof, not a second target-side action.
+        if pushability["mode"] in {PUSHABILITY_FORK_REJECT, PUSHABILITY_UNVERIFIED}:
+            comp, tests, ci, names, configured_checks = (
+                "unknown",
+                "unknown",
+                False,
+                set(),
+                [],
+            )
+        else:
+            event_evidence = enrich_compliance_evidence(
+                owner,
+                name,
+                pr,
+                repo_cfg,
+                cache=compliance_evidence_cache,
+            )
+            if (
+                isinstance(event_evidence, dict)
+                and event_evidence.get("complete") is not True
+            ):
+                print(
+                    "::warning::wheelhouse compliance evidence unavailable %s#%s: %s"
+                    % (
+                        name,
+                        pr.get("number"),
+                        _workflow_command_text(
+                            str(event_evidence.get("error") or "incomplete")[:200]
+                        ),
+                    ),
+                    file=sys.stderr,
+                )
+            comp, tests, ci, names, configured_checks = check_status(
+                pr, repo_cfg, return_rows=True
+            )
+        all_names.update(names)
+        pending_ci_approval = False
+        # statusCheckRollup only reflects check contexts that already exist. A
+        # separate or replayed action_required suite can coexist with completed
+        # contexts on the same head, so discover that state independently before
+        # bucket selection. Drafts stay excluded by policy, and only a provable
+        # fork is queried. The acting path below still re-lists and individually
+        # verifies every run against the live PR head before approving anything.
+        if (
+            not pr["isDraft"]
+            and cross_repo is True
+            and pushability["mode"]
+            not in {PUSHABILITY_FORK_REJECT, PUSHABILITY_UNVERIFIED}
         ):
-            settle_numbers.append(pr["number"])
+            pending_runs, pending_error = _list_action_required_runs(
+                slug, pr.get("headRefName"), pr.get("headRefOid")
+            )
+            if pending_error:
+                pending_ci_errors[pr["number"]] = pending_error
+            else:
+                pending_ci_approval = bool(pending_runs)
+        pr_contexts.append(
+            (
+                pr,
+                author,
+                comp,
+                tests,
+                ci,
+                cross_repo,
+                pending_ci_approval,
+                configured_checks,
+                pushability,
+            )
+        )
 
-    settled_mergeables, settlement_errors = _settle_mergeables(
-        owner, name, settle_numbers
-    )
-    settlement_failure = _settlement_failure_result(
-        slug,
-        name,
-        prs,
-        issues,
-        settle_numbers,
-        settled_mergeables,
-        settlement_errors,
-        pr_truncated or issue_truncated,
-    )
-    if settlement_failure:
+    if pending_ci_errors:
+        failed_numbers = sorted(pending_ci_errors)
+        failed_reason = pending_ci_errors[failed_numbers[0]]
         return (
-            settlement_failure,
+            {
+                "name": name,
+                "ok": False,
+                "warning": (
+                    "%s scan failed: action_required run enumeration failed for "
+                    "fork PR(s) %s: %s"
+                    % (
+                        slug,
+                        ", ".join("#%s" % number for number in failed_numbers),
+                        failed_reason[:160],
+                    )
+                ),
+                "open_pr_numbers": [pr["number"] for pr in prs],
+                "open_issue_numbers": [it["number"] for it in issues],
+                "truncated": pr_truncated or issue_truncated,
+            },
             [],
         )
-    for pr, author, comp, tests, ci, cross_repo in pr_contexts:
-        bucket = _resolve_pr_bucket(
-            owner,
-            name,
-            pr,
-            pr["isDraft"],
-            comp,
-            tests,
-            ci,
-            cross_repo,
-            settled_mergeables.get(pr["number"], _MERGEABLE_SETTLEMENT_UNSET),
+
+    for (
+        pr,
+        author,
+        comp,
+        tests,
+        ci,
+        cross_repo,
+        pending_ci_approval,
+        configured_checks,
+        pushability,
+    ) in pr_contexts:
+        # Observation paths are authority-bearing current facts, unlike the
+        # bounded repository candidate set below. Read each candidate once from
+        # its immutable base/head comparison even when repository context is
+        # truncated; the API's bounded rows plus changedFiles prove completeness.
+        paths, paths_ok, paths_complete = immutable_compare_files(
+            slug,
+            pr.get("baseRefOid"),
+            pr.get("headRefOid"),
+            pr.get("changedFiles"),
+        )
+        try:
+            changed_paths = target_contracts.changed_path_facts(
+                paths if paths_ok and paths_complete else [],
+                complete=bool(paths_ok and paths_complete),
+                count=(
+                    len(set(paths))
+                    if paths_ok and paths_complete
+                    else None
+                ),
+            )
+        except ValueError:
+            # A path outside the compact contract is observation-incomplete,
+            # not a reason to darken unrelated repository maintenance.
+            changed_paths = target_contracts.changed_path_facts()
+        explicit_refs, explicit_refs_complete = _explicit_pr_references(
+            pr.get("body")
+        )
+        bucket = (
+            "maintainer-edits-required"
+            if pushability["mode"] == PUSHABILITY_FORK_REJECT
+            else "source-permission-unverified"
+            if pushability["mode"] == PUSHABILITY_UNVERIFIED
+            else "needs-ci-approval"
+            if pending_ci_approval
+            else classify(
+                pr["isDraft"],
+                comp,
+                tests,
+                ci,
+                cross_repo,
+                labels=((pr.get("labels") or {}).get("nodes") or []),
+            )
         )
         author_excluded = _author_excluded_from_queue(author, maintainer_logins)
         try:
@@ -2826,14 +4260,33 @@ def build_repo(
                 "base_ref": pr.get("baseRefName"),
                 "base_sha": pr.get("baseRefOid"),
                 "cross_repo": cross_repo,
-                # Bulk GraphQL mergeable - used only by the ci-approval noop
-                # conflict-nudge path (needs-rebase already resolved via bucket).
+                # Informational only: never a routing, lifecycle, or action fact.
                 "mergeable": pr.get("mergeable"),
+                "pushability": pushability,
+                "changed_paths": changed_paths,
+                "explicit_references": explicit_refs,
+                "explicit_references_complete": explicit_refs_complete,
             }
         )
-        if bucket == "needs-rebase" and not author_excluded:
-            _maybe_nudge_rebase(
-                slug, name, enriched[-1], maintainer_logins, arm_rebase_cleanup
+        if pushability["mode"] not in {
+            PUSHABILITY_FORK_REJECT,
+            PUSHABILITY_UNVERIFIED,
+        }:
+            enriched[-1]["target_observation"] = _pr_observation_contract(
+                owner,
+                name,
+                pr,
+                comp=comp,
+                tests=tests,
+                ci=ci,
+                bucket=bucket,
+                pending_ci_approval=pending_ci_approval,
+                action_required_complete=True,
+                observed_at=bulk_observed_at,
+                source="bulk-scan",
+                target_complete=not pr_truncated,
+                configured_checks=configured_checks,
+                changed_paths=changed_paths,
             )
 
     closed_by_cleanup = sweep_pending_contributor_actions(
@@ -2857,15 +4310,22 @@ def build_repo(
     auto_enabled = _auto_approve_enabled(repo_cfg, auto_approve_ci)
     triage_enabled = _auto_triage_enabled(repo_cfg, auto_triage)
     triage_issues_enabled = _auto_triage_issues_enabled(repo_cfg, auto_triage_issues)
-    auto_merge_vision_sha = ""
-    if _auto_merge_enabled(repo_cfg, auto_merge) and any(
+    triage_attempt_cap = _triage_attempt_cap(repo_cfg, triage_attempt_cap_per_revision)
+    triage_context_allowance = _triage_context_allowance(
+        repo_cfg, triage_context_refresh_allowance
+    )
+    vision_observation = {"status": "unavailable", "sha": ""}
+    needs_triage_vision = triage_enabled and any(
+        PR_KIND.get(pr.get("bucket")) == "pr-review" for pr in enriched
+    )
+    needs_automerge_vision = _auto_merge_enabled(repo_cfg, auto_merge) and any(
         pr.get("bucket") == "merge-ready" for pr in enriched
-    ):
-        auto_merge_vision_sha = _default_branch_vision_sha(slug)
+    )
+    if needs_triage_vision or needs_automerge_vision:
+        vision_observation = _default_branch_vision_observation(slug)
     default_posture = None
 
     items = []
-    ci_noop_nudge_candidates = []
     # PRs whose fork CI this scan FRESHLY auto-approved (a new approval that will
     # produce pending checks). Combined below with `ci-running` PRs into the
     # "mid fork-CI approval/run wait" set that reconcile FREEZES (never consume a
@@ -2875,7 +4335,48 @@ def build_repo(
     # existing author-filter self-heal is never blocked (they never carry a
     # contributor pr-review card anyway).
     ci_just_approved = []
+    action_receipts = []
+    approved_receipts = {}
     for pr in enriched:
+        pushability = pr.get("pushability") or {}
+        if pr["bucket"] in {
+            "maintainer-edits-required",
+            "source-permission-unverified",
+        }:
+            mode = pushability.get("mode")
+            policy = {
+                "version": 1,
+                "mode": mode,
+                "reason": str(pushability.get("reason") or "source permission evidence is unavailable"),
+                "head_sha": pr["head_sha"],
+                "source": pushability.get("source") or {},
+            }
+            items.append(
+                {
+                    "repo": name,
+                    "number": pr["number"],
+                    "kind": "pr-review",
+                    "head_sha": pr["head_sha"],
+                    "updated_at": pr.get("updated_at", "") or "",
+                    "title": pr["title"],
+                    "author": pr["author"],
+                    "bucket": pr["bucket"],
+                    "comp": pr["comp"],
+                    "tests": pr["tests"],
+                    "url": "https://github.com/%s/pull/%d" % (slug, pr["number"]),
+                    "summary": (
+                        "Source-branch permission: %s. No CI approval, model, or "
+                        "target action is allowed until this policy state is resolved."
+                        % policy["reason"]
+                    ),
+                    "priority": "med",
+                    "pushability": mode,
+                    "mergeable": pr.get("mergeable"),
+                    "maintainer_edits_policy": policy,
+                    "auto_triage": False,
+                }
+            )
+            continue
         if pr["bucket"] not in NEEDS_MAINTAINER:
             continue
         kind = PR_KIND[pr["bucket"]]
@@ -2900,13 +4401,38 @@ def build_repo(
             "tests": pr["tests"],
             "url": "https://github.com/%s/pull/%d" % (slug, pr["number"]),
             "summary": summary,
-            "recommendation": _recommendation(pr["bucket"]),
             "priority": priority,
+            # The existing presentation note is also a trusted scan-time
+            # auto-merge safety fact. An empty string proves no overlap in this
+            # complete scan; a non-empty string is the ambiguity evidence.
+            "same_closing_issue_overlap": overlap,
+            "pushability": pushability.get("mode", PUSHABILITY_UNVERIFIED),
+            "mergeable": pr.get("mergeable"),
         }
+        initial_observation = target_contracts.normalize_observation(
+            pr.get("target_observation")
+        )
+        if initial_observation:
+            if kind == "pr-review":
+                item["target_observation"] = initial_observation
+            item["projection_ref"] = target_contracts.make_projection_ref(
+                initial_observation,
+                "current"
+                if initial_observation["completeness"]["complete"]
+                else "unknown",
+                item["bucket"],
+            )
         if kind == "pr-review":
             item["auto_triage"] = triage_enabled
+            item["triage_attempt_cap_per_revision"] = triage_attempt_cap
+            item["triage_context_refresh_allowance"] = triage_context_allowance
             item["base_sha"] = pr.get("base_sha") or ""
-            item["automerge_vision_sha"] = auto_merge_vision_sha
+            item["triage_vision_status"] = vision_observation["status"]
+            item["automerge_vision_sha"] = (
+                vision_observation["sha"]
+                if vision_observation["status"] == "present"
+                else ""
+            )
 
         if kind == "ci-approval":
             if pr.get("cross_repo") is not True:
@@ -2936,27 +4462,33 @@ def build_repo(
                     default_posture = repo_pr_target_posture(slug)
                 posture = default_posture
             approve_enabled = auto_enabled or author_excluded
-            handled, card_note, log_note, approve_status = _auto_approve_or_card(
-                owner,
-                name,
-                pr["number"],
-                posture,
-                approve_enabled,
-                pr.get("changed_files"),
+            handled, card_note, log_note, approve_status, action_receipt = (
+                _auto_approve_or_card(
+                    owner,
+                    name,
+                    pr["number"],
+                    posture,
+                    approve_enabled,
+                    pr.get("changed_files"),
+                    expected_head_sha=pr.get("head_sha") or "",
+                    initial_observation_id=(
+                        (pr.get("target_observation") or {}).get("observation_id") or ""
+                    ),
+                )
             )
+            if action_receipt:
+                action_receipts.append(action_receipt)
             if handled:
                 print(
                     "::notice::%s#%s %s"
                     % (name, pr["number"], _workflow_command_text(log_note)),
                     file=sys.stderr,
                 )
-                if approve_status == "noop" and not author_excluded:
-                    ci_noop_nudge_candidates.append(pr)
                 if approve_status == "approved" and not author_excluded:
-                    # This scan just approved this fork PR's CI; its checks are now
-                    # pending. Freeze/refresh any existing card for it until those
-                    # checks reach a terminal result (see `_ci_wait_refresh_item`).
+                    # The receipt invalidates every pre-action CI projection fact.
+                    # Reconcile must exact-reread before writing this target.
                     ci_just_approved.append(pr["number"])
+                    approved_receipts[pr["number"]] = action_receipt
                 continue  # provably safe (or nothing to approve) -> NO card
             # Log exactly one per-PR outcome line so a silent approve failure
             # can never hide in the scan log. The card body itself is unchanged
@@ -2973,6 +4505,25 @@ def build_repo(
             )
             if author_excluded:
                 continue
+            if action_receipt and action_receipt.get("requires_reobservation"):
+                # An error may be partial: some POSTs can succeed before another
+                # fails. The pre-action observation is no longer current, so the
+                # fallback card is explicitly unknown rather than falsely green
+                # or approval-required. Manual approval remains head/safety bound.
+                item.update(
+                    {
+                        "bucket": "ci-state-unknown",
+                        "comp": "unknown",
+                        "tests": "unknown",
+                        "summary": "Fork-CI approval had a partial or uncertain "
+                        "effect; current target state is unknown until a complete "
+                        "re-observation.",
+                    }
+                )
+                if initial_observation:
+                    item["projection_ref"] = target_contracts.make_projection_ref(
+                        initial_observation, "unknown", item["bucket"]
+                    )
             if card_note:  # surface the safety warning on the card body / response
                 item["warning"] = card_note
             # Attach the advisory, read-only security summary of the changed
@@ -2981,38 +4532,6 @@ def build_repo(
             _attach_ci_security_summary(item, slug, pr, ci_security_summary_cache)
 
         items.append(item)
-
-    ci_noop_unknown_numbers = [
-        pr["number"]
-        for pr in ci_noop_nudge_candidates
-        if _mergeable_is_unknown(pr.get("mergeable"))
-    ]
-    ci_noop_settled_mergeables = {}
-    ci_noop_settlement_errors = {}
-    if ci_noop_unknown_numbers:
-        ci_noop_settled_mergeables, ci_noop_settlement_errors = _settle_mergeables(
-            owner, name, ci_noop_unknown_numbers
-        )
-    ci_noop_settlement_failure = _settlement_failure_result(
-        slug,
-        name,
-        enriched,
-        issues,
-        ci_noop_unknown_numbers,
-        ci_noop_settled_mergeables,
-        ci_noop_settlement_errors,
-        pr_truncated or issue_truncated or not closing_scan_complete,
-        (pr["number"] for pr in enriched if pr["bucket"] == MERGEABILITY_PENDING),
-    )
-    if ci_noop_settlement_failure:
-        return (ci_noop_settlement_failure, [])
-    for pr in ci_noop_nudge_candidates:
-        mergeable = _mergeable_for_ci_noop_nudge(
-            pr,
-            ci_noop_settled_mergeables.get(pr["number"], _MERGEABLE_SETTLEMENT_UNSET),
-        )
-        if _mergeable_is_conflicting(mergeable):
-            _maybe_nudge_rebase(slug, name, pr, maintainer_logins, arm_cleanup=False)
 
     if card_issues:
         if pr_truncated or not closing_scan_complete:
@@ -3042,9 +4561,9 @@ def build_repo(
                         "tests": "n/a",
                         "url": "https://github.com/%s/issues/%d" % (slug, it["number"]),
                         "summary": "open issue, no linked PR",
-                        "recommendation": _recommendation("issue-triage"),
                         "priority": PRIORITY["issue-triage"],
                         "auto_triage_issues": triage_issues_enabled,
+                        "triage_attempt_cap_per_revision": triage_attempt_cap,
                     }
                 )
 
@@ -3081,14 +4600,6 @@ def build_repo(
         "ok": True,
         "open_pr_numbers": [p["number"] for p in enriched],
         "open_issue_numbers": open_issue_numbers,
-        # PRs whose mergeability could not be settled this scan (UNKNOWN did not
-        # resolve within the poll budget). They stay in `open_pr_numbers` (still
-        # open) but emit no worklist item, and reconcile FREEZES their cards -
-        # an UNKNOWN reading must never flip worklist membership or
-        # create/close/consume a card.
-        "indeterminate_pr_numbers": [
-            p["number"] for p in enriched if p["bucket"] == MERGEABILITY_PENDING
-        ],
         # Freeze set for the approve/wait window (see above). reconcile skips
         # consuming a PR-kind card whose target number is here, exactly like the
         # indeterminate freeze.
@@ -3098,11 +4609,72 @@ def build_repo(
         # state (never create a card, never queue triage for this revision).
         "ci_wait_refresh_items": [
             _ci_wait_refresh_item(
-                slug, name, enriched_by_number[n], triage_enabled
+                slug,
+                name,
+                enriched_by_number[n],
+                triage_enabled,
+                action_receipt=approved_receipts.get(n),
             )
             for n in ci_wait_numbers
             if n in enriched_by_number
         ],
+        # Content-free head-bound target action audit contracts. Reconcile reads
+        # the matching receipt from each refresh item; this list is retained for
+        # scan observability and future stage separation.
+        "target_action_receipts": action_receipts,
+        # Neutral inputs for DecisionContext. Every PR was already observed by
+        # this scan, so relation matching sees the full set before
+        # decision_context.py applies its small result cap. These records never
+        # feed classification or auto-merge.
+        "decision_context_candidates": _decision_context_candidate_rows(
+            owner, name, enriched, closing_scan_complete
+        ),
+        # Open issues are indexed only as exact-reference destinations. They do
+        # not enter the default PR comparison set and cannot crowd out shared-
+        # path PR candidates. GitHub issue/PR numbers share one namespace.
+        "decision_reference_candidates": [
+            {
+                "owner": owner,
+                "repo": name,
+                "number": issue["number"],
+                "head_sha": "issue:%s" % str(issue.get("updatedAt") or "unknown"),
+                "title": issue["title"],
+                "paths_complete": True,
+                "paths": [],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": 0,
+                "url": "https://github.com/%s/%s/issues/%s"
+                % (owner, name, issue["number"]),
+                "card_url": "",
+            }
+            for issue in issues
+        ],
+        "worklist_absence_reasons": {
+            str(p["number"]): (
+                "waiting in target state `%s`" % p.get("bucket")
+                if p.get("bucket")
+                else "no longer classified for a maintainer decision"
+            )
+            for p in enriched
+            if not any(
+                candidate.get("repo") == name
+                and candidate.get("number") == p["number"]
+                for candidate in items
+            )
+        },
+        "worklist_absence_observations": {
+            str(p["number"]): p["target_observation"]
+            for p in enriched
+            if p.get("target_observation")
+            and not any(
+                candidate.get("repo") == name
+                and candidate.get("number") == p["number"]
+                for candidate in items
+            )
+        },
         "truncated": pr_truncated or issue_truncated or not closing_scan_complete,
         "warning": warning,
     }
@@ -3415,6 +4987,23 @@ def _is_not_found(stderr):
     return "404" in s or "not found" in s
 
 
+def target_label_state(owner, repo, number, label):
+    """Return True/False for one exact target label, or None on read failure."""
+    path = "/repos/%s/%s/issues/%s/labels/%s" % (
+        owner,
+        repo,
+        number,
+        quote(label, safe=""),
+    )
+    try:
+        value = gh_rest(path)
+    except RuntimeError as error:
+        return False if _is_not_found(str(error)) else None
+    except ValueError:
+        return None
+    return bool(isinstance(value, dict) and value.get("name") == label) or None
+
+
 def _gh_api_capture(path):
     """Raw `gh api <path>` returning the CompletedProcess so the caller can tell
     a 404 (genuinely absent) apart from a read error (must fail closed)."""
@@ -3427,6 +5016,46 @@ def _changed_file_count(value):
     except (TypeError, ValueError):
         return None
     return count if count >= 0 else None
+
+
+def immutable_compare_files(slug, base_sha, head_sha, expected_count):
+    """Read changed paths from one immutable base/head comparison.
+
+    GitHub bounds comparison file rows. The expected GraphQL changed-file count
+    therefore proves completeness instead of treating a partial response as
+    complete. Rename source paths are retained for path-based safety gates.
+    """
+    object_id = re.compile(r"[0-9a-fA-F]{7,64}")
+    base_sha = str(base_sha or "").strip()
+    head_sha = str(head_sha or "").strip()
+    if not object_id.fullmatch(base_sha) or not object_id.fullmatch(head_sha):
+        return ([], False, False)
+    try:
+        comparison = gh_rest(
+            "/repos/%s/compare/%s...%s" % (slug, base_sha, head_sha)
+        )
+    except (RuntimeError, ValueError):
+        return ([], False, False)
+    if not isinstance(comparison, dict) or not isinstance(comparison.get("files"), list):
+        return ([], False, False)
+    paths = []
+    entry_count = 0
+    for changed in comparison["files"]:
+        if not isinstance(changed, dict):
+            return ([], False, False)
+        filename = str(changed.get("filename") or "").strip()
+        if not filename:
+            return ([], False, False)
+        paths.append(filename)
+        entry_count += 1
+        if "previous_filename" in changed:
+            previous = changed.get("previous_filename")
+            if not isinstance(previous, str) or not previous.strip():
+                return ([], False, False)
+            paths.append(previous.strip())
+    count = _changed_file_count(expected_count)
+    return (paths, True, count is not None and entry_count == count)
+
 
 
 def _list_pr_files(slug, pr, expected_count=None):
@@ -3448,6 +5077,38 @@ def _list_pr_files(slug, pr, expected_count=None):
     files = [f.strip() for f in out.stdout.splitlines() if f.strip()]
     count = _changed_file_count(expected_count)
     return (files, True, count is not None and len(files) >= count)
+
+
+_EXPLICIT_TARGET_URL_RE = re.compile(
+    r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/(?:pull|issues)/([1-9][0-9]*)"
+)
+_EXPLICIT_TARGET_SLUG_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([1-9][0-9]*)(?![A-Za-z0-9])"
+)
+
+
+def _explicit_pr_references(body):
+    """Extract bounded explicit PR or issue references from target metadata.
+
+    Contributor text remains untrusted data. This deterministic extraction only
+    creates neutral advisory relations and never authorizes an action.
+    """
+    if not isinstance(body, str) or len(body.encode("utf-8")) > 100_000:
+        return ([], False)
+    refs = {
+        (owner, repo, int(number))
+        for pattern in (_EXPLICIT_TARGET_URL_RE, _EXPLICIT_TARGET_SLUG_RE)
+        for owner, repo, number in pattern.findall(body)
+    }
+    if len(refs) > 100:
+        return ([], False)
+    return (
+        [
+            {"owner": owner, "repo": repo, "number": number}
+            for owner, repo, number in sorted(refs)
+        ],
+        True,
+    )
 
 
 def _risky_ci_files(files):
@@ -4671,8 +6332,19 @@ def _security_summary_from_card_body(body):
     _, separator, after_notice = after_heading.partition("\n\n")
     if not separator:
         return None
-    summary, _, _ = after_notice.partition("\n### ")
-    summary = summary.rstrip()
+    # The section ends at the next heading or, when it is the last rendered
+    # section, at the decision block. `### Recommended action` used to always
+    # follow it; it is now conditional (admitted agent recommendations only)
+    # and never present on a ci-approval card, so the marker is load-bearing.
+    ends = [
+        index
+        for index in (
+            after_notice.find("\n### "),
+            after_notice.find("\n<!-- wheelhouse-decision:start -->"),
+        )
+        if index >= 0
+    ]
+    summary = (after_notice[: min(ends)] if ends else after_notice).rstrip()
     return summary or None
 
 
@@ -4834,7 +6506,63 @@ def _workflow_run_matches_pr(slug, run_id, pr, head_sha, head_ref):
     return (True, "")
 
 
-def approve_ci(owner, repo, pr, posture=None, strict=False):
+def _list_action_required_runs(slug, head_ref, head_sha):
+    """List a complete exact-head page of pending workflow runs, or an error.
+
+    Callers must treat any error as unknown state. This helper is discovery
+    only: `approve_ci` separately fetches the live PR and verifies every listed
+    run through `_workflow_run_matches_pr` before acting.
+    """
+    head_ref = str(head_ref or "")
+    head_sha = str(head_sha or "")
+    if not head_ref or not head_sha:
+        return (None, "missing head ref/sha")
+    result = subprocess.run(
+        [
+            "gh",
+            "run",
+            "list",
+            "--branch",
+            head_ref,
+            "--commit",
+            head_sha,
+            "--status",
+            "action_required",
+            "--limit",
+            str(ACTION_REQUIRED_RUN_LIMIT),
+            "-R",
+            slug,
+            "--json",
+            "databaseId,workflowDatabaseId,workflowName,headSha,headBranch,url",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return (None, "workflow run list failed: %s" % result.stderr.strip()[:160])
+    if not result.stdout.strip():
+        return (None, "workflow run list returned no output")
+    try:
+        runs = json.loads(result.stdout)
+    except ValueError:
+        return (None, "workflow run list returned invalid JSON")
+    if not isinstance(runs, list):
+        return (None, "workflow run list returned unexpected data")
+    if len(runs) >= ACTION_REQUIRED_RUN_LIMIT:
+        return (
+            None,
+            "workflow run list returned %d runs (limit %d); refusing a possibly "
+            "truncated list" % (len(runs), ACTION_REQUIRED_RUN_LIMIT),
+        )
+    for run in runs:
+        if not isinstance(run, dict) or not run.get("databaseId"):
+            return (None, "workflow run list returned an entry without databaseId")
+    return (runs, "")
+
+
+def approve_ci(
+    owner, repo, pr, posture=None, strict=False, expected_head_sha=None
+):
     """Approve fork-PR workflow runs awaiting maintainer approval.
 
     `posture` (from `repo_pr_target_posture`) is passed by the scan-time auto path
@@ -4845,9 +6573,11 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
     Each action_required run must also verify against the PR head: populated
     pull_requests associations stay strict, while fork-originated empty
     associations are accepted only on matching head SHA plus head branch.
-    After that verification, duplicate pending runs sharing a stable
-    workflowDatabaseId are deduped to the highest/newest run. Runs without that
-    stable workflow identity remain distinct.
+    Every verified current-head run is approved, including multiple runs with
+    the same workflow identity when GitHub exposes each as actionable.
+    When ``expected_head_sha`` is supplied by the scanner, the live PR must still
+    have that exact head before any approval occurs. The manual command omits it
+    and continues to act on the freshly fetched current head.
 
     Returns (status, message). status in:
       approved - one or more runs approved
@@ -4871,6 +6601,12 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
     head_sha = str(head.get("sha") or "")
     if not head_ref or not head_sha:
         return ("error", "pr fetch returned missing head ref/sha")
+    if expected_head_sha and head_sha != str(expected_head_sha):
+        return (
+            "error",
+            "#%s head changed before approval (expected %s, observed %s)"
+            % (pr, str(expected_head_sha)[:12], head_sha[:12]),
+        )
     changed_files = pr_data.get("changed_files")
     base_ref = str(base.get("ref") or "")
     default_branch = str(((base.get("repo") or {}).get("default_branch")) or "")
@@ -4902,60 +6638,11 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
             % (pr, head_ref, head_sha[:8], verdict.get("reason") or "not safe", warn),
         )
 
-    run_list_limit = 30
-    lst = subprocess.run(
-        [
-            "gh",
-            "run",
-            "list",
-            "--branch",
-            head_ref,
-            "--commit",
-            head_sha,
-            "--status",
-            "action_required",
-            "--limit",
-            str(run_list_limit),
-            "-R",
-            slug,
-            "--json",
-            "databaseId,workflowDatabaseId,workflowName,headSha,headBranch,url",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if lst.returncode != 0:
+    runs, list_error = _list_action_required_runs(slug, head_ref, head_sha)
+    if list_error:
         return (
             "error",
-            "#%s (%s@%s): workflow run list failed: %s%s"
-            % (pr, head_ref, head_sha[:8], lst.stderr.strip()[:160], warn),
-        )
-    if not lst.stdout.strip():
-        return (
-            "error",
-            "#%s (%s@%s): workflow run list returned no output%s"
-            % (pr, head_ref, head_sha[:8], warn),
-        )
-    try:
-        runs = json.loads(lst.stdout)
-    except ValueError:
-        return (
-            "error",
-            "#%s (%s@%s): workflow run list returned invalid JSON%s"
-            % (pr, head_ref, head_sha[:8], warn),
-        )
-    if not isinstance(runs, list):
-        return (
-            "error",
-            "#%s (%s@%s): workflow run list returned unexpected data%s"
-            % (pr, head_ref, head_sha[:8], warn),
-        )
-    if len(runs) >= run_list_limit:
-        return (
-            "error",
-            "#%s (%s@%s): workflow run list returned %d runs (limit %d); "
-            "refusing to approve a possibly truncated list%s"
-            % (pr, head_ref, head_sha[:8], len(runs), run_list_limit, warn),
+            "#%s (%s@%s): %s%s" % (pr, head_ref, head_sha[:8], list_error, warn),
         )
     if not runs:
         return (
@@ -4967,12 +6654,6 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
     matching = []
     skipped = []
     for run in runs:
-        if not isinstance(run, dict) or not run.get("databaseId"):
-            return (
-                "error",
-                "#%s (%s@%s): workflow run list returned an entry without databaseId%s"
-                % (pr, head_ref, head_sha[:8], warn),
-            )
         name = run.get("workflowName", "?")
         match, reason = _workflow_run_matches_pr(
             slug, run["databaseId"], pr, head_sha, head_ref
@@ -4987,28 +6668,6 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
             matching.append(run)
         else:
             skipped.append("%s:%s" % (name, reason))
-
-    def dedup_key(run):
-        workflow_id = run.get("workflowDatabaseId")
-        if workflow_id not in (None, ""):
-            return ("workflow", str(workflow_id))
-        return ("run", str(run["databaseId"]))
-
-    by_workflow = {}
-    for run in matching:
-        key = dedup_key(run)
-        prev = by_workflow.get(key)
-        if prev is None or run["databaseId"] > prev["databaseId"]:
-            by_workflow[key] = run
-    if len(by_workflow) < len(matching):
-        winners = set(id(r) for r in by_workflow.values())
-        for run in matching:
-            if id(run) not in winners:
-                skipped.append(
-                    "%s:duplicate-pending-run-%s"
-                    % (run.get("workflowName", "?"), run["databaseId"])
-                )
-        matching = sorted(by_workflow.values(), key=lambda r: r["databaseId"])
 
     if not matching:
         msg = "#%s (%s@%s): no matching workflow runs awaiting approval" % (
@@ -5026,6 +6685,32 @@ def approve_ci(owner, repo, pr, posture=None, strict=False):
     done = []
     failed = []
     for run in matching:
+        try:
+            source_pr = gh_graphql_pr(owner, repo, int(pr))
+            source_policy = derive_pushability(source_pr)
+        except Exception as error:
+            return (
+                "error",
+                "#%s (%s@%s): source permission could not be verified before approval: %s%s"
+                % (pr, head_ref, head_sha[:8], str(error)[:160], warn),
+            )
+        source_mode = source_policy.get("mode")
+        source_head = str(source_pr.get("headRefOid") or "")
+        if source_head != head_sha or source_mode not in {
+            PUSHABILITY_SAME_REPO,
+            PUSHABILITY_PERSONAL_FORK_EDITABLE,
+        }:
+            return (
+                "error",
+                "#%s (%s@%s): source permission policy blocked approval: %s%s"
+                % (
+                    pr,
+                    head_ref,
+                    head_sha[:8],
+                    source_policy.get("reason") or "source identity changed",
+                    warn,
+                ),
+            )
         rid = run["databaseId"]
         ar = subprocess.run(
             [
@@ -5330,6 +7015,22 @@ def cmd_scan_health(scan_path):
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
+def _load_cards_file(path):
+    if not path:
+        return []
+    try:
+        with open(path) as f:
+            cards = json.load(f)
+    except (OSError, ValueError) as error:
+        print(
+            "::warning::wheelhouse could not load card snapshot %s: %s"
+            % (path, str(error)[:160]),
+            file=sys.stderr,
+        )
+        return []
+    return cards if isinstance(cards, list) else []
+
+
 def _load_ci_security_summary_cache(path):
     if not path:
         return {}
@@ -5359,7 +7060,8 @@ def cmd_scan(only_repo=None, cards_path=None):
     else:
         names = list(repos)
 
-    summary_cache = _load_ci_security_summary_cache(cards_path)
+    cards_snapshot = _load_cards_file(cards_path)
+    summary_cache = ci_security_summary_cache(cards_snapshot)
     out_repos = {}
     items = []
     for name in names:
@@ -5376,6 +7078,8 @@ def cmd_scan(only_repo=None, cards_path=None):
             cfg["pending_contributor_cleanup_targets"],
             summary_cache,
             cfg["auto_merge"],
+            cfg["triage_attempt_cap_per_revision"],
+            cfg["triage_context_refresh_allowance"],
         )
         out_repos[name] = result
         items.extend(repo_items)
@@ -5389,14 +7093,119 @@ def cmd_scan(only_repo=None, cards_path=None):
             else:
                 print("::warning::%s: %s" % (name, warning), file=sys.stderr)
 
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Build bounded neutral DecisionContext only after every repository snapshot
+    # is available. Optional context incompleteness is rendered but never marks
+    # a repository scan unhealthy and never feeds an acting condition.
+    cards_repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    card_index = {}
+    for card in cards_snapshot:
+        state = parse_state_block((card or {}).get("body", "")) or {}
+        labels = set(_label_names_from_issue(card or {}))
+        key = (state.get("repo"), state.get("number"))
+        author = ((card or {}).get("user") or (card or {}).get("author") or {})
+        login = author.get("login", "") if isinstance(author, dict) else ""
+        if (
+            state.get("kind") in {"pr-review", "issue-triage"}
+            and key[0]
+            and isinstance(key[1], int)
+            and login in {"github-actions[bot]", "app/github-actions"}
+            and {"repo:%s" % key[0], "target:%s-%s" % key}.issubset(labels)
+        ):
+            card_index[key] = int(card.get("number") or 0)
+
+    candidates_by_repo = {}
+    candidate_lookup = {}
+    for repo_name, result in out_repos.items():
+        rows = list((result or {}).get("decision_context_candidates") or [])
+        reference_rows = list(
+            (result or {}).get("decision_reference_candidates") or []
+        )
+        for row in rows + reference_rows:
+            issue = card_index.get((row.get("repo"), row.get("number")), 0)
+            row["card_issue"] = issue
+            if issue and cards_repo:
+                row["card_url"] = "https://github.com/%s/issues/%s" % (
+                    cards_repo,
+                    issue,
+                )
+            candidate_lookup[(row.get("owner"), row.get("repo"), row.get("number"))] = row
+        candidates_by_repo[repo_name] = rows
+
+    for item in items:
+        if item.get("kind") != "pr-review":
+            continue
+        rows = list(candidates_by_repo.get(item.get("repo"), []))
+        referenced = []
+        target_row = candidate_lookup.get((owner, item.get("repo"), item.get("number")))
+        for ref in (target_row or {}).get("references") or []:
+            candidate = candidate_lookup.get(
+                (ref.get("owner"), ref.get("repo"), ref.get("number"))
+            )
+            if candidate and candidate not in rows:
+                referenced.append(candidate)
+        rows.extend(sorted(referenced, key=lambda row: (row["owner"], row["repo"], row["number"])))
+        snapshot = decision_context_contracts.repository_snapshot(
+            rows,
+            generated_at,
+            complete=True,
+            candidate_count=len(rows),
+        )
+        observation = item.get("target_observation")
+        normalized_observation = target_contracts.normalize_review_observation(
+            observation
+        )
+        if normalized_observation:
+            print(
+                "::notice::wheelhouse observation %s %s#%s observation=%s "
+                "head=%s checks=%s paths=%s"
+                % (
+                    (
+                        "produced"
+                        if normalized_observation["completeness"]["complete"]
+                        else "incomplete"
+                    ),
+                    item.get("repo"),
+                    item.get("number"),
+                    normalized_observation["observation_id"][:24],
+                    normalized_observation["revision"]["head_sha"][:12],
+                    len(normalized_observation["facts"]["configured_checks"]),
+                    normalized_observation["changed_paths"]["count"],
+                ),
+                file=sys.stderr,
+            )
+        if snapshot is None:
+            context = decision_context_contracts.unavailable_context(
+                observation, "snapshot.unavailable"
+            )
+        else:
+            context = decision_context_contracts.build_decision_context(
+                observation, snapshot
+            )
+        item["decision_context"] = context
+        print(
+            "::notice::wheelhouse context %s %s#%s context=%s candidates=%s reason=%s"
+            % (
+                context["status"],
+                item.get("repo"),
+                item.get("number"),
+                context["context_id"][:24],
+                len(context["candidates"]),
+                context.get("reason") or "none",
+            ),
+            file=sys.stderr,
+        )
+
     payload = {
         "owner": owner,
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at": generated_at,
         "card_issues": cfg["card_issues"],
         "auto_approve_ci": cfg["auto_approve_ci"],
         "auto_merge": cfg["auto_merge"],
         "auto_triage": cfg["auto_triage"],
         "auto_triage_issues": cfg["auto_triage_issues"],
+        "triage_attempt_cap_per_revision": cfg["triage_attempt_cap_per_revision"],
+        "triage_daily_ceiling": cfg["triage_daily_ceiling"],
         "pending_contributor_cleanup": cfg["pending_contributor_cleanup"],
         "repos": out_repos,
         "items": items,
@@ -5430,7 +7239,11 @@ def cmd_checks(repo):
     prs, complete = _page_open_prs(owner, rc["name"], data["pullRequests"])
     if not complete:
         sys.exit("could not read every open PR; refusing incomplete check-name list")
+    evidence_cache = {}
     for pr in prs:
+        enrich_compliance_evidence(
+            owner, rc["name"], pr, rc, cache=evidence_cache
+        )
         _, _, _, n = check_status(pr, rc)
         names.update(n)
     print("check names on %s (compliance_check=%r):" % (repo, comp))

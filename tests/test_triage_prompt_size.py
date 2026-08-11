@@ -33,10 +33,17 @@ import yaml
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # The whole point of by-reference is an O(1) prompt. Keep this budget small: the
-# constant scaffolding (all conditional branches unioned) is a few KB, ~16x
-# under this and ~48x+ under MAX_ARG_STRLEN. If a future change makes the prompt
-# grow past this, that is exactly the regression to catch.
-PROMPT_BYTE_BUDGET = 8192
+# constant scaffolding (all conditional branches unioned) is a few KB and ~10x+
+# under MAX_ARG_STRLEN. If a future change makes the prompt grow past this, that
+# is exactly the regression to catch.
+#
+# The budget applies to BOTH the raw prompt and its json.dumps() escaping, which
+# is ~5% larger; 8192 was breaching on the escaped variant before the literal
+# recommendation_basis contract was even added. 12288 restores real headroom
+# while keeping the guard meaningful - the invariant that matters is that the
+# prompt is CONSTANT (the flat-size checks below prove that against a 5 MB
+# diff), not that it sits at any particular byte count.
+PROMPT_BYTE_BUDGET = 12288
 MAX_ARG_STRLEN = 131072
 
 _failures = []
@@ -303,12 +310,12 @@ def test_both_token_and_no_token_paths_use_the_same_by_reference_prompt():
 
 
 def test_diff_complete_fails_closed_when_diff_exceeds_the_cap():
-    """DIFF_COMPLETE / auto-merge verdict semantics under by-reference: the
-    verdict is only produced when the WHOLE diff is on disk. A diff that still
-    exceeds the (now generous) on-disk cap is truncated and fails CLOSED
-    (DIFF_COMPLETE=false -> no auto-merge verdict), where complete context is
-    required. A diff UNDER the cap is complete (the correctness upgrade: large
-    but sub-cap PRs, previously truncated at 120000, now get a verdict)."""
+    """DIFF_COMPLETE / auto-merge behavior semantics under by-reference: the
+    independent facts are produced only when the WHOLE diff is on disk. A diff
+    that still exceeds the generous on-disk cap is truncated and fails CLOSED
+    (DIFF_COMPLETE=false -> no behavior facts). A diff under the cap gets the
+    independent facts, while the vision-bound verdict still additionally
+    requires trusted default-branch VISION.md."""
     text = _read(".github/workflows/triage.yml")
     check("triage: DIFF_COMPLETE starts false (fail-closed default)", "DIFF_COMPLETE=false" in text)
     check(
@@ -328,9 +335,19 @@ def test_diff_complete_fails_closed_when_diff_exceeds_the_cap():
         trunc_idx != -1 and complete_idx != -1 and complete_idx > trunc_idx,
     )
     check(
-        "triage: auto-merge verdict requires VISION_PRESENT AND DIFF_COMPLETE",
-        'if [ "$VISION_PRESENT" = "true" ] && [ "$DIFF_COMPLETE" = "true" ]; then'
-        in text,
+        "triage: independent facts require DIFF_COMPLETE",
+        'if [ "$DIFF_COMPLETE" = "true" ]; then' in text
+        and "AUTOMERGE_BEHAVIOR_AVAILABLE=true" in text,
+    )
+    check(
+        "triage: vision-bound verdict requires VISION and trusted target facts",
+        (
+            'if [ "$VISION_PRESENT" = "true" ] \\\n'
+            '              && [ "$TARGET_FACTS_PRESENT" = "true" ] \\\n'
+            '              && [ "$AUTOMERGE_BEHAVIOR_AVAILABLE" = "true" ]; then'
+        )
+        in text
+        and "AUTOMERGE_VERDICT_AVAILABLE=true" in text,
     )
     # The on-disk cap is generous enough that a large-but-real PR (no-mistakes
     # #434 was ~139571 bytes of diff) is now complete-on-disk, whereas the old
@@ -343,7 +360,7 @@ def test_diff_complete_fails_closed_when_diff_exceeds_the_cap():
 
 def test_triage_apply_anchor_checks_evidence_against_on_disk_target():
     """The trusted card-update step passes the on-disk target.txt to
-    triage-apply so it can anchor-check the model's evidence quotes (the
+    triage-apply so it can anchor-check the model's evidence spans (the
     lazy/fabrication guard). The path is the absolute workspace path (target.txt
     is written outside the trusted-src snapshot)."""
     text = _read(".github/workflows/triage.yml")

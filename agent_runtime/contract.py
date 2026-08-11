@@ -226,10 +226,24 @@ def validate_contract(document: dict[str, Any], kind: str | None = None) -> None
         raise ContractError("unsupported agent runtime contract version")
     validate_schema(document, load_schema(actual_kind))
     if actual_kind == "AgentTask":
+        input_ids = [item["id"] for item in document["spec"]["inputs"]]
+        if len(input_ids) != len(set(input_ids)):
+            raise ContractError("$.spec.inputs ids must be unique")
         for item in document["spec"]["inputs"]:
             logical = Path(item["logicalPath"])
             if logical.is_absolute() or any(part in ("", ".", "..") for part in logical.parts):
                 raise ContractError("$.spec.inputs logicalPath has an invalid format")
+            git = item.get("git")
+            if git is not None:
+                matches = [
+                    candidate
+                    for candidate in document["spec"]["inputs"]
+                    if candidate["id"] == "repository-provenance"
+                    and candidate["artifact"] == git["symlinkProvenanceArtifact"]
+                    and candidate["sha256"] == git["symlinkProvenanceSha256"]
+                ]
+                if len(matches) != 1:
+                    raise ContractError("repository symlink provenance binding is invalid")
         limits = document["spec"]["limits"]
         enforcement = limits["enforcement"]
         for name, quality in enforcement.items():
@@ -246,7 +260,7 @@ def validate_contract(document: dict[str, Any], kind: str | None = None) -> None
             or (revision_binding["cancellationConfirmed"] != (revision_binding["cancellationError"] is None))
             or document["proof"]["sandboxPolicySha256"] != canonical_sha256(revision_binding)
             or document["status"] != "failed"
-            or document.get("error", {}).get("code") != "target.stale"
+            or document.get("error", {}).get("code") != "source.revision_mismatch"
             or document.get("error", {}).get("spendStarted") is not True
             or document["selection"]["actualProvider"]
             or document["selection"]["actualModel"]
@@ -255,6 +269,8 @@ def validate_contract(document: dict[str, Any], kind: str | None = None) -> None
         ):
             raise ContractError("revision mismatch evidence is inconsistent")
         selection = document["selection"]
+        if document["proof"]["executionProfile"] != selection["profile"]:
+            raise ContractError("result proof execution profile does not match selection")
         quality = selection["harnessProvenanceQuality"]
         if quality == "verified-executable" and (selection["harnessVersion"] is None or selection["harnessDigest"] is None):
             raise ContractError("verified executable provenance requires an observed version and digest")
@@ -264,6 +280,16 @@ def validate_contract(document: dict[str, Any], kind: str | None = None) -> None
             raise ContractError("pinned action provenance must not claim observed metadata")
         if quality == "unavailable" and any(selection[name] is not None for name in ("harnessVersion", "harnessDigest", "harnessSourceCommit", "harnessMetadataSha256")):
             raise ContractError("unavailable harness provenance cannot carry observed identities")
+        if selection["adapter"] == "claude-cli" and document["status"] == "succeeded":
+            validations = document.get("final", {}).get("validation", [])
+            if (
+                document["proof"]["structuredOutputMechanism"] != "native-schema"
+                or not any(
+                    row.get("name") == "native-schema" and row.get("status") == "passed"
+                    for row in validations
+                )
+            ):
+                raise ContractError("direct Claude success requires native structured output proof")
 
 
 def load_json_regular(path: os.PathLike[str] | str, max_bytes: int = 16 * 1024 * 1024) -> Any:
@@ -315,3 +341,8 @@ def verify_result_binding(task: dict[str, Any], result: dict[str, Any]) -> None:
         raise ContractError("result execution id does not match its task")
     if result["requestSha256"] != canonical_sha256(task):
         raise ContractError("result request hash does not match its task")
+    if result["selection"]["profile"] != task["spec"]["selection"]["profile"]:
+        raise ContractError("result execution profile does not match its task")
+    candidate = task["spec"]["selection"]["candidates"][0]
+    if result["selection"]["adapter"] != candidate["adapter"]:
+        raise ContractError("result adapter does not match its task")

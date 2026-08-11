@@ -31,6 +31,12 @@ Covers:
   * the optional READONLY_TOKEN search prompt: when enabled it tells the LLM how
     to use read-only gh for answer context, and when disabled the prompt
     stays in the legacy no-shell/no-search mode.
+  * decline prose is an explicit prompt contract carried through the native
+    schema's strict `free_text` field: the model is told to use card/target
+    context, write respectfully for the contributor, preserve the decision and
+    stated factual rationale, and neither invent a reason nor soften the close
+    into ambiguity. The real #1493 instruction is carried through the mocked
+    structured-result, route, comment, and close path.
   * the card-driven workflow-merge gate: net-diff and history-only workflow
     touches, including either side of a rename, fail closed as terminal
     `blocked` with manual UI-merge guidance and no merge API call.
@@ -47,6 +53,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
 )
 import apply_decision as ad  # noqa: E402
+from agent_runtime import size_budget  # noqa: E402
 
 _failures = []
 
@@ -271,24 +278,18 @@ def test_consuming_actions_unchanged_by_investigate_routing():
     )
 
 
-def test_reconcile_absence_state_does_not_affect_decision_parse():
-    baseline = run_parse(_tick([], ["merge"]))
+def test_reconcile_absence_state_makes_decision_inert():
     with_absence = _tick([], ["merge"])
     with_absence["ISSUE_BODY"] = INV_CARD.replace(
         '"options"',
-        '"reconcile_absence":{"version":1,"threshold":2,"count":1},"options"',
+        '"reconcile_absence":{"version":3,"threshold":2,"count":1,'
+        '"scheduled_epoch":41},"options"',
     )
     actual = run_parse(with_absence)
     check(
-        "decision: reconcile absence state is ignored",
-        {
-            key: actual.get(key, "")
-            for key in ("decision", "target_repo", "target_number", "kind", "head_sha")
-        }
-        == {
-            key: baseline.get(key, "")
-            for key in ("decision", "target_repo", "target_number", "kind", "head_sha")
-        },
+        "decision: visible first absence is inert",
+        actual.get("decision", "") == ""
+        and actual.get("investigate", "") == "",
     )
 
 
@@ -416,6 +417,94 @@ def test_text_required_label_parse_is_ignored():
     )
 
 
+def admitted_pr_assessment(action, reason):
+    rows = [
+        {"name": "Gate", "role": "compliance", "outcome": "pass"},
+        {"name": "tests", "role": "test", "outcome": "pass"},
+    ]
+    observation = ad.target_observation.make_observation(
+        "acme",
+        "lavish-axi",
+        42,
+        head_sha="abc",
+        base_sha="base",
+        expected_head_sha="abc",
+        observed_at="2024-01-01T00:00:00Z",
+        source="exact-reread",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "configured_checks": True,
+            "changed_paths": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": "Ready PR",
+            "author": "contributor",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "draft": False,
+            "cross_repo": False,
+            "head_ref": "feature",
+            "mergeable": "MERGEABLE",
+            "ci": True,
+            "comp": "pass",
+            "tests": "green",
+            "bucket": "merge-ready",
+            "approval_phase": "complete",
+            "check_phase": "terminal",
+            "configured_checks": rows,
+        },
+        changed_paths=ad.target_observation.changed_path_facts(
+            ["src/example.py"], complete=True
+        ),
+    )
+    snapshot = ad.decision_context.repository_snapshot(
+        [
+            {
+                "owner": "acme",
+                "repo": "lavish-axi",
+                "number": 42,
+                "head_sha": "abc",
+                "title": "Fixture PR 42",
+                "paths_complete": True,
+                "paths": ["src/example.py"],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": 0,
+                "url": "https://github.com/acme/lavish-axi/pull/42",
+                "card_url": "",
+            }
+        ],
+        "2024-01-01T00:00:00Z",
+    )
+    context = ad.decision_context.build_decision_context(observation, snapshot)
+    assessment = ad.assessment_admission.admit_assessment(
+        {
+            "summary": "Ready",
+            "product_implications": "No product risk found.",
+            "recommended_action": action,
+            "recommended_reason": reason,
+            "recommendation_basis": {
+                "kind": "other",
+                "observation_id": observation["observation_id"],
+                "context_id": context["context_id"],
+                "check_names": [],
+            },
+        },
+        observation,
+        context,
+    )
+    return observation, context, assessment
+
+
 def accept_card(
     kind="issue-triage",
     action="decline",
@@ -435,6 +524,15 @@ def accept_card(
         "triage_status": "succeeded",
         "triage_recommendation": {"action": action, "reason": reason},
     }
+    if kind == "pr-review":
+        observation, context, assessment = admitted_pr_assessment(action, reason)
+        state.update(
+            {
+                "review_observation": observation,
+                "decision_context": context,
+                "triage_assessment": assessment,
+            }
+        )
     if extra_state:
         state.update(extra_state)
     return "<!-- wheelhouse-state: %s -->" % json.dumps(state, separators=(",", ":"))
@@ -864,7 +962,9 @@ def test_request_changes_route_decision():
     )
     check(
         "route: request-changes target carried from state block",
-        r["target_repo"] == "lavish-axi" and str(r["target_number"]) == "42",
+        r["target_repo"] == "lavish-axi"
+        and str(r["target_number"]) == "42"
+        and r["target_revision"] == STATE["head_sha"],
     )
 
     r = route({"mode": "action", "action": "request-changes"})
@@ -910,6 +1010,8 @@ def test_load_llm_result_tolerant():
 def patch_core(**attrs):
     """Monkeypatch attributes on ad.core for the duration of the block, no
     network required. Restores the originals afterwards even on failure."""
+    if "gh_rest" in attrs and "gh_graphql_pr" not in attrs:
+        attrs["gh_graphql_pr"] = lambda *_args: editable_source_pr()
     saved = {name: getattr(ad.core, name) for name in attrs}
     for name, value in attrs.items():
         setattr(ad.core, name, value)
@@ -971,6 +1073,8 @@ def fake_gh_rest(
             }
         )
         if method in (None, "GET"):
+            if "/issues/" in path and "/labels/" in path:
+                raise RuntimeError("HTTP 404: label not found")
             if "/reviews/" in path:
                 if review_get_error:
                     raise RuntimeError(review_get_error)
@@ -1066,7 +1170,13 @@ def open_pr(
     user = {"login": login}
     if user_type is not None:
         user["type"] = user_type
-    pr = {"merged": False, "state": "open", "head": {"sha": head_sha}, "user": user}
+    pr = {
+        "merged": False,
+        "state": "open",
+        "head": {"sha": head_sha, "repo": {"full_name": "owner-login/target-repo"}},
+        "base": {"repo": {"full_name": "owner-login/target-repo"}},
+        "user": user,
+    }
     if changed_files is not None:
         pr["changed_files"] = changed_files
     if commits is not None:
@@ -1074,6 +1184,21 @@ def open_pr(
     if html_url is not None:
         pr["html_url"] = html_url
     return pr
+
+
+def editable_source_pr(head_sha="abc123"):
+    return {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": head_sha,
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/fork",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
 
 
 def posts(calls):
@@ -1568,6 +1693,8 @@ def test_workflow_merge_gate_rechecks_head_after_scan():
                 "TARGET_REPO": "target-repo",
                 "TARGET_NUMBER": "5",
                 "HEAD_SHA": "oldhead01",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "oldhead01",
             }
         )
     pr_reads = [
@@ -1634,7 +1761,7 @@ def test_workflow_merge_gate_reclassifies_merge_head_race():
         pr_files=["src/app.py"],
         pr_commits=["oldhead01"],
         commit_files={"oldhead01": ["src/app.py"]},
-        pr_sequence=[start, start, moved],
+        pr_sequence=[start, start, start, moved],
     )
     with patch_core(
         gh_rest=fake,
@@ -1648,6 +1775,8 @@ def test_workflow_merge_gate_reclassifies_merge_head_race():
                 "TARGET_REPO": "target-repo",
                 "TARGET_NUMBER": "5",
                 "HEAD_SHA": "oldhead01",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "oldhead01",
             }
         )
     check(
@@ -1722,6 +1851,8 @@ def test_workflow_merge_gate_logs_blocked_result():
                     "TARGET_REPO": "target-repo",
                     "TARGET_NUMBER": "5",
                     "HEAD_SHA": "abc123",
+                    "KIND": "pr-review",
+                    "TARGET_REVISION": "abc123",
                 }
             )
     check(
@@ -1762,6 +1893,217 @@ def test_workflow_merge_gated_files_helper_is_workflows_only():
         "wf-gate: helper tolerates None/empty",
         ad.core._workflow_merge_gated_files(None) == []
         and ad.core._workflow_merge_gated_files([]) == [],
+    )
+
+
+def test_manual_merge_does_not_bypass_rejected_source_policy():
+    pr = open_pr()
+    pr["head"]["repo"] = {"full_name": "contributor/target-repo"}
+    source = {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "abc123",
+        "maintainerCanModify": False,
+        "headRepository": {
+            "nameWithOwner": "contributor/target-repo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=lambda *_args: source,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
+    check(
+        "merge: exact source-policy reject blocks a stale manual card",
+        terminal == "none" and "contribution requirement" in message,
+    )
+    check("merge: rejected source sends no merge request", merge_puts(calls) == [])
+
+
+def test_manual_merge_rechecks_source_policy_after_workflow_inspection():
+    pr = open_pr()
+    pr["head"]["repo"] = {"full_name": "contributor/target-repo"}
+    source = {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "abc123",
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/target-repo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    source_reads = []
+
+    def read_source(*_args):
+        source_reads.append(len(source_reads) + 1)
+        current = dict(source)
+        current["maintainerCanModify"] = len(source_reads) == 1
+        return current
+
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=read_source,
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        message, terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
+    check(
+        "merge: source policy is rebound after workflow inspection",
+        source_reads == [1, 2]
+        and terminal == "none"
+        and "contribution requirement" in message,
+    )
+    check("merge: final source-policy reject sends no merge request", merge_puts(calls) == [])
+
+
+def test_decline_rechecks_source_policy_immediately_before_close():
+    pr = open_pr()
+    source = {
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "abc123",
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/target-repo",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    source_reads = []
+
+    def read_source(*_args):
+        source_reads.append(len(source_reads) + 1)
+        current = dict(source)
+        current["maintainerCanModify"] = len(source_reads) == 1
+        return current
+
+    fake, calls = fake_gh_rest(pr)
+    with patch_core(gh_rest=fake, gh_graphql_pr=read_source):
+        out = run_execute(
+            {
+                "GITHUB_REPOSITORY_OWNER": "owner-login",
+                "DECISION": "decline",
+                "FREE_TEXT": "This does not fit the project.",
+                "TARGET_REPO": "target-repo",
+                "TARGET_NUMBER": "5",
+                "HEAD_SHA": "abc123",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "abc123",
+            }
+        )
+    check(
+        "decline: source policy is rebound immediately before close",
+        source_reads == [1, 2]
+        and out.get("terminal_state") == "retryable"
+        and out.get("source_policy_mode") == ad.core.PUSHABILITY_FORK_REJECT,
+    )
+    check(
+        "decline: final source-policy rejection prevents every target mutation",
+        not any(call["method"] in ("POST", "PATCH", "PUT") for call in calls),
+    )
+
+
+def test_comment_and_review_recheck_source_policy_at_mutation_boundary():
+    source = editable_source_pr()
+
+    for decision, text in (
+        ("comment", "Please add coverage."),
+        ("request-changes", "Please add coverage."),
+    ):
+        source_reads = []
+
+        def read_source(*_args):
+            source_reads.append(len(source_reads) + 1)
+            current = dict(source)
+            current["maintainerCanModify"] = len(source_reads) == 1
+            return current
+
+        fake, calls = fake_gh_rest(open_pr())
+        with patch_core(gh_rest=fake, gh_graphql_pr=read_source):
+            out = run_execute(
+                {
+                    "GITHUB_REPOSITORY_OWNER": "owner-login",
+                    "DECISION": decision,
+                    "FREE_TEXT": text,
+                    "TARGET_REPO": "target-repo",
+                    "TARGET_NUMBER": "5",
+                    "HEAD_SHA": "abc123",
+                    "KIND": "pr-review",
+                    "TARGET_REVISION": "abc123",
+                }
+            )
+        check(
+            "%s: source policy is rebound at the mutation boundary" % decision,
+            source_reads == [1, 2]
+            and out.get("terminal_state") == "retryable"
+            and out.get("source_policy_mode") == ad.core.PUSHABILITY_FORK_REJECT,
+        )
+        check(
+            "%s: final source-policy rejection prevents target mutation" % decision,
+            not any(call["method"] in ("POST", "PATCH", "PUT") for call in calls),
+        )
+
+
+def test_request_changes_rechecks_source_policy_before_cleanup_arming():
+    source = editable_source_pr()
+    source_reads = []
+
+    def read_source(*_args):
+        source_reads.append(len(source_reads) + 1)
+        current = dict(source)
+        current["maintainerCanModify"] = len(source_reads) < 3
+        return current
+
+    fake, calls = fake_gh_rest(open_pr())
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=read_source,
+        load_config=lambda: cleanup_cfg(),
+    ):
+        out = run_execute(
+            {
+                "GITHUB_REPOSITORY_OWNER": "owner-login",
+                "DECISION": "request-changes",
+                "FREE_TEXT": "Please add coverage.",
+                "TARGET_REPO": "target-repo",
+                "TARGET_NUMBER": "5",
+                "HEAD_SHA": "abc123",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "abc123",
+            }
+        )
+    check(
+        "request-changes arming: review remains posted after permission revocation",
+        len([call for call in posts(calls) if call["path"].endswith("/reviews")])
+        == 1,
+    )
+    check(
+        "request-changes arming: revoked source blocks marker and label writes",
+        not any(
+            call["method"] == "POST"
+            and (
+                call["path"].endswith("/issues/5/comments")
+                or call["path"].endswith("/issues/5/labels")
+            )
+            for call in calls
+        ),
+    )
+    check(
+        "request-changes arming: denial queues source-policy reconciliation",
+        source_reads == [1, 2, 3]
+        and out.get("source_policy_mode") == ad.core.PUSHABILITY_FORK_REJECT
+        and out.get("terminal_state") == "none",
     )
 
 
@@ -1958,12 +2300,21 @@ def test_thank_on_merge_skips_non_success_outcomes():
 
     fake, calls = fake_gh_rest(open_pr(), merge_error="422: merge conflict")
     with patch_core(gh_rest=fake, **common):
-        _, terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
-    check("thank: a failed merge PUT is an error, not resolved", terminal == "error")
-    check("thank: no comment when the merge itself failed", posts(calls) == [])
+        msg, terminal = ad.do_merge("owner-login", "target-repo", 5, "abc123")
+    # Merge conflicts are recoverable (card #1544): leave the card pending so a
+    # later clean head can refresh via the normal scan path. Still not resolved.
+    check(
+        "thank: a merge-conflict PUT is recoverable none, not resolved",
+        terminal == "none",
+    )
+    check(
+        "thank: merge-conflict message still explains the rebase ask",
+        "merge conflict" in msg.lower() and "rebase" in msg.lower(),
+    )
+    check("thank: no thank-you comment when the merge itself failed", posts(calls) == [])
 
-    # Card #447: 403 token failures and merge conflicts both terminal "error".
-    # decision-handler must label both as blocked (not pure needs-decision).
+    # Card #447: generic (non-conflict) failures stay durable "error" so
+    # decision-handler labels them blocked (not pure needs-decision).
     fake, calls = fake_gh_rest(
         open_pr(),
         merge_error=(
@@ -2044,6 +2395,250 @@ def test_thank_on_merge_custom_message_and_per_repo_precedence():
 
 
 # --------------------------------------------------------------------------- #
+# Recoverable merge-conflict classification (card #1544 / #447 tension):
+# a real base-advance conflict must leave the card pure pending so a later
+# clean head refreshes via the normal path, while generic failures stay
+# durable blocked and stale heads stay non-actionable.
+# --------------------------------------------------------------------------- #
+def test_merge_conflict_is_recoverable_not_durable_blocked():
+    import render_card as rc
+
+    common = dict(
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    )
+    old_head = "93d2ba365d725e2263e9e4181b8db1ffe8a205ed"
+    new_head = "668a67c9a002a4480598e9fb20a6059f9eff9032"
+
+    # (1) Real merge-conflict PUT -> recoverable terminal + owner-facing note.
+    conflict_detail = (
+        "gh: Pull Request has merge conflicts (HTTP 405)"
+    )
+    fake, calls = fake_gh_rest(
+        open_pr(head_sha=old_head),
+        merge_error=conflict_detail,
+    )
+    with patch_core(gh_rest=fake, **common):
+        msg, terminal = ad.do_merge(
+            "owner-login", "target-repo", 79, old_head
+        )
+    check(
+        "recoverable-conflict: terminal is none (not error/blocked/resolved)",
+        terminal == "none",
+    )
+    check(
+        "recoverable-conflict: message still explains the conflict",
+        "merge conflict" in msg.lower()
+        and "rebase" in msg.lower()
+        and "target-repo#79" in msg,
+    )
+    check(
+        "recoverable-conflict: merge PUT was attempted",
+        len(merge_puts(calls)) == 1,
+    )
+    check(
+        "recoverable-conflict: no thank-you or target side-write on conflict",
+        posts(calls) == [],
+    )
+    # decision-handler only adds blocked / drops needs-decision for
+    # terminal_state in {blocked, error}. Terminal "none" leaves pure pending.
+    pure_pending = [
+        {"name": n}
+        for n in (
+            "needs-decision",
+            "kind:pr-review",
+            "repo:target-repo",
+            "priority:med",
+            "target:target-repo-79",
+        )
+    ]
+    check(
+        "recoverable-conflict: pure pending labels stay is_refreshable",
+        rc.is_refreshable(pure_pending) is True,
+    )
+    blocked_labels = [
+        {"name": n}
+        for n in ("blocked", "kind:pr-review", "repo:target-repo", "target:target-repo-79")
+    ]
+    check(
+        "recoverable-conflict: durable blocked labels are NOT refreshable "
+        "(#447 protection still encodes this shape)",
+        rc.is_refreshable(blocked_labels) is False,
+    )
+
+    # (2) Later contributor rebase / new clean head is a material refresh trigger.
+    card_state = {
+        "repo": "target-repo",
+        "number": 79,
+        "kind": "pr-review",
+        "head_sha": old_head,
+        "comp": "pass",
+        "tests": "green",
+        "priority": "med",
+        "options": ["merge", "close", "investigate", "hold"],
+        "bucket": "merge-ready",
+        "projection_freshness": "",
+        "projection_head_sha": "",
+        "projection_complete": False,
+        "pushability": "",
+        "render_version": rc.CARD_RENDER_VERSION,
+    }
+    refreshed_item = {
+        "repo": "target-repo",
+        "number": 79,
+        "kind": "pr-review",
+        "head_sha": new_head,
+        "comp": "pass",
+        "tests": "green",
+        "priority": "med",
+        "options": ["merge", "close", "investigate", "hold"],
+        "title": "fix labels",
+        "author": "contributor",
+        "bucket": "merge-ready",
+        "updated_at": "2026-07-21T20:18:37Z",
+        "url": "https://github.com/owner/target-repo/pull/79",
+        "summary": "compliance=pass tests=green",
+        "recommendation": "Merge it.",
+        "pushability": "",
+    }
+    check(
+        "recoverable-conflict: new head is material_changed for normal refresh",
+        rc.material_changed(refreshed_item, card_state) is True,
+    )
+    check(
+        "recoverable-conflict: new head needs refresh on pure pending card",
+        rc.refresh_needed(refreshed_item, card_state, labels=pure_pending) is True,
+    )
+    check(
+        "recoverable-conflict: same head is not a material refresh",
+        rc.material_changed(
+            dict(refreshed_item, head_sha=old_head), card_state
+        )
+        is False,
+    )
+    # A still-blocked card (pre-fix shape) would NOT refresh even with new head:
+    # refresh_needed may still be True on material change, but reconcile/upsert
+    # only act when is_refreshable is True.
+    check(
+        "recoverable-conflict: blocked+new-head stays non-refreshable "
+        "(why the recoverable terminal is load-bearing)",
+        rc.is_refreshable(blocked_labels) is False
+        and rc.material_changed(refreshed_item, card_state) is True,
+    )
+
+    # (3) Action bound to the OLD head is rejected (stale-head recheck).
+    fake, calls = fake_gh_rest(open_pr(head_sha=new_head))
+    with patch_core(gh_rest=fake, **common):
+        stale_msg, stale_terminal = ad.do_merge(
+            "owner-login", "target-repo", 79, old_head
+        )
+    check(
+        "recoverable-conflict: action on old head is retryable, not merged",
+        stale_terminal == "retryable",
+    )
+    check(
+        "recoverable-conflict: stale-head message names the drift",
+        "moved" in stale_msg.lower() or "changed" in stale_msg.lower(),
+    )
+    check(
+        "recoverable-conflict: stale-head never reaches the merge PUT",
+        merge_puts(calls) == [],
+    )
+    fake, calls = fake_gh_rest(open_pr(head_sha=new_head))
+    with patch_core(
+        gh_rest=fake,
+        get_owner=lambda: "owner-login",
+        load_config=lambda: thank_cfg(),
+        maintainers=lambda: {"owner-login"},
+    ):
+        out = run_execute(
+            {
+                "DECISION": "merge",
+                "TARGET_REPO": "target-repo",
+                "TARGET_NUMBER": "79",
+                "HEAD_SHA": old_head,
+                "KIND": "pr-review",
+                "TARGET_REVISION": old_head,
+                "FREE_TEXT": "",
+            }
+        )
+    check(
+        "recoverable-conflict: cmd_execute rejects old-head revision as retryable",
+        out.get("terminal_state") == "retryable" and out.get("success") == "false",
+    )
+    check(
+        "recoverable-conflict: cmd_execute never reaches merge PUT on stale rev",
+        merge_puts(calls) == [],
+    )
+
+    # (4) Generic non-conflict execution error remains durable error.
+    fake, calls = fake_gh_rest(
+        open_pr(head_sha=old_head),
+        merge_error="gh: Resource not accessible by personal access token (HTTP 403)",
+    )
+    with patch_core(gh_rest=fake, **common):
+        err_msg, err_terminal = ad.do_merge(
+            "owner-login", "target-repo", 79, old_head
+        )
+    check(
+        "recoverable-conflict: generic merge API failure stays terminal error",
+        err_terminal == "error",
+    )
+    check(
+        "recoverable-conflict: generic failure is not misclassified as conflict",
+        "conflict" not in err_msg.lower(),
+    )
+
+    # (5) #447 false-close stays impossible: durable blocked without
+    # needs-decision is non-refreshable, so soft-heal cannot consume it.
+    check(
+        "recoverable-conflict: #447 blocked shape is non-refreshable",
+        rc.is_refreshable(
+            [{"name": "blocked"}, {"name": "kind:pr-review"}, {"name": "target:x-1"}]
+        )
+        is False,
+    )
+    check(
+        "recoverable-conflict: #447 blocked never soft-heal refreshable "
+        "even with needs-decision still present",
+        rc.is_refreshable(
+            [
+                {"name": "needs-decision"},
+                {"name": "blocked"},
+                {"name": "kind:pr-review"},
+            ]
+        )
+        is False,
+    )
+
+    # (6) Claim / idempotency shape: recoverable conflict does not leave the
+    # card in a non-claimable blocked state; pure pending remains claimable.
+    # (auto-merge G1 requires needs-decision + trusted identity.)
+    check(
+        "recoverable-conflict: pure pending has needs-decision for G1 claim",
+        any(lab["name"] == "needs-decision" for lab in pure_pending),
+    )
+    check(
+        "recoverable-conflict: blocked shape lacks needs-decision claim surface",
+        not any(lab["name"] == "needs-decision" for lab in blocked_labels),
+    )
+
+    # Conflict substring must not fire on unrelated 405s without "conflict".
+    fake, calls = fake_gh_rest(
+        open_pr(head_sha=old_head),
+        merge_error="gh: Pull Request is not mergeable (HTTP 405)",
+    )
+    with patch_core(gh_rest=fake, **common):
+        other_msg, other_terminal = ad.do_merge(
+            "owner-login", "target-repo", 79, old_head
+        )
+    check(
+        "recoverable-conflict: non-conflict 405 stays durable error",
+        other_terminal == "error" and "failed" in other_msg.lower(),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # request-changes execution: POST .../reviews with event=REQUEST_CHANGES,
 # a defensive self-review guard, and API-error surfacing. `fake_gh_rest`'s
 # POST branch (`comment_error`) doubles as the review-post error path here -
@@ -2083,6 +2678,53 @@ def test_do_request_changes_posts_review():
         "request-changes: adds the pending contributor label",
         label_posts
         and label_posts[0]["fields"]["labels[]"] == ad.core.PENDING_CONTRIBUTOR_LABEL,
+    )
+
+
+def test_target_action_text_neutralizes_mentions_at_write_sinks():
+    fake, calls = fake_gh_rest(open_pr())
+    with patch_core(
+        gh_rest=fake,
+        load_config=lambda: cleanup_cfg(enabled=False),
+    ):
+        ad.do_comment(
+            "owner-login",
+            "target-repo",
+            5,
+            "Please ask @contributor to verify this.",
+        )
+        ad.do_close(
+            "owner-login",
+            "target-repo",
+            5,
+            reason="Closing after @contributor confirmed.",
+        )
+        ad.do_request_changes(
+            "owner-login",
+            "target-repo",
+            5,
+            "abc123",
+            "Please have @contributor add coverage.",
+        )
+    target_bodies = [
+        call["fields"]["body"]
+        for call in posts(calls)
+        if isinstance(call.get("fields"), dict) and "body" in call["fields"]
+    ]
+    check(
+        "target text: comment, close note, and review neutralize mentions",
+        target_bodies
+        == [
+            "Please ask contributor to verify this.",
+            "Closing after contributor confirmed.",
+            "Please have contributor add coverage.",
+        ],
+    )
+    safe_once = ad._target_safe_action_text("@contributor already handled")
+    check(
+        "target text: mention neutralization is idempotent",
+        ad._target_safe_action_text(safe_once) == safe_once
+        and "@" not in safe_once,
     )
 
 
@@ -2284,28 +2926,60 @@ def test_cmd_execute_request_changes_keeps_stale_head_refreshable():
                 "TARGET_REPO": "target-repo",
                 "TARGET_NUMBER": "5",
                 "HEAD_SHA": "oldsha",
+                "KIND": "pr-review",
+                "TARGET_REVISION": "oldsha",
             }
         )
     check(
-        "request-changes: stale head stays open for refresh through cmd_execute",
-        out["terminal_state"] == "none" and out["success"] == "true",
+        "request-changes: stale head stays retryable through cmd_execute",
+        out["terminal_state"] == "retryable" and out["success"] == "false",
     )
     check(
         "request-changes: stale head message names the moved head",
-        "head moved" in out["result_message"]
+        "moved since this decision" in out["result_message"]
         and "oldsha" in out["result_message"]
         and "newsha" in out["result_message"]
-        and "will refresh" in out["result_message"]
-        and "Re-scan" not in out["result_message"],
+        and "No target action was taken" in out["result_message"],
     )
     check("request-changes: stale head does not POST a review", posts(calls) == [])
 
 
+def test_cmd_execute_revalidates_revision_before_any_target_mutation():
+    fake, calls = fake_gh_rest(open_pr(head_sha="newsha"))
+    with patch_core(gh_rest=fake, get_owner=lambda: "owner-login"):
+        out = run_execute(
+            {
+                "DECISION": "comment",
+                "FREE_TEXT": "please recheck",
+                "TARGET_REPO": "target-repo",
+                "TARGET_NUMBER": "5",
+                "KIND": "pr-review",
+                "HEAD_SHA": "oldsha",
+                "TARGET_REVISION": "oldsha",
+            }
+        )
+    check(
+        "execute revision guard: stale target is retryable",
+        out["terminal_state"] == "retryable"
+        and out["success"] == "false"
+        and "No target action was taken" in out["result_message"],
+    )
+    check(
+        "execute revision guard: stale target receives no mutation",
+        not any(call["method"] in ("POST", "PATCH", "PUT") for call in calls),
+    )
+
+
 def test_accept_decline_execute_comments_then_closes_issue():
     parsed = run_parse(
-        _tick_accept(accept_card(action="decline", reason="fixed by #9"))
+        _tick_accept(
+            accept_card(
+                action="decline",
+                reason="fixed by #9 after @contributor confirmed",
+            )
+        )
     )
-    fake, calls = fake_gh_rest(open_pr())
+    fake, calls = fake_gh_rest({"updated_at": parsed["target_revision"]})
     with patch_core(gh_rest=fake, get_owner=lambda: "acme"):
         out = run_execute(
             {
@@ -2314,23 +2988,27 @@ def test_accept_decline_execute_comments_then_closes_issue():
                 "TARGET_REPO": parsed["target_repo"],
                 "TARGET_NUMBER": parsed["target_number"],
                 "HEAD_SHA": parsed.get("head_sha", ""),
+                "KIND": parsed["kind"],
+                "TARGET_REVISION": parsed["target_revision"],
             }
         )
     check(
         "accept execute(issue decline): closes with success",
         out["terminal_state"] == "resolved" and out["success"] == "true",
     )
+    mutations = [call for call in calls if call["method"] in ("POST", "PATCH", "PUT")]
     check(
         "accept execute(issue decline): posts the recommended reason",
-        calls[0]["method"] == "POST"
-        and calls[0]["path"] == "/repos/acme/lavish-axi/issues/42/comments"
-        and calls[0]["fields"]["body"] == "fixed by acme/lavish-axi#9",
+        mutations[0]["method"] == "POST"
+        and mutations[0]["path"] == "/repos/acme/lavish-axi/issues/42/comments"
+        and mutations[0]["fields"]["body"]
+        == "fixed by acme/lavish-axi#9 after contributor confirmed",
     )
     check(
         "accept execute(issue decline): then closes the target",
-        calls[1]["method"] == "PATCH"
-        and calls[1]["path"] == "/repos/acme/lavish-axi/issues/42"
-        and calls[1]["fields"]["state"] == "closed",
+        mutations[1]["method"] == "PATCH"
+        and mutations[1]["path"] == "/repos/acme/lavish-axi/issues/42"
+        and mutations[1]["fields"]["state"] == "closed",
     )
 
 
@@ -2365,13 +3043,15 @@ def test_accept_merge_execute_keeps_stale_head_retryable():
                 "TARGET_REPO": parsed["target_repo"],
                 "TARGET_NUMBER": parsed["target_number"],
                 "HEAD_SHA": parsed["head_sha"],
+                "KIND": parsed["kind"],
+                "TARGET_REVISION": parsed["target_revision"],
             }
         )
     check(
         "accept execute(pr merge): stale head keeps the card actionable",
         out["terminal_state"] == "retryable"
         and out["success"] == "false"
-        and "head moved" in out["result_message"],
+        and "moved since this decision" in out["result_message"],
     )
     check(
         "accept execute(pr merge): no merge PUT when stale",
@@ -2385,7 +3065,7 @@ def test_accept_request_changes_execute_posts_review():
             accept_card(
                 kind="pr-review",
                 action="request-changes",
-                reason="please add coverage",
+                reason="please ask @contributor to add coverage",
                 options=[
                     "accept-recommendation",
                     "merge",
@@ -2397,7 +3077,11 @@ def test_accept_request_changes_execute_posts_review():
         )
     )
     fake, calls = fake_gh_rest(open_pr(head_sha="abc"))
-    with patch_core(gh_rest=fake, get_owner=lambda: "acme"):
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=lambda *_args: editable_source_pr("abc"),
+        get_owner=lambda: "acme",
+    ):
         out = run_execute(
             {
                 "DECISION": parsed["decision"],
@@ -2405,6 +3089,8 @@ def test_accept_request_changes_execute_posts_review():
                 "TARGET_REPO": parsed["target_repo"],
                 "TARGET_NUMBER": parsed["target_number"],
                 "HEAD_SHA": parsed["head_sha"],
+                "KIND": parsed["kind"],
+                "TARGET_REVISION": parsed["target_revision"],
             }
         )
     check(
@@ -2416,7 +3102,43 @@ def test_accept_request_changes_execute_posts_review():
         "accept execute(pr request-changes): posts a review",
         len(review_posts) == 1
         and review_posts[0]["fields"]["event"] == "REQUEST_CHANGES"
-        and review_posts[0]["fields"]["body"] == "please add coverage",
+        and review_posts[0]["fields"]["body"]
+        == "please ask contributor to add coverage",
+    )
+
+
+def test_accept_comment_execute_neutralizes_recommendation_mentions():
+    parsed = run_parse(
+        _tick_accept(
+            accept_card(
+                action="comment",
+                reason="Please ask @contributor to verify the fix.",
+            )
+        )
+    )
+    fake, calls = fake_gh_rest({"updated_at": parsed["target_revision"]})
+    with patch_core(gh_rest=fake, get_owner=lambda: "acme"):
+        out = run_execute(
+            {
+                "DECISION": parsed["decision"],
+                "FREE_TEXT": parsed["free_text"],
+                "TARGET_REPO": parsed["target_repo"],
+                "TARGET_NUMBER": parsed["target_number"],
+                "KIND": parsed["kind"],
+                "TARGET_REVISION": parsed["target_revision"],
+            }
+        )
+    comment_posts = [
+        call
+        for call in posts(calls)
+        if call["path"].endswith("/issues/42/comments")
+    ]
+    check(
+        "accept execute(issue comment): recommendation cannot notify",
+        out["terminal_state"] == "none"
+        and len(comment_posts) == 1
+        and comment_posts[0]["fields"]["body"]
+        == "Please ask contributor to verify the fix.",
     )
 
 
@@ -2680,12 +3402,217 @@ def test_prompt_offers_request_changes_guidance_for_pr_review_only():
     )
 
 
+def test_decline_prose_contract_and_real_action_path():
+    instruction = (
+        "decline - tasks-axi is owned by me, and i will be adding it when i see fit"
+    )
+    body = (
+        "## Decision needed - axi#103\n\n"
+        "**PR review** by RooseveltAdvisors\n\n"
+        "> docs: add tasks-axi to community catalog\n\n"
+        '<!-- wheelhouse-state: {"repo":"axi","number":103,'
+        '"kind":"pr-review","head_sha":"deadbeefcafe"} -->'
+    )
+    prompt = ad.build_nl_prompt(
+        body,
+        instruction,
+        "pr-review",
+        target_slug="kunchenguid/axi",
+    )
+    check(
+        "decline contract: exact production instruction reaches trusted prompt",
+        "=== The maintainer's new comment (trusted instruction) ===\n" + instruction
+        in prompt,
+    )
+    check(
+        "decline contract: card and target context are available for interpretation",
+        "RooseveltAdvisors" in prompt
+        and "tasks-axi to community catalog" in prompt
+        and "target.txt" in prompt,
+    )
+    check(
+        "decline contract: respectful tone cannot weaken the decision",
+        "Respect changes the tone, not the decision" in prompt
+        and "contribution is declined" in prompt
+        and "target is being closed" in prompt,
+    )
+    check(
+        "decline contract: factual rationale is preserved without invention",
+        "every factual rationale" in prompt
+        and "Do not omit, contradict, or replace that rationale" in prompt
+        and "must not supply a new rationale" in prompt,
+    )
+    check(
+        "decline contract: ambiguity and reason-free declines are explicit",
+        "Never soften it into maybe, might, perhaps" in prompt
+        and "If no rationale was given" in prompt,
+    )
+    check(
+        "decline contract: reason-bearing close selects decline instead of silent close",
+        "reason-bearing close/reject instruction maps to `decline`" in prompt
+        and "`close` only when the maintainer wants no target note" in prompt,
+    )
+    check(
+        "decline contract: prompt's schema-shaped guidance binds free_text to the rules",
+        '"free_text":"<required and non-empty for decline; optional final target-facing prose otherwise>"'
+        in prompt
+        and "Never return a `decline` action" in prompt,
+    )
+
+    with open(ad.NL_SCHEMA_PATH, encoding="utf-8") as schema_file:
+        schema = json.load(schema_file)
+    check(
+        "decline contract: native schema keeps the strict bounded prose carrier",
+        schema["additionalProperties"] is False
+        and schema["properties"]["free_text"]
+        == {"type": "string", "maxLength": size_budget.NL_FREE_TEXT_MAX_CHARS},
+    )
+
+    omission_cases = (
+        ("omitted prose", {"mode": "action", "action": "decline"}),
+        (
+            "normalized action",
+            {"mode": "action", "action": " Decline ", "free_text": " \t"},
+        ),
+    )
+    for label, candidate in omission_cases:
+        omitted_note = json.dumps(candidate)
+        omission_reason = ad.nl_schema_reason(omitted_note)
+        omission_plan = ad.plan_nl_repair(omitted_note)
+        omission_result = ad.decide_nl_apply(
+            omitted_note,
+            "",
+            repair_needed=omission_plan["repair_needed"],
+        )
+        check(
+            "decline regression: %s is rejected before deterministic routing" % label,
+            omission_reason == "decline action requires non-empty field 'free_text'"
+            and omission_plan["repair_needed"] is True
+            and omission_result["outcome"] == "repair-failed"
+            and omission_result["result"] is None,
+        )
+
+    # Faithful no-spend replay of the observed model payload through the same
+    # deterministic route + executor used by production run 29722388363.
+    contributor_note = (
+        "Thanks for the contribution, but tasks-axi is maintained by the repo "
+        "owner, who will add it to the community catalog when the time is right. "
+        "Closing this PR."
+    )
+    routed = ad.route_decision(
+        {"mode": "action", "action": "decline", "free_text": contributor_note},
+        "pr-review",
+        {
+            "repo": "axi",
+            "number": 103,
+            "kind": "pr-review",
+            "head_sha": "deadbeefcafe",
+        },
+    )
+    check(
+        "decline regression: structured result preserves decline plus rewritten note",
+        routed["decision"] == "decline"
+        and routed["free_text"] == contributor_note
+        and routed["target_repo"] == "axi"
+        and routed["target_number"] == 103,
+    )
+    check(
+        "decline regression: decision and real factual rationale survive the rewrite",
+        all(
+            phrase in routed["free_text"]
+            for phrase in (
+                "tasks-axi",
+                "maintained by the repo owner",
+                "add it to the community catalog",
+                "Closing this PR",
+            )
+        ),
+    )
+    check(
+        "decline regression: rewrite has no invented technical rationale or ambiguity",
+        not any(
+            phrase in routed["free_text"].lower()
+            for phrase in (
+                "maybe",
+                "might",
+                "perhaps",
+                "security",
+                "performance",
+                "test failure",
+            )
+        ),
+    )
+
+    fake, calls = fake_gh_rest(open_pr(head_sha="deadbeefcafe"))
+    with patch_core(
+        gh_rest=fake,
+        gh_graphql_pr=lambda *_args: editable_source_pr("deadbeefcafe"),
+        get_owner=lambda: "kunchenguid",
+    ):
+        outcome = run_execute(
+            {
+                "DECISION": routed["decision"],
+                "FREE_TEXT": routed["free_text"],
+                "TARGET_REPO": routed["target_repo"],
+                "TARGET_NUMBER": str(routed["target_number"]),
+                "KIND": routed["kind"],
+                "HEAD_SHA": routed["head_sha"],
+                "TARGET_REVISION": routed["target_revision"],
+            }
+        )
+    mutations = [call for call in calls if call["method"] in ("POST", "PATCH")]
+    check(
+        "decline regression: executor resolves the card action",
+        outcome["terminal_state"] == "resolved" and outcome["success"] == "true",
+    )
+    check(
+        "decline regression: executor posts contributor prose verbatim before close",
+        len(mutations) == 2
+        and mutations[0]["method"] == "POST"
+        and mutations[0]["path"] == "/repos/kunchenguid/axi/issues/103/comments"
+        and mutations[0]["fields"]["body"] == contributor_note
+        and mutations[1]["method"] == "PATCH"
+        and mutations[1]["path"] == "/repos/kunchenguid/axi/issues/103"
+        and mutations[1]["fields"]["state"] == "closed",
+    )
+
+
+def test_decline_prompt_semantic_and_adversarial_cases():
+    body = '<!-- wheelhouse-state: {"repo":"target","number":7,"kind":"pr-review"} -->'
+    cases = (
+        (
+            "semantic preservation",
+            "decline and close this - it duplicates the built-in exporter",
+        ),
+        (
+            "no softening",
+            "definitely reject and close this; do not leave it open",
+        ),
+        ("no invented reason", "decline and close this PR"),
+    )
+    for label, instruction in cases:
+        prompt = ad.build_nl_prompt(body, instruction, "pr-review")
+        check(
+            "decline adversarial (%s): instruction remains the sole decision source"
+            % label,
+            "NEW comment" in prompt
+            and "instruction to classify is always the new comment" in prompt
+            and instruction in prompt,
+        )
+        check(
+            "decline adversarial (%s): semantic guardrails remain attached" % label,
+            "Preserve the meaning and every factual rationale" in prompt
+            and "Never soften it into maybe, might, perhaps" in prompt
+            and "Do not invent" in prompt,
+        )
+
+
 def main():
     test_state_marker_back_compat()
     test_checkbox_diff()
     test_investigate_is_non_consuming()
     test_consuming_actions_unchanged_by_investigate_routing()
-    test_reconcile_absence_state_does_not_affect_decision_parse()
+    test_reconcile_absence_state_makes_decision_inert()
     test_investigate_allow_set_and_nl_exclusion()
     test_request_changes_allow_set_and_nl_selectable()
     test_slash_only_actions_are_not_checkbox_decisions()
@@ -2720,6 +3647,11 @@ def main():
     test_workflow_merge_gate_retry_after_rebase_merges()
     test_workflow_merge_gate_logs_blocked_result()
     test_workflow_merge_gated_files_helper_is_workflows_only()
+    test_manual_merge_does_not_bypass_rejected_source_policy()
+    test_manual_merge_rechecks_source_policy_after_workflow_inspection()
+    test_decline_rechecks_source_policy_immediately_before_close()
+    test_comment_and_review_recheck_source_policy_at_mutation_boundary()
+    test_request_changes_rechecks_source_policy_before_cleanup_arming()
     test_auto_merge_receives_sha_from_successful_merge_response()
     test_auto_merge_rejects_a_changed_expected_base()
     test_auto_merge_rechecks_final_mergeability_without_changing_manual_merge()
@@ -2730,7 +3662,9 @@ def main():
     test_thank_on_merge_best_effort_survives_comment_failure()
     test_thank_on_merge_skips_owner_maintainer_bot_and_blank_author()
     test_thank_on_merge_custom_message_and_per_repo_precedence()
+    test_merge_conflict_is_recoverable_not_durable_blocked()
     test_do_request_changes_posts_review()
+    test_target_action_text_neutralizes_mentions_at_write_sinks()
     test_do_request_changes_respects_cleanup_config()
     test_do_request_changes_refuses_self_review()
     test_do_request_changes_does_not_arm_cleanup_for_excluded_authors()
@@ -2740,9 +3674,11 @@ def main():
     test_do_request_changes_requires_text()
     test_cmd_execute_request_changes_requires_text()
     test_cmd_execute_request_changes_keeps_stale_head_refreshable()
+    test_cmd_execute_revalidates_revision_before_any_target_mutation()
     test_accept_decline_execute_comments_then_closes_issue()
     test_accept_merge_execute_keeps_stale_head_retryable()
     test_accept_request_changes_execute_posts_review()
+    test_accept_comment_execute_neutralizes_recommendation_mentions()
     test_history_owner_scoped_and_ordered()
     test_history_excludes_trigger_even_if_owner_authored()
     test_history_empty_and_blank_cases()
@@ -2751,6 +3687,8 @@ def main():
     test_prompt_omits_advisory_auto_triage_from_trusted_card()
     test_prompt_search_capability_is_gated()
     test_prompt_offers_request_changes_guidance_for_pr_review_only()
+    test_decline_prose_contract_and_real_action_path()
+    test_decline_prompt_semantic_and_adversarial_cases()
     print()
     if _failures:
         print("%d FAILED: %s" % (len(_failures), ", ".join(_failures)))

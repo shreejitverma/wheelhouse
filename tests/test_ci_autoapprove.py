@@ -29,9 +29,8 @@ These tests cover:
   * run-to-PR verification: same-repo runs use GitHub's populated
     `pull_requests` association, while fork runs with an empty association are
     bound by matching `head_sha` plus `head_branch`;
-  * duplicate pending-run hygiene: verified runs sharing a stable
-    workflowDatabaseId approve only the newest run, without collapsing same-named
-    distinct workflows or runs that lack a workflow identity;
+  * duplicate pending-run coverage: every independently actionable verified run
+    is approved, including same-workflow duplicates on the same head;
   * idempotency by construction (a PR no longer `needs-ci-approval` is never
     re-approved), default-on, explicit opt-out, and the per-repo override.
 """
@@ -386,7 +385,8 @@ def pr_node(number, status_rollup, draft=False, base_ref="main", cross_repo=True
         "headRefOid": "sha%d" % number,
         "baseRefName": base_ref,
         "baseRefOid": "base-%s" % base_ref,
-        "headRepository": {"name": "demo-fork", "owner": {"login": "forker"}},
+        "maintainerCanModify": True,
+        "headRepository": {"name": "demo-fork", "nameWithOwner": "forker/demo-fork", "isFork": True, "owner": {"login": "forker", "__typename": "User"}},
         "baseRepository": {"name": "demo", "owner": {"login": "owner"}},
         "labels": {"nodes": []},
         "closingIssuesReferences": {"nodes": []},
@@ -429,9 +429,18 @@ def run_build_repo(
     graphql_raises=False,
     default_branch="main",
     summary_cache=None,
+    pending_heads=(),
+    pending_error_heads=(),
+    observation_compare=None,
 ):
     """Drive build_repo with the network-touching dependencies stubbed."""
-    calls = {"approve": [], "posture": 0, "safety": [], "summary": []}
+    calls = {
+        "approve": [],
+        "pending": [],
+        "posture": 0,
+        "safety": [],
+        "summary": [],
+    }
     repo_cfg = {
         "name": "demo",
         "compliance_check": "Gate",
@@ -455,11 +464,32 @@ def run_build_repo(
             return verdict(slug, pr, repo_posture, changed_files)
         return SAFE_VERDICT if verdict is None else verdict
 
-    def fake_approve(owner, name, pr, posture=None, strict=False):
+    def fake_approve(
+        owner, name, pr, posture=None, strict=False, expected_head_sha=None
+    ):
         calls["approve"].append((owner, name, pr, posture, strict))
         if approve_raises:
             raise RuntimeError("approve boom")
         return approve_result
+
+    def fake_pending_runs(slug, head_ref, head_sha):
+        calls["pending"].append((slug, head_ref, head_sha))
+        if head_sha in set(pending_error_heads):
+            return (None, "pending-run probe failed")
+        if head_sha in set(pending_heads):
+            return (
+                [
+                    {
+                        "databaseId": 9000,
+                        "workflowDatabaseId": 90,
+                        "workflowName": "Replay",
+                        "headSha": head_sha,
+                        "headBranch": head_ref,
+                    }
+                ],
+                "",
+            )
+        return ([], "")
 
     def fake_summary(slug, pr, head_sha, changed_files=None):
         # Stub the read-only advisory summarizer so build_repo routing tests stay
@@ -473,10 +503,20 @@ def run_build_repo(
         core.ci_safety,
         core.approve_ci,
         core.ci_security_summary,
+        core._list_action_required_runs,
+        core.immutable_compare_files,
     )
     core.gh_graphql, core.repo_pr_target_posture = fake_graphql, fake_posture
     core.ci_safety, core.approve_ci = fake_ci_safety, fake_approve
     core.ci_security_summary = fake_summary
+    core._list_action_required_runs = fake_pending_runs
+    core.immutable_compare_files = observation_compare or (
+        lambda _slug, _base, _head, expected: (
+            ["src/file-%d.py" % index for index in range(int(expected or 0))],
+            True,
+            True,
+        )
+    )
     err = io.StringIO()
     try:
         with redirect_stderr(err):
@@ -494,6 +534,8 @@ def run_build_repo(
             core.ci_safety,
             core.approve_ci,
             core.ci_security_summary,
+            core._list_action_required_runs,
+            core.immutable_compare_files,
         ) = save
     calls["stderr"] = err.getvalue()  # so logging-path tests can assert the per-PR line
     return result, items, calls
@@ -520,6 +562,77 @@ def test_safe_pr_is_auto_approved_no_card():
     check("route: repo result still ok", result["ok"] is True)
 
 
+def test_completed_contexts_do_not_mask_separate_pending_fork_run():
+    masked = pr_node(
+        4,
+        rollup([check_run("Gate", "SUCCESS"), check_run("build-test", "SUCCESS")]),
+    )
+    result, items, calls = run_build_repo([masked], pending_heads={"sha4"})
+    check("masked pending: complete scan remains healthy", result["ok"] is True)
+    check(
+        "masked pending: exact current fork head is enumerated",
+        calls["pending"] == [("owner/demo", "feature-4", "sha4")],
+    )
+    check(
+        "masked pending: completed contexts do not hide approval",
+        len(calls["approve"]) == 1,
+    )
+    check("masked pending: safe approval emits no card", items == [])
+    check(
+        "masked pending: freshly approved PR enters CI wait",
+        result["ci_wait_pr_numbers"] == [4],
+    )
+
+
+def test_completed_contexts_pending_unsafe_fork_is_carded():
+    masked = pr_node(
+        5,
+        rollup([check_run("Gate", "SUCCESS"), check_run("build-test", "SUCCESS")]),
+    )
+    verdict = {
+        "safe": False,
+        "error": False,
+        "risky_files": [".github/workflows/ci.yml"],
+        "pr_target": False,
+        "exploit": False,
+        "reason": "risky",
+    }
+    result, items, calls = run_build_repo(
+        [masked], pending_heads={"sha5"}, verdict=verdict
+    )
+    check("masked unsafe: complete scan remains healthy", result["ok"] is True)
+    check("masked unsafe: pending run is never approved", calls["approve"] == [])
+    check(
+        "masked unsafe: pending run emits the existing CI-approval card",
+        len(items) == 1 and items[0]["kind"] == "ci-approval",
+    )
+    check(
+        "masked unsafe: existing pwn-request warning is preserved",
+        ".github/workflows/ci.yml" in (items[0].get("warning") or ""),
+    )
+
+
+def test_pending_run_probe_error_fails_repo_scan_closed():
+    masked = pr_node(
+        6,
+        rollup([check_run("Gate", "SUCCESS"), check_run("build-test", "SUCCESS")]),
+    )
+    result, items, calls = run_build_repo([masked], pending_error_heads={"sha6"})
+    check("pending probe error: repo scan fails closed", result["ok"] is False)
+    check("pending probe error: no worklist mutation is emitted", items == [])
+    check("pending probe error: no approval is attempted", calls["approve"] == [])
+    check("pending probe error: safety path is not guessed", calls["safety"] == [])
+
+
+def test_draft_fork_pending_run_exclusion_is_unchanged():
+    draft = pr_node(7, None, draft=True)
+    result, items, calls = run_build_repo([draft], pending_heads={"sha7"})
+    check("draft exclusion: scan remains healthy", result["ok"] is True)
+    check("draft exclusion: pending-run probe is skipped", calls["pending"] == [])
+    check("draft exclusion: no approval is attempted", calls["approve"] == [])
+    check("draft exclusion: no CI-approval card is emitted", items == [])
+
+
 def test_same_repo_no_ci_routes_to_review_needed_not_ci_approval():
     pr = needs_ci_pr(cross_repo=False)
     pr["headRepository"] = {"name": "demo", "owner": {"login": "owner"}}
@@ -540,14 +653,16 @@ def test_same_repo_no_ci_routes_to_review_needed_not_ci_approval():
 
 def test_unknown_fork_status_keeps_ci_card_without_auto_approval():
     result, items, calls = run_build_repo([needs_ci_pr(cross_repo="missing")])
-    warning = items[0].get("warning") if items else ""
+    policy = items[0].get("maintainer_edits_policy") if items else {}
     check(
-        "route: unknown fork status keeps a ci-approval card",
-        len(items) == 1 and items[0]["kind"] == "ci-approval",
+        "route: unknown fork status keeps an inert source-permission card",
+        len(items) == 1
+        and items[0]["kind"] == "pr-review"
+        and policy.get("mode") == core.PUSHABILITY_UNVERIFIED,
     )
     check(
-        "route: unknown fork status warns instead of guessing",
-        "could not determine" in (warning or ""),
+        "route: unknown fork status is explicitly retryable instead of guessed",
+        items and items[0]["bucket"] == "source-permission-unverified",
     )
     check("route: unknown fork status is NOT auto-approved", calls["approve"] == [])
     check("route: unknown fork status skips posture", calls["posture"] == 0)
@@ -707,12 +822,21 @@ def test_truncated_pr_file_list_routes_to_card():
         return graphql_data([pr])
 
     def fake_run(cmd, capture_output=True, text=True):
+        if cmd[:3] == ["gh", "run", "list"]:
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
         if cmd[:3] == ["gh", "api", "--paginate"]:
             files = ["src/file%d.py" % i for i in range(3000)]
             return SimpleNamespace(returncode=0, stdout="\n".join(files), stderr="")
         raise AssertionError(cmd)
 
-    def fake_approve(owner, name, pr_number, posture=None):
+    def fake_approve(
+        owner,
+        name,
+        pr_number,
+        posture=None,
+        strict=False,
+        expected_head_sha=None,
+    ):
         calls["approve"].append((owner, name, pr_number))
         return ("approved", "approved 1 run")
 
@@ -721,11 +845,15 @@ def test_truncated_pr_file_list_routes_to_card():
         core.repo_pr_target_posture,
         core.approve_ci,
         core.subprocess.run,
+        core.immutable_compare_files,
     )
     core.gh_graphql = fake_graphql
     core.repo_pr_target_posture = lambda slug: CLEAN_POSTURE
     core.approve_ci = fake_approve
     core.subprocess.run = fake_run
+    core.immutable_compare_files = lambda _slug, _base, _head, _count: (
+        [], False, False
+    )
     try:
         with redirect_stderr(io.StringIO()):
             result, items = core.build_repo(
@@ -744,6 +872,7 @@ def test_truncated_pr_file_list_routes_to_card():
             core.repo_pr_target_posture,
             core.approve_ci,
             core.subprocess.run,
+            core.immutable_compare_files,
         ) = save
 
     check("route: truncated PR file list raises a card", len(items) == 1)
@@ -976,6 +1105,8 @@ def run_approve_ci(
     posture=CLEAN_POSTURE,
     strict=False,
     repo_posture=None,
+    expected_head_sha=None,
+    source_pr=None,
 ):
     approval_results = list(approval_results or [])
     run_details = run_details or {}
@@ -986,6 +1117,19 @@ def run_approve_ci(
         "changed_files": 0,
     }
     safety_verdict = safety_verdict or SAFE_VERDICT
+    source_pr = source_pr or {
+        "number": 1,
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": str((pr_payload.get("head") or {}).get("sha") or ""),
+        "maintainerCanModify": True,
+        "headRepository": {
+            "nameWithOwner": "contributor/r",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
 
     def fake_run(cmd, capture_output=True, text=True):
         calls.setdefault("commands", []).append(cmd)
@@ -1021,16 +1165,87 @@ def run_approve_ci(
     def fake_posture(slug):
         return CLEAN_POSTURE if repo_posture is None else repo_posture
 
-    save = (core.subprocess.run, core.ci_safety, core.repo_pr_target_posture)
+    save = (
+        core.subprocess.run,
+        core.ci_safety,
+        core.repo_pr_target_posture,
+        core.gh_graphql_pr,
+    )
     core.subprocess.run = fake_run
     core.repo_pr_target_posture = fake_posture
+    core.gh_graphql_pr = lambda *_args: source_pr
     if stub_safety:
         core.ci_safety = lambda slug, pr, posture, changed_files=None: safety_verdict
     try:
-        status, message = core.approve_ci("o", "r", "1", posture=posture, strict=strict)
+        status, message = core.approve_ci(
+            "o",
+            "r",
+            "1",
+            posture=posture,
+            strict=strict,
+            expected_head_sha=expected_head_sha,
+        )
         return status, message, calls
     finally:
-        core.subprocess.run, core.ci_safety, core.repo_pr_target_posture = save
+        (
+            core.subprocess.run,
+            core.ci_safety,
+            core.repo_pr_target_posture,
+            core.gh_graphql_pr,
+        ) = save
+
+
+def test_approve_ci_rechecks_source_permission_before_write():
+    rejected = {
+        "number": 1,
+        "state": "OPEN",
+        "isCrossRepository": True,
+        "headRefName": "feature",
+        "headRefOid": "sha1",
+        "maintainerCanModify": False,
+        "headRepository": {
+            "nameWithOwner": "contributor/r",
+            "isFork": True,
+            "owner": {"login": "contributor", "__typename": "User"},
+        },
+    }
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {
+                        "databaseId": 11,
+                        "workflowDatabaseId": 22,
+                        "workflowName": "CI",
+                        "headSha": "sha1",
+                        "headBranch": "feature",
+                    }
+                ]
+            ),
+            stderr="",
+        ),
+        source_pr=rejected,
+    )
+    check("approve_ci: revoked source permission blocks approval", status == "error")
+    check("approve_ci: source-policy denial is observable", "source permission policy blocked" in message)
+    check("approve_ci: revoked source permission performs no write", calls["approved"] == [])
+
+
+def test_approve_ci_expected_head_mismatch_stops_before_run_discovery():
+    status, message, calls = run_approve_ci(
+        SimpleNamespace(returncode=0, stdout="[]", stderr=""),
+        expected_head_sha="different-head",
+    )
+    check("approve_ci: expected-head mismatch -> error", status == "error")
+    check(
+        "approve_ci: expected-head mismatch is explicit",
+        "head changed before approval" in message,
+    )
+    check(
+        "approve_ci: expected-head mismatch performs no run read or write",
+        calls["run_list"] == [] and calls["approved"] == [],
+    )
 
 
 def test_approve_ci_run_list_failure_returns_error():
@@ -1065,26 +1280,29 @@ def test_approve_ci_any_failed_post_returns_error():
     check("approve_ci: failed approval POST is named", "Lint:forbidden" in message)
 
 
-def test_approve_ci_dedups_duplicate_pending_runs_of_same_workflow():
-    # The card #392 incident: two action_required runs of the SAME workflow
-    # for one head_sha. Approving both is what manufactures the
-    # cancel-in-progress race; approve_ci must approve only one.
+def test_approve_ci_approves_every_duplicate_pending_run_of_same_workflow():
+    # GitHub exposes both same-workflow runs as independently actionable.
+    # Leaving the lower ID pending strands it once the higher run creates a
+    # completed rollup context, so each verified current-head run must be acted on.
     runs = [
         {"databaseId": 123, "workflowDatabaseId": 7, "workflowName": "CI"},
         {"databaseId": 200, "workflowDatabaseId": 7, "workflowName": "CI"},
     ]
     status, message, calls = run_approve_ci(
         SimpleNamespace(returncode=0, stdout=json.dumps(runs), stderr=""),
-        [SimpleNamespace(returncode=0, stdout="", stderr="")],
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ],
     )
-    check("approve_ci: dedup still approves", status == "approved")
+    check("approve_ci: duplicate runs are approved", status == "approved")
     check(
-        "approve_ci: dedup approves exactly one of the duplicate runs",
-        calls["approved"] == ["200"],
+        "approve_ci: both independently actionable duplicate runs are approved",
+        calls["approved"] == ["123", "200"],
     )
     check(
-        "approve_ci: dedup message reports a single matching run",
-        "approved 1 matching run" in message,
+        "approve_ci: duplicate-run result remains observable",
+        "approved 2 matching run" in message,
     )
     check(
         "approve_ci: run-list asks for workflow IDs",
@@ -1136,7 +1354,7 @@ def test_approve_ci_does_not_dedup_runs_without_workflow_identity():
     )
 
 
-def test_approve_ci_dedup_does_not_bypass_risky_file_hold():
+def test_approve_ci_multiple_runs_do_not_bypass_risky_file_hold():
     risky = [".github/workflows/ci.yml"]
     verdict = {
         "safe": False,
@@ -1461,7 +1679,9 @@ def test_idempotent_non_ci_approval_pr_never_reapproved():
 def test_auto_approved_pr_is_frozen_with_antimasquerade_item():
     result, items, calls = run_build_repo([needs_ci_pr(7)])
     check("ci-wait: safe approved PR raises NO card", items == [])
-    check("ci-wait: approved PR is in the freeze set", result["ci_wait_pr_numbers"] == [7])
+    check(
+        "ci-wait: approved PR is in the freeze set", result["ci_wait_pr_numbers"] == [7]
+    )
     refresh = result["ci_wait_refresh_items"]
     check("ci-wait: approved PR gets exactly one refresh item", len(refresh) == 1)
     check(
@@ -1471,11 +1691,43 @@ def test_auto_approved_pr_is_frozen_with_antimasquerade_item():
         and refresh[0]["number"] == 7
         and refresh[0]["head_sha"] == "sha7",
     )
+    receipt = (result.get("target_action_receipts") or [{}])[0]
+    check(
+        "ci-wait: successful approval has a head-bound invalidating receipt",
+        receipt.get("schema") == "wheelhouse.target-action-receipt/v1"
+        and receipt.get("expected_head_sha") == "sha7"
+        and receipt.get("effect") == "changed"
+        and receipt.get("requires_reobservation") is True
+        and refresh[0].get("action_receipt", {}).get("receipt_id")
+        == receipt.get("receipt_id"),
+    )
+    check(
+        "ci-wait: successful approval provisional payload never repeats approval-needed",
+        refresh[0].get("bucket") != "needs-ci-approval",
+    )
     check(
         "ci-wait: refresh item renders a NON-green pending state (no false green)",
-        refresh
-        and refresh[0]["comp"] != "pass"
-        and refresh[0]["tests"] != "green",
+        refresh and refresh[0]["comp"] != "pass" and refresh[0]["tests"] != "green",
+    )
+    text = " ".join(
+        [
+            str(refresh[0].get("summary") or ""),
+            str(refresh[0].get("recommendation") or ""),
+        ]
+    ).lower()
+    check(
+        "ci-wait: refresh copy says automatic triage is deferred until checks finish",
+        "automatic triage" in text
+        and ("deferred" in text or "resume" in text)
+        and ("terminal" in text or "finish" in text or "checks" in text),
+    )
+    check(
+        "ci-wait: refresh copy distinguishes prior-head triage from current head",
+        "prior-head" in text or "prior head" in text or "does not apply" in text,
+    )
+    check(
+        "ci-wait: refresh item does not claim current-head triage is already present",
+        "triage complete" not in text and "already triaged" not in text,
     )
 
 
@@ -1511,6 +1763,27 @@ def test_unsafe_carded_pr_is_not_frozen():
     check(
         "ci-wait: unsafe carded PR gets no refresh item",
         result["ci_wait_refresh_items"] == [],
+    )
+
+
+def test_uncertain_approval_receipt_invalidates_fallback_projection():
+    result, items, calls = run_build_repo(
+        [needs_ci_pr(8)], approve_result=("error", "approved 1/2; second failed")
+    )
+    receipt = (result.get("target_action_receipts") or [{}])[0]
+    check(
+        "ci-wait: uncertain approval has an unknown-effect receipt",
+        receipt.get("expected_head_sha") == "sha8"
+        and receipt.get("effect") == "unknown"
+        and receipt.get("requires_reobservation") is True,
+    )
+    check(
+        "ci-wait: uncertain approval fallback is explicit unknown, not current approval",
+        len(items) == 1
+        and items[0].get("bucket") == "ci-state-unknown"
+        and items[0].get("comp") == "unknown"
+        and items[0].get("tests") == "unknown"
+        and (items[0].get("projection_ref") or {}).get("freshness") == "unknown",
     )
 
 
@@ -1646,6 +1919,10 @@ def main():
     test_posture_contents_listing_limit_fails_closed()
     test_posture_non_base64_workflow_file_fails_closed()
     test_safe_pr_is_auto_approved_no_card()
+    test_completed_contexts_do_not_mask_separate_pending_fork_run()
+    test_completed_contexts_pending_unsafe_fork_is_carded()
+    test_pending_run_probe_error_fails_repo_scan_closed()
+    test_draft_fork_pending_run_exclusion_is_unchanged()
     test_same_repo_no_ci_routes_to_review_needed_not_ci_approval()
     test_unknown_fork_status_keeps_ci_card_without_auto_approval()
     test_risky_pr_raises_card_not_approved()
@@ -1669,13 +1946,15 @@ def main():
     test_carded_approve_exception_is_logged()
     test_carded_unsafe_verdict_is_logged_without_approve_status()
     test_carded_disabled_auto_approve_is_logged()
+    test_approve_ci_rechecks_source_permission_before_write()
+    test_approve_ci_expected_head_mismatch_stops_before_run_discovery()
     test_approve_ci_run_list_failure_returns_error()
     test_approve_ci_invalid_run_list_returns_error()
     test_approve_ci_any_failed_post_returns_error()
-    test_approve_ci_dedups_duplicate_pending_runs_of_same_workflow()
+    test_approve_ci_approves_every_duplicate_pending_run_of_same_workflow()
     test_approve_ci_does_not_dedup_same_named_distinct_workflows()
     test_approve_ci_does_not_dedup_runs_without_workflow_identity()
-    test_approve_ci_dedup_does_not_bypass_risky_file_hold()
+    test_approve_ci_multiple_runs_do_not_bypass_risky_file_hold()
     test_approve_ci_hold_message_caps_risky_file_list()
     test_approve_ci_filters_to_current_pr_head_and_number()
     test_approve_ci_fork_run_with_empty_pr_association_is_approved()
@@ -1694,6 +1973,7 @@ def main():
     test_auto_approved_pr_is_frozen_with_antimasquerade_item()
     test_ci_running_pr_is_frozen()
     test_unsafe_carded_pr_is_not_frozen()
+    test_uncertain_approval_receipt_invalidates_fallback_projection()
     test_noop_ci_approval_is_not_frozen()
     test_author_excluded_approved_pr_is_not_frozen()
     test_merge_ready_pr_is_not_frozen()

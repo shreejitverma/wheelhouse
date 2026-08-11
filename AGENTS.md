@@ -33,18 +33,25 @@ still appears where it's plain English, e.g. "triage the queue".)
 
 - **State lives in GitHub, not on disk.** Open issue = pending decision; closed =
   consumed. Labels are state (`needs-decision`, `pending-triage`, `processing`,
-  `resolved`, `blocked`, `wheelhouse:manual-merge-required`, `repo:*`, `kind:*`,
-  `priority:*`). A hidden
+  `resolved`, `blocked`, `wheelhouse:manual-merge-required`,
+  `wheelhouse:confirming-target-state`, `repo:*`, `kind:*`, `priority:*`). A hidden
   `<!-- wheelhouse-state: {...} -->` block in each card body carries
   `{repo, number, kind, head_sha, options}` plus the material fields
-  `{comp, tests, priority}` (the latter three added so a refresh can cheaply and
-  deterministically decide "did this target materially change?" - see "Card
-  refresh" in Sharp edges). `options` is also material for refresh comparison,
+  `{comp, tests, priority, bucket, projection_freshness, projection_head_sha,
+  projection_complete, pushability}` so a refresh can cheaply and deterministically
+  decide
+  "did this target or its current-tense projection contract materially change?"
+  - see "Card refresh" in Sharp edges. `options` is also material for refresh comparison,
   but is normalized as a sorted set so checkbox reordering alone does not
   refresh the card. The state block also carries `updated_at` unconditionally
   (populated for issue-triage items, empty for pr-review) - it is NON-material,
-  existing purely as the issue-triage auto-triage cache key, mirroring how
-  `head_sha` doubles as the pr-review cache key. The state block also carries
+  existing as the issue-triage auto-triage cache key and strict newer-only
+  deterministic refresh stamp, mirroring how `head_sha` doubles as the
+  pr-review cache key. PR cards may also carry a versioned, non-churn-triggering
+  `projection_ref` with observation ID/time/source, target/head identity,
+  completeness, freshness, and bucket. Its semantic head/completeness/freshness/
+  bucket dimensions are the material fields above; a newer observation ID/time
+  alone does not rewrite an otherwise unchanged card. The state block also carries
   `activity_reflected_at`, a NON-material target-activity sort stamp. When a
   target's GitHub `updatedAt` advances past that stamp, Wheelhouse may make one
   hidden state-only card body edit so GitHub's `sort:updated-desc` issue view
@@ -56,7 +63,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   AND issue-triage) adds non-material cache fields such as
   `triaged_sha`, `triage_status`, `triage_recommendation`, and the bounded
   schema-repair telemetry `triage_repair_status`/`triage_repair_reason` (see
-  "Bounded schema repair" in Sharp edges); those are
+  "Context-equivalent single correction turn" in Sharp edges); those are
   deliberately outside `MATERIAL_FIELDS` so a triage result never changes
   classification or forces a card refresh. The auto-inserted
   `accept-recommendation` option is stripped from material option comparisons
@@ -78,17 +85,23 @@ still appears where it's plain English, e.g. "triage the queue".)
   status labeling) propagates to already-open cards; it is never a
   `MATERIAL_FIELDS` member and never
   influences classification. `render_card.py` writes that marker.
-  Reconcile may also add one bounded, versioned, NON-material `reconcile_absence` record to a pure pending card after a conclusive scheduled run finds its still-open target outside the worklist.
-  The fixed threshold is two adjacent scheduled workflow run numbers.
-  The threshold record includes exact trusted machine soft-close provenance before close; malformed, duplicate, wrong-version, boolean, negative, oversized, or otherwise untrusted state reads as count zero and can never accelerate close or qualify future reuse.
-  When no open card exists, `render_card.lookup_card_lifecycle` completely lists the exact target label and may reuse exactly one closed card only when its strict state identity, managed target/repo labels, issue author, latest close actor, close timing, terminal labels, and current-schema soft-close provenance are independently trustworthy.
+  Reconcile may also add one bounded, versioned, NON-material `reconcile_absence` record to a pure pending card after a complete scheduled observation finds its still-open target outside the worklist.
+  The fixed threshold is two adjacent trusted scheduled-observation epochs from `scripts/scheduled_epoch.py`; manual runs never advance or reset it, and unavailable bookkeeping delays closure.
+  The first observation is a complete visible inert projection with `wheelhouse:confirming-target-state`, reason, no controls, and `lifecycle-transition` cause; a PR-review projection also carries the exact ReviewObservation. The threshold record includes exact trusted machine soft-close provenance before close; malformed, duplicate, wrong-version, boolean, negative, oversized, or otherwise untrusted state reads as count zero and can never accelerate close or qualify future reuse.
+  When no open card exists, `render_card.lookup_card_lifecycle` completely lists the exact target label and may reuse a closed card only when its strict state identity, managed target/repo labels, issue author, latest close actor, close timing, terminal labels, and current-schema soft-close provenance are independently trustworthy.
+  A later `updatedAt` is reusable only when a bounded complete issue-timeline read proves every post-close event came from trusted Wheelhouse automation and fully explains the timestamp; unreadable, incomplete, ambiguous, or human-touched history refuses reuse.
+  If several trusted candidates share the exact identity, Wheelhouse selects the highest issue number deterministically and reports the lower candidates as superseded without changing them; any identity disagreement still fails closed.
   Legacy, owner/decision-resolved, blocked, held, hard-target-closed, auto-merged/audit-protected, manually authored, malformed, target-mismatched, and ambiguous closed cards are never reopened.
   A reusable card is rendered and relabeled while still closed, re-read before reopening, then checked through a complete trusted-open lookup; a partial failure stays closed, and post-open ambiguity rolls the local card back closed.
   New-head or incompatible-kind rendering naturally drops stale triage, recommendation, verdict, criteria, held, audit, and absence state; same-revision triage is preserved only through the normal `_preserve_same_revision_triage` path.
   A conclusive worklist return clears the record while reusing the open card.
-  Definitive target closure remains an immediate hard close and clears any uniquely parsed absence record first so hard-close cards cannot later satisfy reuse provenance, while `ok:false`, truncated, unresolved-mergeability, CI-wait, audit-protected, and owner/handler-raced cards remain frozen.
+  Definitive target closure remains an immediate hard close and clears any uniquely parsed absence record first so hard-close cards cannot later satisfy reuse provenance, while `ok:false`, truncated, CI-wait, audit-protected, and owner/handler-raced cards remain frozen.
   Every reconcile mutation and close re-reads the live card and requires it to match the scan snapshot.
-  `ingest`, `decision-handler`, and `scan-backstop` share the queued `wheelhouse-backstop` concurrency group, and create/reopen still performs a post-write uniqueness check, so the event and global paths cannot mint two actionable cards for one target.
+  `ingest`, `decision-handler`, `triage`, and `scan-backstop` share the queued `wheelhouse-backstop` concurrency group, and create/reopen still performs a post-write uniqueness check, so the event and global paths cannot mint two actionable cards for one target. The handler can recover an authorized owner checkbox webhook across a same-revision authoritative projection by proving exact target, observation, and context identity; a new head or incompatible projection still fails closed.
+  **Post-create admission treats the create response number plus issue-by-number reads as source of truth** (`render_card.verify_unique_open_card` / `_create_and_verify_card`): a valid create must never be closed or labeled `resolved` solely because GitHub's eventually consistent open-list/search index has not yet surfaced the new issue.
+  List lag emits structured `wheelhouse card-admission list_index_lag` telemetry and still admits/queues by number; a genuinely observed alternate open card or a malformed direct object fails closed with rollback; an incomplete list probe retains the open card deferred without destructive rollback.
+  Destructive admission rollbacks must fail the reconcile pass (`admission rollback(s)` counter) so a scan cannot look healthy after admission loss.
+  Covered by `tests/test_card_reuse.py` delayed-index fixtures.
   `render_card.py` writes state markers, but
   `parse_state_block` also accepts the legacy `<!-- triage-state: ... -->`
   marker (cards rendered before the rename) - back-compat that must stay so a live
@@ -124,8 +137,10 @@ still appears where it's plain English, e.g. "triage the queue".)
   any workflow), `triage` (automatic,
   lightweight, advisory PR-card OR issue-card context; pr-review is gated on
   `auto_triage`, issue-triage on the INDEPENDENT `auto_triage_issues`, both also
-  requiring `CLAUDE_CODE_OAUTH_TOKEN`; cached once per revision), `deep-review` (ALWAYS-ON, code-grounded;
+  requiring `CLAUDE_CODE_OAUTH_TOKEN`; cache-keyed by source revision), `deep-review` (ALWAYS-ON, code-grounded;
   gated only on `CLAUDE_CODE_OAUTH_TOKEN` - no config flag),
+  `merge-assist` (captain-initiated assisted in-place conflict resolution - see
+  "Assisted in-place merge" in Sharp edges),
   `no-mistakes-required` (PR-to-`main` gate: the job `name:` MUST stay exactly
   `PR must be raised via no-mistakes` - it is the check name the fleet convention
   and this repo's own `wheelhouse.config.yml compliance_check` reference - and it
@@ -139,12 +154,15 @@ still appears where it's plain English, e.g. "triage the queue".)
   auto-approve in `build_repo`, the advisory read-only CI-approval security
   summary `ci_security_summary` (see "CI-approval security summary" in Sharp
   edges), stale pending-contributor cleanup
-  (`sweep_pending_contributor_actions`, target-side markers/labels, and the
-  rebase-nudge arming path), plus shared utils
+  (`sweep_pending_contributor_actions`, target-side markers/labels, and legacy-rebase disarming), plus shared utils
   `parse_state_block`, `authorized`, `state`, `nl-decisions-enabled`,
   `auto-triage-enabled`, `auto-triage-issues-enabled`, `qualify_issue_refs`
   (rewrites a bare GitHub-autolink `#N` in model text to `owner/repo#N` - see
   "Cross-repo reference qualification" in Sharp edges)),
+  `target_observation.py` (strict revision-bound ReviewObservation v2, concrete persisted-v1 compatibility reader, head-bound approval receipt, and compact projection-reference contracts),
+  `decision_context.py` (neutral same-closing-issue, explicit-reference, and exact-shared-path context; a hub path - touched by at least 3 open candidates AND at least half of the open candidate universe - never forms a shared-path relation, so catalog-style README/index files cannot manufacture relations; candidates sort by relation strength - same-closing-issue, then explicit-reference, then exact-shared-path, ties by owner/repo/number - BEFORE the deterministic 10-result display/model cap, so the cap keeps the most informative candidates; the deliberate cap is recorded honestly as `related_candidate_count > len(candidates)` on a still-`complete` context, never as incomplete comparison evidence; `compact_model_context` alone owns title+URL model input), `assessment_admission.py` (typed observation-bound advisory admission; DecisionContext status/content/`context_id` never grant or deny Accept/G6 authority - `context_id` stays in artifacts for provenance/refresh/telemetry only, while `observation_id` and head binding stay exact; `_readmit_context_denied_assessment` in `render_card.py` heals, with zero model spend during the ordinary same-revision refresh, same-head assessments whose persisted admission was denied solely under the retired advisory-context rule), `assessment_record.py` (durable exact-revision agent result), `card_projection.py` (pure complete byte-deterministic PR-review projection), `projection_writer.py` (the sole verified v2 PR-review body/title/managed-label writer), `decision_label_recovery.py` (the narrow authorized, pinned-revision, timeline-proven, durably claimed recovery for a supported decision label erased by that writer), `scheduled_epoch.py` (trusted schedule-only lifecycle epoch),
+  `target_reconcile.py` (pure CI-wait observation + receipt -> current/pending/
+  unknown projection planner; no GitHub calls or Markdown),
   `render_card.py` (render + card CRUD, including the shared strict closed-card
   lookup/trust/reuse operation used by both ingest and reconcile;
   `CHECKBOX_OPTIONS`/`OPTION_LABELS` carry
@@ -171,12 +189,14 @@ still appears where it's plain English, e.g. "triage the queue".)
   free-text comment to a structured result), `nl_readonly_search.py` (installs
   the optional `wheelhouse-search` wrapper for READONLY_TOKEN-backed LLM
   context),
+  `merge_assist.py` (the whole captain-initiated assisted in-place merge
+  transaction: bind, mechanical merge, admission, zero-novel-line resolution,
+  confinement, the one plain non-force push after an exact-head re-read, and the card record),
   `automerge_criteria.py` (stable criterion IDs/labels and fail-closed
   normalization shared by evaluator and renderer), `auto_merge.py`
-  (authoritative G0-G6 criterion evaluation plus claim/validate/G7 act/audit and
-  default-token persistence/recovery of final-gate workflow holds),
+  (complete read-only G0-G6 preclaim, exact-pass-only action claim, under-claim reevaluation, G7 act/audit, and default-token persistence/recovery of final-gate workflow holds),
   `build_item.py` (normalize ingest payload), `reconcile.py` (backstop
-  create/**refresh**/activity-reflect/close/reuse and automatic triage dispatch). `apply_decision` imports `wheelhouse_core` and
+  create/**refresh**/activity-reflect/close/reuse, durable result-to-projection retry, and automatic triage dispatch). The complete Option B production, compatibility, observability, migration, and rollback contract is `docs/OPTION_B_CARD_PROJECTION.md`. `apply_decision` imports `wheelhouse_core` and
   `nl_readonly_search`; `reconcile`/`render_card` import `wheelhouse_core` (and
   `build_item` imports `render_card`) via
   `sys.path.insert(0, dirname(__file__))`.
@@ -191,43 +211,50 @@ still appears where it's plain English, e.g. "triage the queue".)
 
 ## Sharp edges
 
-- **`check_status()`'s `comp`/`tests` are worst-wins aggregates, never scalar
-  overwrites - card #392 was a false green from getting this wrong.**
+- **`check_status()` aggregates by equivalent check identity, never scalar
+  last-write-wins - cards #392 and #1537.**
   GitHub's GraphQL `statusCheckRollup.contexts` can return more than one
-  check-run with the SAME name (e.g. Wheelhouse's own `approve_ci` approving
-  two duplicate pending runs of one workflow, one of which then gets
-  cancelled by the workflow's own `concurrency: cancel-in-progress` group).
-  `check_status()` (`scripts/wheelhouse_core.py`) collects every context
-  matching `cfg["compliance_check"]` into a list and reduces it after the
-  loop, exactly like it already did for `tests`: any terminal non-`SUCCESS`
-  conclusion anywhere in the group -> `"fail"`; else any non-`COMPLETED`
-  context -> `"pending"`; only if every matching context is a completed
-  `SUCCESS` -> `"pass"`. A scalar last-write-wins assignment inside the loop
-  (the original bug) makes the result depend on GraphQL array order instead
-  of policy. As a fail-toward-safe backstop, `check_status()` also clamps
+  check-run with the SAME name (e.g. `concurrency: cancel-in-progress`
+  leaving CANCELLED siblings beside a completed SUCCESS on the same head).
+  `check_status()` (`scripts/wheelhouse_core.py`) groups by exact check name
+  on the current head and reduces each group: substantive
+  FAILURE/TIMED_OUT/ACTION_REQUIRED/STARTUP_FAILURE -> `"fail"`; any
+  non-completed -> `"pending"`; a completed SUCCESS makes same-name
+  CANCELLED siblings ignorable -> `"pass"`; cancelled-only evidence is
+  never pass. Across different names (e.g. matrix legs) results still
+  worst-wins. A scalar last-write-wins assignment inside the loop (card
+  #392) would make the result depend on GraphQL array order instead of
+  policy. As a fail-toward-safe backstop, `check_status()` also clamps
   `compliance` to `"fail"` whenever GitHub's own authoritative
   `statusCheckRollup.state` is `"FAILURE"`/`"ERROR"` and the per-context read
-  would otherwise say `"pass"`/`"n/a"` - deliberately conservative (it can
-  hold a card over an untracked/optional check the rollup counts but this
-  config doesn't), because a false hold is recoverable and a false green is
-  not. `classify()` is correct given correct inputs and was not touched; the
-  defect was entirely in how `check_status()` derived those inputs. See
-  `tests/test_check_status.py`. Relatedly, `approve_ci()` dedups its
-  `action_required` run list by stable `workflowDatabaseId` when GitHub exposes
-  one, keeping the highest `databaseId` per head_sha, and leaves runs without a
-  stable workflow identity distinct before approving, purely so Wheelhouse itself
-  stops manufacturing the duplicate-pending-run race that started the card #392
-  incident - this dedup runs strictly after the risky-files/posture HOLD check
-  and never weakens it.
+  would otherwise say `"pass"`/`"n/a"`, except when every non-pass rollup
+  context is an ignorable CANCELLED sibling of a proven same-name SUCCESS
+  (card #1537 concurrency poison). Untracked/optional failures still fail
+  closed. Repositories whose compliance check depends on mutable PR-body events
+  may explicitly opt into `wheelhouse.actions-current-body/v1`; the producer,
+  bounded Actions API reads, exact workflow/run/CheckRun bindings, latest
+  `run_number` semantics, and fail-closed freshness rules are authoritative in
+  `docs/CURRENT_BODY_COMPLIANCE.md` and covered by
+  `tests/test_compliance_event_evidence.py`. Non-opted-in reduction is unchanged.
+  See `tests/test_check_status.py`.
 - **Failed decision = durable open `blocked`, never pure `needs-decision`
-  (card #447).** `decision-handler.yml` maps `terminal_state == 'error'` onto
-  the same label path as `blocked` (add `blocked`, drop `needs-decision`; do
-  NOT close). Leaving a failed action as pure `needs-decision` lets reconcile's
-  soft self-heal silently consume it as `resolved` when the open target later
-  leaves the worklist. Hard-close still auto-cleans a `blocked` card once the
-  target is genuinely merged/closed. Guarded by the YAML-inspection in
-  `tests/test_nl_decisions_search.py` (`test_error_terminal_state_labels_as_blocked`)
-  and the soft/hard-close cases in `tests/test_reconcile.py`.
+  (card #447), except recoverable merge conflicts.** `decision-handler.yml`
+  maps `terminal_state == 'error'` onto the same label path as `blocked` (add
+  `blocked`, drop `needs-decision`; do NOT close). Leaving a failed action as
+  pure `needs-decision` lets reconcile's soft self-heal silently consume it as
+  `resolved` when the open target later leaves the worklist. Hard-close still
+  auto-cleans a `blocked` card once the target is genuinely merged/closed.
+  **Exception (card #1544):** `do_merge` returns terminal `none` when GitHub
+  reports a merge conflict (still posts the conflict note). Terminal `none`
+  does not add `blocked` or drop `needs-decision`, so the card stays pure
+  pending and the existing scan/reconcile refresh path reactivates it after a
+  clean new head. Generic non-conflict failures stay durable `error`/`blocked`.
+  Stale-head rechecks and NL revision binding are unchanged. Guarded by the
+  YAML-inspection in `tests/test_nl_decisions_search.py`
+  (`test_error_terminal_state_labels_as_blocked`, plus `none`/retryable
+  keep-actionable checks), the soft/hard-close cases in `tests/test_reconcile.py`,
+  and `tests/test_decision.py`
+  (`test_merge_conflict_is_recoverable_not_durable_blocked`).
 - **Workflow-touching PRs are manual UI merges by design (Option B; cards
   #442/#447).** `FLEET_TOKEN` intentionally has no Workflows write. Before any
   card-driven `do_merge` API call, `apply_decision._workflow_merge_block`
@@ -264,10 +291,15 @@ still appears where it's plain English, e.g. "triage the queue".)
   block, so the handler treats it as a no-op.)
 - **Card refresh (an open card must reflect CURRENT target state).** Both the
   event path (`render_card.upsert_card`) and the backstop (`reconcile.py`) keep a
-  card current: when a target's MATERIAL state changes - `head_sha`, compliance
-  (`comp`), tests (`tests`), `kind`, `priority`, or checkbox `options` - the
-  card is re-rendered in place; title/summary/recommendation re-render naturally
-  and are NOT change triggers. Option comparisons use set equality; display
+  card current: when a target's MATERIAL state changes - `head_sha`, bucket,
+  compliance (`comp`), tests (`tests`), projection freshness/head/completeness,
+  `kind`, `priority`, or checkbox `options` - the card is re-rendered in place.
+  Observation ID/time are persisted in `projection_ref` but intentionally do not
+  trigger churn when every semantic dimension is unchanged. Exact deterministic card-title drift is also a
+  trigger for every kind, using the renderer's same 70-character truncation,
+  while summary/recommendation remain non-triggers. A valid strictly newer
+  issue-triage `updated_at` is a full-refresh trigger when the advisory queued
+  write does not already own that revision advance. Option comparisons use set equality; display
   order remains the order provided in the card body/state. A refresh ALSO fires
   when the card's stored `render_version` is behind the current
   `CARD_RENDER_VERSION` - a non-material, one-time, self-terminating trigger
@@ -285,7 +317,43 @@ still appears where it's plain English, e.g. "triage the queue".)
   survive untouched, no re-triage for that revision), and it does NOT drop the
   "target updated" comment (that stays gated strictly on `head_sha` actually
   changing - an issue's `updated_at` alone never triggers that comment, since
-  it is not a material field). `CARD_RENDER_VERSION` is currently `7`: the
+  it is not a material field). `CARD_RENDER_VERSION` is currently `17`: the
+  16 -> 17 bump publishes mergeability-independent captain readiness and the
+  inert, source-bound maintainer-edits policy card. The 15 -> 16 bump presents
+  machine `INELIGIBLE` as `MANUAL REVIEW REQUIRED` without changing persisted
+  state or G0-G7 semantics. The 14 -> 15 bump
+  makes a current admitted assessment the sole owner-facing
+  current triage outcome - historical primary-failed / advisory-consumption
+  telemetry stays in non-material state for diagnostics, but the visible
+  "consumed for advisory triage" warning is suppressed whenever production
+  authority predicates already grant a current admitted assessment / Accept
+  surface (cards #1735 class); true no-authority stuck-advisory cards keep the
+  explicit unavailable warnings (card #1759 class). The owning helpers are
+  `render_card.triage_section(current_authority=...)`,
+  `current_triage_authority_present`, `body_with_coherent_advisory_telemetry`,
+  and the read-only `contradictory_advisory_telemetry_census`; the 13 -> 14 bump
+  makes recommendation framing controls-aware so a projection that suppresses
+  decision checkboxes (confirming/inert lifecycle or held placeholder) never
+  keeps the "Tick **Accept recommendation**" instruction that references an
+  absent Accept control - analysis and the explicit inert decision copy stay;
+  the ordinary published card keeps the actionable framing and checkbox
+  (card #1721 / scan-5). The owning helpers for that bump are
+  `render_card._recommendation_section(controls_available=...)`,
+  `body_with_reconcile_absence`, and the read-only
+  `contradictory_accept_instruction_census`; the 12 -> 13 bump qualifies bare
+  target-derived references in the deterministic title quote and warning
+  surfaces using the existing `wheelhouse_core.qualify_issue_refs` helper,
+  while leaving Wheelhouse-owned self-references such as G1 `card #N` evidence
+  bare; the 11 -> 12 bump
+  establishes ONE canonical recommendation surface - it drops the
+  deterministic check-derived `### Recommended action` copy, drops the cached
+  `Recommended next step` bullet from an existing `### Triage` block, and folds
+  a legacy admission warning back inside the triage markers so it survives the
+  lift; the
+  10 -> 11 bump republishes DecisionContext-neutral related-work copy and runs
+  the zero-spend re-admission of assessments denied solely under the retired
+  advisory-context admission rule; the
+  9 -> 10 bump publishes truthful incomplete-context authority copy; the 8 -> 9 bump publishes deterministic triage-suppression reasons and makes G6 credential wording distinct from card triage eligibility; the 7 -> 8 bump groups auto-merge criteria by gate family and separates G6's complete-diff behavior facts from its VISION.md-dependent subtree;
   6 -> 7 bump publishes the non-authoritative read-only `### Auto-merge criteria`
   section on already-open PR-review cards; the 5 -> 6 bump publishes the
   advisory read-only `### Security review` section on
@@ -294,9 +362,9 @@ still appears where it's plain English, e.g. "triage the queue".)
   4 -> 5 bump labels known claude-code-action harness polling/status transcript
   lines in card-visible auto-triage output and older cached `### Triage`
   sections without stripping content; the 3 -> 4 bump publishes the
-  conditional `Accept recommendation` checkbox and
-  suppresses the top-level deterministic recommendation when structured triage
-  recommendation state is present; the 2 -> 3 bump publishes the
+  conditional `Accept recommendation` checkbox (its companion deterministic
+  recommendation was later removed entirely by the 11 -> 12 bump); the
+  2 -> 3 bump publishes the
   `/request-changes <text>` PR-review slash hint on already-open cards; the
   earlier 1 -> 2 bump retroactively re-qualifies cross-repo refs cached in an
   already-open card's `### Triage` section from before `qualify_issue_refs`
@@ -306,7 +374,10 @@ still appears where it's plain English, e.g. "triage the queue".)
   re-inserting it - `owner` is `GITHUB_REPOSITORY_OWNER` (read in
   `_refresh_card`, the same env source the fresh-triage render path uses) and
   `repo` is the card's own deterministic `old_state["repo"]` (falling back to
-  the item's repo), NEVER the model's own text. This is the same one-time,
+  the item's repo), NEVER the model's own text. The renderer also applies this
+  same helper only to the target-derived title quote and warning line; it must
+  never qualify the whole card body because Wheelhouse-owned G1 `card #N`
+  evidence is intentionally a self-reference. This is the same one-time,
   self-terminating propagation shape as the earlier author `@mention` drop:
   every pre-existing card refreshes once, gets its cached triage refs
   qualified, known automated status lines labeled, and its `render_version`
@@ -397,15 +468,17 @@ still appears where it's plain English, e.g. "triage the queue".)
   cards of either kind backfill exactly once on the next eligible scan.
   Before dispatching `triage.yml`, `reconcile.py` / the ingest fast path edits
   the card state to set `triaged_sha=<current revision>` and
-  `triage_status=queued`; this intentionally spends at most one Claude attempt
-  per revision even if the asynchronous workflow errors, times out, or cannot
-  parse a result.
+  `triage_status=queued` so an asynchronous error, timeout, or parse failure cannot trigger an hourly retry loop; every sanctioned later cache clear remains bounded by `triage_attempts` and the daily ledger.
   **A just-created card must be read back BY NUMBER, never via
   `find_card`'s label-filtered `gh issue list`.** That listing is not
   read-after-write consistent immediately after `gh issue create`, so reading
   it back milliseconds later can silently miss the card and skip queuing its
   first auto-triage attempt (only a later scan's pre-existing-card backfill
-  path would then catch it). `_create_card`/`upsert_card` therefore always
+  path would then catch it). The same eventual-consistency gap used to drive
+  destructive post-create rollback when uniqueness polled only the open-list
+  index; admission now verifies the direct issue first (see state-block
+  uniqueness note above) and only uses the list to detect alternate open cards.
+  `_create_card`/`upsert_card` therefore always
   return an int issue number (never a URL), and `reconcile.py`'s new-card
   branch reads the fresh card via `current_card({"number": n})` -> `get_card`,
   which IS consistent. The ingest fast path mirrors this: the `upsert` CLI
@@ -418,12 +491,13 @@ still appears where it's plain English, e.g. "triage the queue".)
   `### Triage` section are non-material: they must never affect `classify`,
   `material_changed`, fork-CI approval, author filtering, or conflict routing.
   For a pr-review card, `head_sha` IS material, so a head move both refreshes
-  the card and makes the fresh head eligible for one new triage attempt in the
-  same pass. For an issue-triage card, `updated_at` is NOT material (an issue's
+  the card and makes the fresh head eligible for a spend-guarded triage attempt
+  in the same pass. For an issue-triage card, `updated_at` is NOT material (an issue's
   title/comp/tests/kind/priority/options rarely change on a new comment), so a
-  new comment/edit can make the card eligible for one new triage attempt
-  WITHOUT any card refresh at all - `reconcile.py` checks triage eligibility
-  independently of the material-change branch for exactly this reason.
+  new comment/edit can make the card eligible for a spend-guarded triage attempt.
+  When eligible, the existing single queued write owns the revision advance;
+  when ineligible, the strictly newer timestamp triggers one deterministic full
+  refresh without reserving budget or dispatching an advisory.
   If config is off or the token is absent, no dispatch happens and cards render
   exactly as the deterministic card did before this feature.
   `triage.yml` itself checks out the PR head for a pr-review card (and
@@ -432,6 +506,80 @@ still appears where it's plain English, e.g. "triage the queue".)
   gate/Claude/card-update steps, security posture, and `--revision` CLI
   argument (`render_card.py triage-apply|triage-fail --revision <head_sha or
   updated_at>`).
+- **Automatic-triage spend guards are enforced inside the shared queued checkpoint.**
+  `render_card.mark_triage_queued` reserves from the one trusted closed UTC daily ledger before it writes the non-material, versioned `triage_attempts` count and existing queued cache together, verifies the card by number, and returns the sole permit accepted by `dispatch_triage_workflow`.
+  `triage_attempt_cap_per_revision` defaults to 2 queued attempts, accepts integers 1 through 5, may be overridden per repository, and fails closed to 1 when invalid.
+  The global-only `triage_daily_ceiling` defaults to 1200 reservations per UTC day, accepts integers 1 through 2000, and fails closed to 0 when invalid; one reservation authorizes one triage run whose bounded schema repair permits at most two model calls.
+  The finite default keeps approved operator replay paced by reviewable waves rather than cost, while preserving a hard runaway-containment bound.
+  Malformed, ambiguous, untrusted, duplicate, unreadable, or unverified ledger state denies reservations, and a crash or verification failure may leak capacity only in the safe direction.
+  All current automatic queue writers are serialized by the `wheelhouse-backstop` concurrency group, while deep-review and natural-language decision runs remain outside this ceiling because they require deliberate owner actions and durable claims.
+  A pr-review re-triage whose ONLY trigger is a verified base-SHA or VISION-SHA movement against an unchanged, already-attempted head (audit F13; G6 binds those SHAs) consumes the SEPARATE `triage_context_refresh_allowance` instead of the ordinary cap: default 2, integers 0 through 5 (0 disables), per-repo override, invalid fails closed to 0.
+  Each use binds the exact (head, base, VISION) identity in the non-material versioned `triage_context_allowance` state record, so a repeated identity grants nothing and a malformed record denies; verified means the card carries a complete recorded prior identity - legacy cards and first-time VISION appearance stay on the ordinary budget.
+  Ordinary same-context failure retries (including operator replay, which clears the cache) stay on `triage_attempt_cap_per_revision`; every context refresh still reserves one daily-ceiling unit and returns the same sealed permit; an exhausted, repeated, or untrusted allowance emits the explicit bounded `context.deferred` diagnostic with no dispatch; and `body_with_triage_queued` no-ops on a fresh identical identity so a raced duplicate call cannot buy spend from either budget.
+  The authoritative implementation and offline failure matrix are `scripts/render_card.py`, `scripts/wheelhouse_core.py`, `tests/test_triage_budget.py`, and `tests/test_triage_context_allowance.py`.
+- **Automatic-triage replay is operator-only, exact-revision, and admission-safe.**
+  `docs/AGENT_RUNTIME.md` owns the workflow-level operator invocation, exact-selector replay-only isolation, fail-closed validation, claim tombstone, duplicate-only evidence, and exact-revision admission-denial contracts.
+  PR-triage durable claims bind the queued, complete ReviewObservation ID plus base and default-branch VISION SHA-or-absence through an opaque context token; the queue permit is the only dispatch source, and `triage.yml` re-reads the queued card plus live head/base/VISION before reconstructing it. Same-context delivery remains deduplicated before spend while first-VISION, verified base/VISION, and complete-observation changes get distinct events. Issue-triage identity is unchanged.
+  A checked-in `triage_replay.BACKFILL_POLICIES` entry can grant one separate, versioned policy-backfill allowance only to an exact owner-selected cohort. It never resets ordinary attempts, is replay-only with two exact-read preflights, tombstones only the matching primary claim, and retains card-1585/other incident-marker refusals. See `docs/AGENT_RUNTIME.md`.
+  Legacy candidate listings supply issue numbers only; an optional exact-card selector bypasses that discovery step, while every selected card and live target is still re-read by exact number before a marker write.
+  Replay normally clears only a proven current `triage_status:error` non-success cache, marks an entirely absent cache, or re-enters the bounded duplicate-only cohort whose prior replay was denied before task construction; `docs/AGENT_RUNTIME.md` owns the narrow exact-selector-only advisory-cache exception.
+  `triage_replay._advisory_recovery_refusal` is the single code owner of that exception's proof, and the workflow deliberately restates no predicate.
+  The distinct observation-drift targeted-refresh class proven by cards #1584/#1819 is shared by ordinary maintenance and the exact-selector fallback; `render_card.observation_drift_refresh_refusal` is the single code owner of its proof, and `docs/AGENT_RUNTIME.md` owns the detailed automatic and operator contracts.
+  The exact-selector fallback writes the versioned non-material `triage_replay` marker and re-enters `reconcile.maybe_queue_auto_triage`; ordinary maintenance enters the same reservation, queued checkpoint, sealed dispatch permit, and `triage.yml` admission without a replay marker.
+  Malformed or mismatched state, markers, identities, revisions, labels, authorship, sources, attempt counts, or budget ledgers fail closed.
+  `--dry-run` performs the same exact-number eligibility reads and reports planned actions without any GitHub write.
+  The evidence-empty E7 and array-recovery G1 recoveries have separate incident-scoped attempts-reset cohorts in `scripts/triage_replay.py`.
+  Each reset is admitted only for its dedicated sanctioned wave plus the explicitly supplied complete code-defined cohort.
+  Every card is bound to its exact diagnosed revision and prior replay marker before its trusted count of 2 is reset to 1 for the queued write.
+  A full cohort second-read preflight refuses any mismatch before a reset write, and a one-use v2 marker excludes completed members from ordinary replay while allowing only the same sanctioned cohort's pending members to resume.
+  Each reset refuses policy drift away from cap 2 and leaves both the global per-revision cap and daily ceiling unchanged.
+  `docs/AGENT_RUNTIME.md` owns the additive `wheelhouse-triage-record` migration record shape.
+- **One canonical recommendation surface (card #1746).** A card presents a
+  recommendation ONLY when it comes from a current ADMITTED structured
+  agent-triage result, and only in `### Recommended action`
+  (`render_card._recommendation_section`, gated by
+  `accept_recommendation_available`). There is deliberately NO deterministic
+  check-derived recommendation: `wheelhouse_core._recommendation`,
+  `target_reconcile._TERMINAL_RECOMMENDATIONS`, the item `recommendation` field,
+  and the `ingest` `recommendation` input are all gone. Compliance, test, and
+  mergeability facts stay facts in `### Situation` and the auto-merge criteria -
+  never owner guidance to act. `### Triage` carries analysis only (summary,
+  product implications, and the honest primary-failure/admission warnings); the
+  model's advisory action is NOT rendered there, so a delivered-but-invalid or
+  non-admitted candidate can never show "merge" as the agent's recommendation
+  beside a G6 row that truthfully says none was established. That G6 evidence
+  reads "no valid agent recommendation was established: the advisory assessment
+  was not admitted" - it never implies the model recommended something else, and
+  the row stays UNMET with identical authority semantics. Existing cards heal
+  through the ordinary `CARD_RENDER_VERSION` 11 -> 12 migration
+  (`_without_legacy_recommended_next_step` plus `_with_lifted_admission_warning`
+  in `_preserve_same_revision_triage`): zero model spend, no target write, and
+  no change to admission, cache freshness, options, or gates. The admission
+  warning is written INSIDE the triage markers so the same-revision lift keeps
+  it. The projection path (an admitted assessment re-renders `### Triage` from
+  the bound artifact rather than lifting the cached section) explicitly carries
+  the prior same-revision card's NON-MATERIAL
+  `triage_primary_status`/`triage_primary_error_code`/`triage_consumption`, so a
+  refresh cannot delete the honest primary-failure record.
+  `render_card.legacy_recommendation_presentation` /
+  `recommendation_census` (and the read-only
+  `render_card.py recommendation-census <cards.json>` CLI, which takes the same
+  open-card list `reconcile.py` consumes and performs NO GitHub call or write)
+  are the census and post-backfill verification helpers: they classify the
+  complete list into affected / clean / skipped-with-reason. Deliberately NOT
+  auto-corrected, and reported instead: cards carrying
+  `processing`/`resolved`/`blocked` (re-rendering would clobber an in-flight or
+  consumed decision), and cards frozen by an `ok:false`/`truncated`/
+  `indeterminate`/CI-wait scan - each heals on the first scan where it is a
+  pure refreshable `needs-decision` card again. Covered by
+  `tests/test_canonical_recommendation.py`.
+- **Incomplete observations never weaken PR-review projection ownership.**
+  The only presentation-only exception is the bounded, operator-selected
+  deletions path documented in `docs/OPTION_B_CARD_PROJECTION.md` and guarded by
+  `tests/test_presentation_migration.py`. Its separate stale-affordance mode
+  may remove only the exact Accept recommendation checkbox when the shipped
+  `accept_recommendation_available` gate is false; it preserves the hidden state
+  and render version and is never a scheduled queue-wide writer.
 - **Accept recommendation is a deterministic shortcut, not model action.** A
   successful current auto-triage attempt for pr-review or issue-triage may
   prepend an `Accept recommendation` checkbox when the structured
@@ -447,9 +595,6 @@ still appears where it's plain English, e.g. "triage the queue".)
   `free_text`, preserving head-SHA rechecks and token boundaries; if the
   recommendation is `investigate`, it stays non-consuming and clears the clicked
   accept box.
-  While a structured accept recommendation is available, render suppresses the
-  top-level deterministic `### Recommended action` section so the card has one
-  primary recommendation surface.
   Bare `#N` refs in `recommended_reason` are qualified against the card state's
   target repo before the reason can be posted, used as a decline/close note, or
   submitted as a request-changes review.
@@ -507,40 +652,28 @@ still appears where it's plain English, e.g. "triage the queue".)
   If the trusted source snapshot is unavailable, the workflow cannot safely run
   `render_card.py`; in that narrow case it clears the queued triage cache for
   the exact raw-input revision instead, so a future scan can retry rather than
-  leaving the held card permanently hidden.
-- **Bounded schema repair - one automatic retry for the model-schema-miss triage
-  class (cards #551/#547), never for the excluded classes.** The TRIGGER is
-  narrow and exact: a triage result that was DELIVERED (a non-empty
-  `extract_claude_result`) but fails parse/normalize (`parse_triage_json` returns
-  None). That is the #551 class. It is deliberately distinct from #556
-  (delivered-then-dropped by the transcript cap - fixed separately) and from
-  E2BIG / auth / rate-limit / infra, which all leave NO extractable result and so
-  keep today's fail-open behavior byte-for-byte. An evidence-anchor failure
-  (parse OK but the model's quotes do not anchor to `target.txt`) is ALSO
-  excluded - a repair turn cannot conjure real quotes. The pure decision helpers
-  are `render_card.plan_triage_repair` (should a schema-miss get a repair turn,
-  and build its prompt) and `render_card.decide_triage_apply` (route the final
-  apply to `success`/`repaired`/`repair-failed`/`anchor-fail`/`no-result`); both
-  go through `triage_schema_reason`, which returns a purely STRUCTURAL reason
-  (field name + defect type, NEVER a field value) safe to persist and display.
-  `triage.yml` performs EXACTLY ONE repair turn: after `triage-result`,
-  `render_card.py triage-repair-prep` emits `repair_needed`/`reason` and (only on
-  a schema-miss) a `repair_prompt` heredoc to `$GITHUB_OUTPUT`; the conditional
-  `claude_repair` step runs that prompt in the SAME tokenless side-job posture as
-  triage (no `FLEET_TOKEN`, no `READONLY_TOKEN`), bounded to `--max-turns 1` with
-  FAIL-CLOSED zero-tool isolation (an empty `--allowedTools` is NOT a reliable
-  guarantee in `claude-code-action` - upstream allowlist parsing can leak
-  defaults incl. Bash - so a Claude Code `permissions.deny` rule set, which takes
-  precedence over any allowlist, blocks every file/exec/network/subagent tool by
-  name; the candidate is embedded in the prompt, so the turn needs no tools and
-  must NOT re-read the diff or re-analyze). `repair-result` extracts the compact
-  repaired result and the existing `Update the decision card` step passes it to
-  `triage-apply --repair-execution-file`. The repaired output is re-validated
-  through the SAME parse/normalize AND evidence-anchor guards; if it is still
-  invalid the card lands on the existing visible triage-unavailable path, now
-  carrying the structural validation reason. There is at most one repair attempt
-  per revision (the `triaged_sha` cache already blocks re-queue), so it is
-  STRUCTURALLY impossible to loop. Telemetry lives in NON-MATERIAL state keys
+  leaving the held card permanently hidden. This no-trusted-source security
+  fallback covers both issue-triage and PR-review cards, stays exempt from full
+  auto-merge re-evaluation because trusted code is unavailable, and visibly
+  warns on the card that the checklist may temporarily reflect the prior queued
+  state until trusted card maintenance resumes.
+- **Context-equivalent single correction turn - one automatic retry for any
+  delivered triage candidate that fails trusted validation, never for the
+  excluded classes.** A delivered candidate failing the complete bound action
+  schema, the UTF-8 evidence-quote byte policy, or trusted evidence anchoring
+  gets exactly one correction; missing results and infrastructure failures do
+  not. The correction rebuilds the original AgentTask from its verified
+  handoff, preserves its action, model, tools, search, network boundaries,
+  immutable inputs, schema binding, and limits, and must pass the same complete
+  trusted validation before it has authority. A failed correction can leave
+  an advisory-consumable primary only as explicitly advisory-only: no
+  admission, Accept shortcut, persisted recommendation, or auto-merge verdict.
+  `docs/AGENT_RUNTIME.md` owns the detailed eligibility, exact-binding,
+  correction-task, evidence-byte, anchoring, outcome, and rollback contract.
+  There is at most one correction per admitted triage dispatch; any separately
+  sanctioned later dispatch consumes another per-revision attempt and daily
+  reservation.
+  Telemetry lives in NON-MATERIAL state keys
   `triage_repair_status` (`repaired` | `repair-failed`; absent = never attempted),
   `triage_repair_reason` (the structural failure), and `triage_repair_candidate`
   (a redacted, content-free candidate shape from `redacted_candidate_shape` -
@@ -548,11 +681,13 @@ still appears where it's plain English, e.g. "triage the queue".)
   model-chosen key name or value) - like `triaged_sha`, never in
   `MATERIAL_FIELDS`, never affecting classify/material_changed/decision-parsing.
   The persisted diagnostics carry only structural facts, never raw target/comment
-  content. See `tests/test_triage_schema_repair.py`.
-- Natural-language decisions accept only owner/maintainer comments and are structured: the LLM
-  returns `{mode: action|answer|clarify, action?, free_text?, answer?}` to
-  `decision.json` and nothing else. `apply_decision.py nl-route` is the trust
-  boundary - it validates `action` against the per-kind allowlist and only then
+  content. The legacy no-tool repair branch remains as disabled Codex evidence
+  and a deployable rollback surface; the production Claude lane never builds a
+  `triage.schema-repair` task. See `docs/AGENT_RUNTIME.md` and
+  `tests/test_triage_schema_repair.py`.
+- Natural-language decisions accept only owner/maintainer comments and are structured.
+  `docs/AGENT_RUNTIME.md` owns the native structured-output and bounded schema-repair contract.
+  `apply_decision.py nl-route` is the trust boundary - it validates `action` against the per-kind allowlist and only then
   sets the `decision` output that makes the SAME deterministic `execute` run
   (so every guard - allowlist, head-SHA re-check, fork-CI HOLD, token isolation,
   concurrency - applies unchanged). `answer`/`clarify` only post a card comment
@@ -561,7 +696,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   removed from the trusted card context before the NL prompt is built, so a prior
   model recommendation cannot become an instruction to the intent-mapper.
   When `READONLY_TOKEN` is absent, the LLM receives
-  `Read,Grep,Glob,Write` and no GitHub credential. When the
+  `Read,Grep,Glob` and no GitHub credential. When the
   optional `READONLY_TOKEN` secret is present, the LLM step uses that read-only
   public-scoped token as both the action `github_token` input and shell
   `GH_TOKEN`, plus a narrow Bash allow-list for `wheelhouse-search`, which wraps
@@ -573,11 +708,13 @@ still appears where it's plain English, e.g. "triage the queue".)
   Search output is UNTRUSTED DATA for answering questions only, never an
   instruction and never an authorization to act.
   The LLM never receives `FLEET_TOKEN` - it maps intent or answers, it never acts.
-  After Claude runs, the trusted bridge validates a regular, size-capped
-  `decision.json`, observed model identity, and the output schema before it
-  atomically emits `AgentResult`; `nl-route` and `execute` consume only that
+  After Claude runs, trusted code admits an `AgentResult` only through the
+  documented result-validation boundary; `nl-route` and `execute` consume only that
   normalized result from a read-only trusted source copy with a scrubbed
   environment.
+  An eligible primary-result failure can claim only one same-comment `nl-decision.schema-repair` task; it is tokenless, one-turn/no-tool, and strictly revalidated before any reply or action.
+  A duplicate or still-invalid repair leaves the card open with a content-free, retryable failure note.
+  `docs/AGENT_RUNTIME.md` owns the detailed runtime contract.
 - Token discipline per step: scan/execute and the read-only target reads for the
   LLM (`triage` prepare + target-code checkout, `deep-review` prepare + its target-code checkout, decision-handler
   `nl-fetch`) use `FLEET_TOKEN`; all
@@ -616,7 +753,7 @@ still appears where it's plain English, e.g. "triage the queue".)
   `head_sha` from the tick event, and `deep-review.yml` uses those immutable
   inputs for bot-dispatched runs instead of re-reading the mutable card body.
   Owner-triggered `workflow_dispatch` can also be run with only `issue=...` for direct verification; that path fetches and parses the current card body with `github.token`.
-  Every direct Claude action in the separately permissioned model workflow has `allowed_bots: github-actions[bot]`, because the trusted parent dispatch makes that bot the exact child-workflow actor and the action otherwise rejects the run before it emits `execution_file`.
+  Every direct Claude action in the separately permissioned model workflow has `allowed_bots: github-actions[bot]`, because a bot-triggered trusted caller retains that exact actor in the reusable model job and the action otherwise rejects the run before it emits `execution_file`.
   Keep that allow-list exact - never `*` and never an external bot actor.
   The manual `needs-deep-review` label path is unchanged (a human applying it raises the `labeled` event normally) and remains a card-body parse path in `deep-review.yml`, alongside owner-triggered issue-only `workflow_dispatch` verification runs.
   This is a deliberate asymmetry: the manual label and issue-only workflow-dispatch paths authorize only the repository owner.
@@ -674,60 +811,13 @@ still appears where it's plain English, e.g. "triage the queue".)
   Any arming failure is cleanup-only: the review stays posted, the card remains
   open, and the result message says stale cleanup was not armed.
 - **Stale pending-contributor cleanup is PR-only, deterministic, and fail-open.**
-  The feature is default OFF in code (`pending_contributor_cleanup: false` when
-  absent) but Kun's committed `wheelhouse.config.yml` opts in globally with
-  `pending_contributor_cleanup_targets: ["pr"]`, a 10-day reminder, and a 14-day
-  close threshold.
-  Every global setting has a per-repo override, including the enable flag,
-  thresholds, and targets.
-  It is intentionally scoped to provable contributor-action asks:
-  successful `/request-changes` reviews and merge-conflict rebase nudges.
-  The ASK is the nudge, not the routing bucket.
-  A conflicting fork PR in the `needs-ci-approval` ci-noop route is eligible only when the sweep can prove an existing rebase nudge.
-  Routing alone never creates or proves an ask.
-  Its nudge is deliberately treated through the legacy retrofit rather than requiring cleanup state, so an unarmed nudge is not orphaned.
-  `_pr_conflicting_for_cleanup` gates this widened proof path with the scan's authoritative `mergeable == CONFLICTING` result, carried in the enriched scan dict.
-  A `needs-ci-approval` PR is entered ONLY when it is authoritatively CONFLICTING this scan.
-  A non-conflicting one is ignored even with a pending label, so the fast security-gate lane is untouched and the close path is fail-closed on current conflict.
-  UNKNOWN, MERGEABLE, and None never qualify.
-  It never handles issue-triage, never runs from
-  ingest, never runs in Claude/LLM paths, and never uses `READONLY_TOKEN`.
-  The sweep runs inside `wheelhouse_core.py scan` under `FLEET_TOKEN`, before
-  worklist emission, so a PR closed by cleanup is removed from the scanned open
-  PR set and the addressed-issue map is recomputed without it.
-  A close requires an open target PR, a non-maintainer human author, no
-  `wheelhouse:keep-open` target label, an active structured marker plus
-  `wheelhouse:pending-contributor-action` label (or a provable legacy rebase
-  nudge), the same head SHA, a verified original ask, complete target comments,
-  reviews, review-comments, timeline, and PR edit-history reads, no qualifying
-  contributor activity after the ask, and a visible maintainer-authored reminder
-  marker posted after the ask.
-  At or after the close threshold with no reminder, it posts the reminder and
-  waits for a later scan instead of closing immediately.
-  Contributor comments, reviews, review comments, PR body edits, head pushes,
-  and other target timeline actions after the ask stop cleanup and clear the
-  active pending label.
-  Maintainer and bot activity is known activity but does not reset the clock.
-  A moved head also clears the active pending label.
-  Any uncertainty skips: unreadable or too-large paginated endpoints, missing or
-  ambiguous timestamps/authors, unaccounted target `updated_at`, untrusted
-  marker authorship, an unprovable review/nudge, invalid targets, or disabled
-  config all fail open.
-  **Timeline `reviewed` events carry `submitted_at`, not `created_at`.**
-  `_timeline_event_time` must read both keys - reading only `created_at` made
-  every PR a maintainer/bot had reviewed fail open as "reviewed event missing
-  timestamp", which is what kept the already-nudged fleet backlog out of the
-  reminder-then-close clock and left a review-caused `updated_at` bump looking
-  "unattributable". Wherever a review or `reviewed`-event read still lacks a
-  usable timestamp, `_read_pr_cleanup_state` recovers it by re-reading the review
-  by id (`_backfill_missing_review_times`, the same authoritative fallback
-  `apply_decision.do_request_changes` uses when arming); a failed re-read leaves
-  the field missing so the downstream check still fails open. A GENUINELY
-  unexplained target `updated_at` (no readable activity at that time) still fails
-  open - that safety net is intentional, not a bug to remove.
-  Legacy `<!-- wheelhouse-rebase-nudge:<head_sha> -->` comments form the unarmed, pre-arming nudge backlog and can be retrofitted into the lifecycle.
-  The retrofit requires a trusted author, the original comment timestamp/id, an unchanged head, and a cleanup-eligible conflict path.
-  The first eligible pass reminds and adds the active label, and only a later pass with that reminder may close.
+  It applies only after a successful captain `/request-changes` review. Merge
+  conflicts, CI routing, and rebase nudges are never contributor asks. Existing
+  `needs-rebase` records are read only to silently remove their pending label;
+  they never produce a reminder or closure. The request-changes lane remains
+  unchanged: full target activity proof, a visible reminder before close, and
+  every unreadable or ambiguous fact fails open. See
+  `scripts/wheelhouse_core.py` and `tests/test_pending_contributor_cleanup.py`.
 - NL conversation memory is owner-scoped, and the scoping IS the security
   boundary. `decision-handler.yml` fetches the card's thread (`nl-comments`,
   `github.token`) and `apply_decision.py assemble_history` renders it as a
@@ -790,62 +880,127 @@ still appears where it's plain English, e.g. "triage the queue".)
   This deliberately bypasses the global or per-repo `auto_approve_ci: false` opt-out only for those author-excluded ci-approval PRs; contributor PRs still honor the opt-out and card as before.
   Unsafe, uncertain, or failed owner, maintainer, and bot CI-approval targets still do not emit cards, but they keep the scan-log warning.
   Skipped targets still remain in `open_pr_numbers` / `open_issue_numbers` but are absent from the `items` worklist, so `reconcile.py` advances the fixed two-scan soft-close lifecycle for any existing pure `needs-decision` owner, maintainer, or bot card on each qualifying scan.
-- **UNKNOWN mergeability is an EXPECTED PENDING STATE, never a classifiable
-  answer (the lavish-axi#111 duplicate-card fix).** GitHub computes PR
-  mergeability LAZILY: a push to the base branch invalidates every open PR's
-  cached mergeability to `UNKNOWN`, and nothing recomputes it until the PR is
-  queried - the first query returns `UNKNOWN` and merely TRIGGERS the async
-  compute, which settles within seconds-to-a-minute (confirmed live: a fleet repo
-  went 32 `UNKNOWN` -> 0 within ~2 min of being queried; matches GitHub's
-  documented REST "mergeable is null until computed, poll until non-null"
-  contract). If the hourly scan is the only regular requester, an un-polled
-  `UNKNOWN` makes a statically-conflicting PR fail open to `merge-ready` (a new
-  card) then settle to `CONFLICTING` (`needs-rebase`, card soft-closed) - one
-  create/close oscillation per base push (10 duplicate cards for #111). So a
-  `merge-ready` or `review-needed` candidate whose `mergeable` reads exactly
-  `UNKNOWN` is polled with short backoff (`_resolve_pr_bucket` -> `_settle_mergeable` ->
-  `gh_graphql_pr_mergeable`; the first read triggers the compute, later reads
-  catch it) until it resolves: `CONFLICTING` -> `needs-rebase` (out, nudged), a
-  non-conflicting value -> its original worklist bucket (in). If it still can't
-  be settled within the budget it returns the `MERGEABILITY_PENDING` sentinel and
-  `build_repo` reports the PR in `indeterminate_pr_numbers` (kept in `open_pr_numbers`, emits NO
-  worklist item), and `reconcile.py` FREEZES that card - the **hard invariant is
-  that an UNKNOWN reading must NEVER flip worklist membership or create/close/
-  consume a card** (in stays in, out stays out). The reconcile freeze is a
-  per-PR extension of the existing `ok:false`/`truncated` unreadable-state skip.
-  It does not close the card or rewrite its absence state, but its intervening
-  scheduled workflow run breaks the run-number adjacency required by the fixed-K
-  soft-close gate in `reconcile.py` (lifecycle coverage lives in
-  `tests/test_reconcile.py`).
-  A settlement query error that does not recover to a conclusive answer marks
-  the repo `ok:false` so its warning reaches the scan-health ledger while the
-  same freeze remains in effect.
-  Only an explicit `UNKNOWN` is polled; a missing/None value keeps classify's
-  fail-open (GraphQL never returns null for an open PR's `mergeable`).
+- **Mergeability is display-only for readiness.** `MERGEABLE`, `CONFLICTING`,
+  and `UNKNOWN` never change PR queue membership, card lifecycle, or source
+  permission policy. A conflicted green PR is merge-ready; GitHub's lazy
+  `UNKNOWN` calculation is not polled or frozen. Auto-merge G4/G7 remains
+  clean-state-only. See `wheelhouse_core.classify` and
+  `tests/test_merge_conflict.py`.
 - **Approve safe fork CI, wait for terminal checks, then classify.**
-  `build_repo` reports freshly approved and `ci-running` contributor PRs in `ci_wait_pr_numbers`, and reconcile freezes their existing `PR_KINDS` cards against self-heal consumption just like `indeterminate_pr_numbers`.
+  `build_repo` reports freshly approved and `ci-running` contributor PRs in `ci_wait_pr_numbers`, and reconcile freezes their existing `PR_KINDS` cards against self-heal consumption until checks become terminal.
   Author-excluded, unsafe or unverifiable, and verified-noop PRs are not frozen; approval eligibility remains the shared `ci_safety` verdict plus head verification.
-  `ci_wait_refresh_items` are refresh-only `pr-review` items: reconcile may use one to update an existing same-kind pure `needs-decision` card to the observed head's non-green state, but must never create a card or queue triage for that transient revision.
-  Terminal checks release the freeze and resume normal classification.
+  `ci_wait_refresh_items` are refresh-only `pr-review` invalidation candidates: reconcile may use one to update an existing same-kind pure `needs-decision` card, but must never create a card or queue triage for that transient revision.
+  The bulk scan attaches `wheelhouse.review-observation/v2`; every attempted approval also emits a head-bound `wheelhouse.target-action-receipt/v1`. Approved or uncertain effects invalidate approval phase, check phase, comp, tests, and bucket. The provisional item therefore never repeats `needs-ci-approval` after a successful receipt.
+  Before any existing CI-wait card write, reconcile re-reads the exact PR under `WHEELHOUSE_FLEET_TOKEN` through `wheelhouse_core.observe_exact_pr`, which uses the same complete-context `check_status` reduction, independent action-required enumeration, and normal classifier as scan. It restores the default card token before `render_card.upsert_card`; card snapshot CAS remains unchanged.
+  A complete terminal reread uses normal classification; a complete non-terminal reread projects `ci-running` with an as-of time. Incomplete, failed, ambiguous, or expected-head-mismatched reads project explicit `ci-state-unknown`/unknown values against the actually observed head and never claim current green or current approval-needed state. A successful same-head approval receipt can never project `needs-ci-approval`.
+  The rendered card persists `wheelhouse.card-projection-ref/v1` and visible current/pending/unknown as-of wording. Terminal checks observed on the next bulk scan still release the freeze and resume normal triage/lifecycle handling.
   Wheelhouse can first observe a target head change through the best-effort hourly `scan-backstop` or an optional source-repo `repository_dispatch`; neither is guaranteed before the next scan.
   At or after the first successful observation-driven refresh, a card cannot display the old head as current; before then, and after a failed corrective refresh, acting paths remain safe because the decision-handler rechecks the pinned head SHA.
-  See `tests/test_ci_autoapprove.py` for emission and `tests/test_reconcile.py` for refresh, freeze, and release coverage.
-- **Merge conflicts leave the maintainer queue.**
-  `wheelhouse_core.py` fetches GraphQL `pullRequests.nodes.mergeable` and treats only `CONFLICTING` as authoritative.
-  An explicit `UNKNOWN` is a pending value - see the UNKNOWN-pending bullet above for the merge-ready/review-needed settlement poll and membership freeze that prevent oscillation.
-  A missing value alone still fails open, so the PR classifies normally until a later scan can prove a conflict.
-  A conflicting PR that would otherwise route to `merge-ready` or `review-needed` becomes waiting-on-contributor `needs-rebase`, which is intentionally absent from `NEEDS_MAINTAINER`.
-  This never rewrites `needs-ci-approval`: fork CI approval is independent of whether the eventual merge would conflict, and issue triage is unrelated.
-  On the `ok:true` scan path, `build_repo` posts a contributor nudge under `FLEET_TOKEN` for non-owner/non-maintainer/non-bot `needs-rebase` PRs.
-  The nudge body carries hidden marker `<!-- wheelhouse-rebase-nudge:<head_sha> -->`; before posting, Wheelhouse paginates the PR comments and skips if that marker already exists, so it posts at most once per conflicted head SHA and can nudge again only after a new push creates a new head.
-  If stale pending-contributor cleanup is active for PRs, a newly posted
-  `needs-rebase` nudge is
-  patched with a structured `wheelhouse-pending-contributor-action` marker and
-  the target gets `wheelhouse:pending-contributor-action`; if the nudge comment
-  response lacks a comment id or timestamp, the cleanup arming fails open with a
-  warning and the nudge remains posted.
-  If comment lookup or posting fails, the scan logs a warning and still emits no card; it never posts without first checking for the current marker.
-  The PR stays in `open_pr_numbers` but drops out of `items`, so `reconcile.py` advances any existing pure `needs-decision` card through the fixed soft-close lifecycle documented in the state-block contract above.
+  See `tests/test_ci_autoapprove.py` for receipts/emission, `tests/test_target_observation.py` for contracts/planning, `tests/test_target_reconcile_transaction.py` for production-composed timed transitions, and `tests/test_reconcile.py` for refresh, freeze, and release coverage.
+- **Conflicts stay captain-owned.** Wheelhouse never asks a contributor to
+  rebase, never sends a rebase reminder, and never closes for rebase inactivity.
+  With `assisted_merge` off (the shipped and this repo's committed default) a
+  manual `/merge` conflict stays retryable with captain-facing copy.
+  Auto-merge remains clean-state-only in every configuration.
+
+- **Assisted in-place merge is captain-initiated, zero-novel-line, and
+  push-confined** (`scripts/merge_assist.py`, `.github/workflows/merge-assist.yml`).
+  The captain's own `Merge it`/`/merge`/NL-merge decision on a conflicted PR
+  returns terminal `none` (card stays pure pending) plus an `assisted_merge`
+  output; `decision-handler.yml` then dispatches `merge-assist.yml` with
+  `github.token`, exactly like Investigate and for the same recursion-barrier
+  reason. The assist resolves the conflict as a merge commit on a
+  same-repository or editable personal fork's EXISTING PR head branch - never a
+  landing branch, a replacement PR, a force push, or a rewrite of their commits
+  (first parent is their head; a `Co-authored-by` trailer credits them from a
+  trusted numeric-id read).
+  Stage order, each failing closed: `bind` (exact live re-read, `derive_pushability`
+  must be `same-repository` or `personal-fork-editable`, base must be the default branch,
+  `apply_decision._workflow_merge_gate` must be clear, non-maintainer human
+  author, `wheelhouse:no-assisted-merge` absent, repo opted in) -> durable
+  `agent_claim` on `merge.resolve-conflicts` keyed by (target, card, head), so
+  there is exactly ONE assisted attempt per head -> `prepare` (credential-light
+  fetch of the BASE repo, which serves the head as `refs/pull/N/head`, so no
+  fork credential exists in that job; `git merge --no-ff --no-commit` with
+  `merge.conflictStyle=merge` and `core.hooksPath=/dev/null`) -> admission ->
+  one bounded model turn -> `apply` -> `push` -> `record`.
+  **The model never authors a line.** Its whole vocabulary is a per-hunk
+  selection from `SELECTIONS` (`ours`, `theirs`, `ours-then-theirs`,
+  `theirs-then-ours`) or `cannot_safely_resolve`; trusted code rebuilds each
+  file from the mechanical merge skeleton plus exact parent lines, then proves
+  no unmerged entry, no marker, no file outside the conflict set, and a clean
+  `git diff --cached --check`. The `merge-resolve-v1` schema has no field
+  through which text could arrive.
+  Admission escalates BEFORE spend on: `core._auto_merge_exclusions` hits, any
+  non-`UU` status, any mode outside `100644`/`100755`, differing stage modes,
+  binary/non-UTF-8/LFS content, an unparsable hunk, the per-repo file/line caps,
+  the result schema's hunk-row capacity, and a
+  merge-base-to-base advance that touches `.github/workflows/**` (neither token
+  has `workflow` scope). The resolve job independently reproduces the merge and
+  refuses unless the conflict inventory digest matches what the model saw.
+  **Push credential:** an editable personal fork uses
+  `ASSISTED_MERGE_PUSH_TOKEN` (the repository owner's own short-lived classic
+  `public_repo` PAT - deliberately NOT a bot account); a same-repository branch
+  uses the existing fine-grained `FLEET_TOKEN` with Contents write. After the
+  source mode and selected credential presence are validated, a target-claim
+  step isolated from the push credential reads the public source ref anonymously
+  and uses `FLEET_TOKEN` to apply and verify the confirmation label. A separate
+  process receives only the selected push credential and performs the final
+  plain, non-force `git push` through `GIT_ASKPASS`, never
+  argv/config/helper/log/model/artifact. Trusted code re-reads the remote ref and
+  requires the exact expected old SHA immediately beforehand; `--force` and
+  `--force-with-lease` are both forbidden. An absent secret fails before any target mutation with an operator
+  message. Before the push, the target PR receives
+  `wheelhouse:awaiting-captain-confirm`; the exact label and unchanged head are
+  verified before the clean resolution head can be pushed. Failure or unreadable
+  evidence denies the push. The GraphQL fork identity that grants eligibility
+  must match the independent REST repository/ref coordinates exactly before the
+  push target is admitted. Scan-time auto-merge denies both the target label
+  and a current bound awaiting-confirmation card record at preclaim and G7;
+  incomplete or unreadable label evidence also denies. The label is advisory:
+  it does not block GitHub-native auto-merge or a raw human merge. That residual
+  is accepted because native auto-merge must be deliberately armed and a human
+  merge against a visible label is deliberate; Wheelhouse's own uncontrolled
+  scan-time path is blocked.
+  Nothing merges from the workflow: the versioned NON-MATERIAL `merge_assist`
+  card record (`render_card.normalize_merge_assist`, bound to the decided head
+  and the resolution head, carried across refreshes by `carry_merge_assist` in
+  `card_projection.plan_card_projection`, written only through
+  `render_card.record_merge_assist` -> `projection_writer.commit_preplanned`)
+  renders a `### Assisted merge` section and the captain makes a SECOND
+  `Merge it` decision. Before the card refresh binds the resolution head, the
+  section is inert and a mistimed decision returns terminal `none`. Confirmation
+  authority comes from the live target label plus a complete live proof that the
+  current head is a two-parent merge commit whose first parent is the preceding
+  PR head and whose second parent is an ancestor of the live base. The card record
+  is secondary display and denial state, so a deferred or unavailable card write
+  cannot strand confirmation. Escalated records distinguish proven-not-pushed,
+  proven-pushed, and uncertain push outcomes so a state-file failure after the
+  push never produces a false captain-facing claim. A successful merge removes
+  the target label best-effort. Bounded
+  auto-proceed is deliberately NOT implemented and remains a separate captain
+  decision. Config is opt-in and fail-closed: `assisted_merge` (default off in
+  code AND in this repo's committed config),
+  `assisted_merge_max_conflict_files` (default 5), and
+  `assisted_merge_max_conflict_lines` (default 200), all per-repo overridable.
+  Covered by `tests/test_merge_assist.py`, which runs the resolution end to end
+  against a real local git repository.
+
+- **Fork source permission policy.** Bulk and exact reads derive a material
+  `pushability` fact. A personal fork with `maintainerCanModify: true` is the
+  only fork candidate for the assisted in-place path. Organization-owned,
+  explicitly non-editable, or proven non-fork sources are policy-rejected.
+  Unavailable or deleted-looking source metadata remains unverified and can
+  never authorize contact or closure. The ordered Phase 0 transaction is exact
+  source proof -> FLEET_TOKEN notice ->
+  github.token audit card -> exact source proof -> FLEET_TOKEN close -> atomic
+  terminal card record. Incomplete source facts are a retryable, inert
+  `pushability-unverified` card - no CI approval, model work, contributor
+  comment, or closure. `scripts/maintainer_edits_policy.py` owns the ordered
+  notice/close transaction; `CONTRIBUTING.md` owns the disclosure. The Phase 0
+  policy transaction must remain credential-free. README.md's "Assisted-merge
+  push credential" section owns the assisted path's credential and confinement contract.
+
 - **Scan-time fork-CI auto-approve (kill the routine "approve CI" click).** One
   shared `ci_safety(slug, pr, repo_posture)` verdict is the single security
   definition; `approve_ci` uses it too, so the auto path is a STRICT SUBSET of the
@@ -878,25 +1033,14 @@ still appears where it's plain English, e.g. "triage the queue".)
   `review-needed`, while unknown fork status fails safe by raising a manual
   `ci-approval` card with no auto-approve attempt for contributor-authored PRs
   and by logging `suppressed-card` for owner, maintainer, and bot-authored PRs.
+  The exact-current-head discovery and per-run approval contract lives in [README.md's Security notes](README.md#security-notes); `tests/test_ci_autoapprove.py` guards the masked-context, duplicate-run, and unchanged safety-boundary regressions.
   An `approve_ci` `noop` is a verified "nothing awaiting approval" state, so the
   scan emits no worklist item and reconcile starts the fixed soft-close lifecycle documented in the state-block contract above for any stale card; if a real
   pending run appears on a later scan, the normal approve/card/suppressed-card
   path runs again.
-  **Exception for a conflicted fork with no CI:** `needs-ci-approval` is never
-  rewritten to `needs-rebase` (classification stays independent of mergeability),
-  so a noop-consumed fork PR with null `statusCheckRollup` would otherwise
-  drop silently with neither a card nor a rebase nudge. When the handled path is
-  specifically `approve_ci` `noop` AND settled mergeability is `CONFLICTING`,
-  `build_repo` posts the same fire-once-per-head contributor rebase nudge the
-  `needs-rebase` path uses, then still emits no card. An `approved` path (PR
-  actually has workflows) is unchanged; `UNKNOWN` mergeability is settled before
-  the nudge and never nudges until conclusive `CONFLICTING`; missing mergeable
-  fails open (no nudge). A settlement-query error marks the repo scan unhealthy,
-  so reconcile preserves existing cards instead. This exception deliberately
-  passes `arm_cleanup=False`, so it never arms pending-contributor cleanup.
+  A verified `approve_ci` `noop` remains a no-card result; mergeability never
+  adds a contributor contact, a rebase cleanup record, or a scan freeze.
   Fork-originated `action_required` workflow runs are expected to have an empty `workflow_run.pull_requests` list, so `approve_ci` verifies that fork case with the already-filtered run's exact `head_sha` plus `head_branch`; non-empty `pull_requests` stays strict and must contain exactly the target PR.
-  After verification, `approve_ci` dedups matching pending runs by stable `workflowDatabaseId` when GitHub exposes it, keeps the highest `databaseId`, and leaves same-named distinct workflows or runs without workflow identity distinct.
-  This dedup happens after the risky-files/posture safety gate, so it never weakens the HOLD path.
   **Observability (every outcome is logged, never silent).** `_auto_approve_or_card`
   returns `(handled, card_note, log_note, approve_status)` and `build_repo` emits exactly ONE
   stderr line per `needs-ci-approval` PR the auto path handles: a `::notice::`
@@ -997,13 +1141,28 @@ still appears where it's plain English, e.g. "triage the queue".)
   G6 a fresh structured `automerge_verdict` for the CURRENT head SHA
   (`verdict_eligible`) assigning an eligible A/B/C class, confirming vision
   alignment, ruling out an ineligible existing/default behavior change, and
-  recommending merge (class C also requires an explicit strictly-opt-in + default-off flag).
-  G7 is an immediate live re-check of head SHA, base SHA, default-branch VISION.md SHA, mergeable, clean state, and configured compliance/test contexts right before `do_merge`.
-  Any missing/stale/malformed/uncertain/unreadable input HOLDS for human review (fail-closed), and an ok:false / truncated / `indeterminate_pr_numbers` repo is frozen exactly like reconcile.
+  recommending merge. Class B additionally requires corrected-defect and
+  restored-behavior claims backed by verbatim-verified exact-source evidence;
+  semantic judgment (faithfulness, restoration object, contract change) is the
+  triage model's attested responsibility taught by the prompt, while trusted
+  code validates only mechanics - schema shapes, the shared quote byte policy,
+  verbatim span binding, distinct verified references - and derives the
+  contradiction record solely from the model's own declared assertion enums
+  (captain decision, card #2148: no vocabulary lists or token grammars in
+  trusted admission). Contradictory and historical verdicts cannot bypass it.
+  Class C also requires an explicit strictly-opt-in + default-off flag. The
+  detailed schema and normalization contract live in `docs/AGENT_RUNTIME.md`.
+  The complete scan must also prove that no other open PR closes an issue closed by the candidate: `same_closing_issue_overlap` carries the existing `_overlap_note` result into eligibility, and a missing, malformed, or non-empty fact holds before claim or act.
+  Before any action-lock mutation, `preclaim_candidates` evaluates complete G0-G6 read-only under the fleet token. Denied or unavailable candidates receive no card write. Only exact preclaim passers can be claimed under the default card token; action mode then rereads the card and reevaluates authoritative gates under claim.
+  G7 is an immediate live re-check of head SHA, base SHA, default-branch VISION.md SHA, mergeable, clean state, configured compliance/test contexts, and same-closing-issue overlap right before `do_merge`.
+  The overlap re-read uses `wheelhouse_core.same_closing_issue_overlap`, which strictly re-lists every open PR and reuses `_closing_issue_numbers`, `_closing_map`, and `_overlap_note`; any unreadable, incomplete, malformed, duplicate, or raced result holds in the final `do_merge` guard.
+  Any missing/stale/malformed/uncertain/unreadable input HOLDS for human review (fail-closed), and an ok:false or truncated repo is frozen exactly like reconcile.
   `evaluate_candidate` returns one ordered structured criterion result using the stable schema in `automerge_criteria.py`; action decisions consume those same facts, while `collect_card_criteria` runs a read-only full evaluation for rendering.
   `scan-backstop` passes that head-bound result through `automerge.json` to `reconcile.py`, and `render_card.py` shows every row as `MET`, `UNMET`, or `UNAVAILABLE` with concise evidence.
-  Criterion state is non-material and never read as authorization; action mode always re-evaluates fail-fast with an exclusive card claim, and G7 plus the unchanged `do_merge` workflow-touch gate still run immediately before merge.
+  Every v2 PR-review triage mutation other than the no-trusted-source security fallback plans one complete result through `render_card._atomic_automerge_card_body` and commits title/body/managed labels through `projection_writer.py`. A terminal result first persists one visible durable exact-revision `assessment_record`; scheduled reconcile retries a missed projection without another reservation or model call. The fallback runs only when the trusted source is unavailable, so it cannot load code or perform fleet reads; it clears the queued cache under the default card token and renders a visible `### Triage` security-fallback warning that any temporarily stale criteria reflect the prior queued state until trusted card maintenance resumes.
+  Criterion state is non-material and never read as authorization; action mode reevaluates under an exclusive card claim, and G7 plus the unchanged `do_merge` workflow-touch gate still run immediately before merge.
   Missing historical criterion data renders every row explicitly unavailable, while a changed fresh result triggers only a display refresh through `automerge_criteria_stale`.
+  Every criteria-carrying card write recomputes the two admission-dependent G6 rows (`g6_triage_success`/`g6_merge_recommendation`) from the exact state it stores via the shared `render_card.triage_admission_facts`, and the staleness compare applies the same recompute, so one edit is always self-consistent and a lagging scan snapshot cannot loop (card #2148; contract in `docs/OPTION_B_CARD_PROJECTION.md`).
   A final `apply_decision._workflow_merge_gate` result of exactly `history-only-workflow-touch` after G2's complete clean net diff creates the separate NON-MATERIAL `automerge_workflow_hold` record and `wheelhouse:manual-merge-required` label/section for that head.
   The matching hold makes claim skip before any processing label, displays G7 as `UNMET`, and is preserved by same-head card maintenance and trusted soft-close reuse; a normal authoritative new-head or incompatible-kind refresh drops it with stale triage/verdict state.
   This is denial-only and remains refreshable, never generic `blocked`: `do_merge` still performs the authoritative history read for every actual merge, while unreadable/incomplete or net-diff workflow cases retain their existing generic fail-closed paths and never establish this proven-history hold.
@@ -1013,11 +1172,12 @@ still appears where it's plain English, e.g. "triage the queue".)
   A target repository without GitHub's "require branches to be up to date" branch protection has an irreducible sub-second window between those final GETs and GitHub's merge PUT: GitHub's merge API accepts no base-SHA precondition.
   That residual risk is bounded by the final CLEAN state, green configured checks, blast-radius caps, and unconditional exclusions.
   Enabling "require branches to be up to date" branch protection, or using a merge queue, closes it server-side because GitHub's `mergeStateStatus` becomes `BEHIND` while auto-merge requires a CLEAN merge state.
-  The behavior verdict is PRODUCED by extending the pr-review triage
-  (`triage.yml` fetches base-branch VISION.md - the contents API with NO `?ref`,
-  never the PR head, so a PR editing VISION.md cannot bless itself, and VISION.md
-  is also a G2 exclusion - and asks for the A/B/C fields;
-  `render_card.normalize_automerge_verdict` parses them) and PERSISTED as the
+  The behavior verdict is PRODUCED by extending the pr-review triage.
+  For every complete immutable diff, `triage.yml` asks for the VISION-independent behavior class, existing/default-behavior-change, and class-C opt-in/default-off facts, plus typed `behavior_assertions` and the bounded, claim-specific `class_b_restoration` evidence when the class is B.
+  `render_card.normalize_automerge_verdict` owns semantic admission, and `auto_merge.behavior_verdict_facts` revalidates its versioned result for both criteria display and acting; see `docs/AGENT_RUNTIME.md` for the detailed contract.
+  It fetches base-branch VISION.md through the contents API with NO `?ref`, never the PR head, so a PR editing VISION.md cannot bless itself, and VISION.md is also a G2 exclusion.
+  Only when that trusted policy exists does triage additionally ask for alignment and the final merge recommendation; `render_card.normalize_automerge_verdict` parses the independent core plus that optional all-or-nothing extension.
+  The result is PERSISTED as the
   NON-MATERIAL `automerge_verdict` state key alongside `triage_recommendation`
   (never in `MATERIAL_FIELDS`, cleared on any failed/stale attempt, carried
   through same-revision refresh). Token discipline mirrors the rest of the fleet:
@@ -1035,7 +1195,8 @@ still appears where it's plain English, e.g. "triage the queue".)
   holds), and a per-PR `wheelhouse:no-auto-merge` target label
   (`NO_AUTO_MERGE_LABEL`). Wheelhouse NEVER auto-reverts. By captain override V1
   DELIBERATELY has NO open-PR file-overlap gate and NO per-contributor/per-scan
-  rate cap - their absence is intentional and asserted by
+  rate cap - their absence is intentional and distinct from the required
+  same-closing-issue ambiguity hold, and is asserted by
   `tests/test_auto_merge_v1.py` (which also covers every gate, A/B/C handling,
   malformed/stale verdicts, the 20-file/1000-line boundaries, base-branch-only
   VISION reads, the self-authorization exclusion, live re-checks, the audit
@@ -1044,8 +1205,12 @@ still appears where it's plain English, e.g. "triage the queue".)
   actor duality: REST issue rows use `github-actions[bot]`, while
   `render_card.get_card` returns `app/github-actions` from GraphQL.
   `auto_merge._canonical_card_author` may map only that exact GraphQL spelling to
-  the REST spelling at the `_trusted_card_identity` boundary.
-  It must not strip prefixes, fold case, or accept any other alias.
+  the REST spelling at the `_trusted_card_identity` boundary, and
+  `projection_writer._canonical_automation_author` performs the same
+  exact-spelling mapping where the writer compares its REST lifecycle
+  expected snapshot against the `get_card` reread (the closed-card reuse
+  preparation path).
+  Neither may strip prefixes, fold case, or accept any other alias.
   Keep the regression fixtures in `tests/test_auto_merge_v1.py`
   `get_card`-shaped, with `author` as a `{"login": ...}` dict.
 - The `repository_dispatch` event type is `wheelhouse-item`, but `ingest.yml`
@@ -1115,21 +1280,39 @@ still appears where it's plain English, e.g. "triage the queue".)
 
 All agent-assisted paths now share Agent Runtime Contract `wheelhouse.agent-runtime/v1alpha1` as the provider-portability boundary.
 The contract, action schemas, pinned Codex app-server protocol, capability negotiation, canonical tools, brokers, sandbox supervisor, adapters, consumers, and tests live under `agent_runtime/`, with the trusted CLI at `scripts/agent_runtime.py` and operator runbook at `docs/AGENT_RUNTIME.md`.
-Claude is the named production primary, and every action resolves `target: claude` to the exact pinned direct Claude Action profile.
+Every model-facing byte bound - schema maxima vs `maxFinalBytes`, repair-candidate retention, prompt budgets, and the NL trusted-history inline budget - is owned by the one `agent_runtime/size_budget.py` table ("Size budgets" in `docs/AGENT_RUNTIME.md`, property-tested by `tests/test_size_budget.py`); never copy a size constant into a consumer.
+Claude is the named production primary.
+The two schema-repair actions resolve to the direct `claude-cli-pinned` profile, while the other nine actions remain on `claude-action-current-pinned`.
+`agent_runtime/config.py` guards that exact split, and `temporary_rollback_profile` is the reviewed one-setting rollback for an explicit durable replay.
+In production, `nl-decision.schema-repair` is the only schema-repair TASK still built: the triage correction turn reuses the ORIGINAL triage action (built by `build_correction_task` under the unchanged `triage.schema-repair` claim identity), so `triage.schema-repair` remains configured, guarded, and deployable as the disabled codex inline evidence plus rollback surface without being selected by the claude lane.
 Codex CLI `0.144.0` app-server remains implemented and tested only as disabled non-target adapter evidence because the current ChatGPT Pro plus public-repository topology has no supported secure noninteractive subscription path.
 No Codex secret is requested, no action targets Codex, and current selection cannot reach a Codex workflow installation path.
 Provider environment overrides are rejected; secret presence cannot select a provider, model, effort, billing path, or stronger tool policy.
 OpenCode with Z.AI Coding Plan is a deferred disabled candidate only; no adapter, provider call, credential request, target, fallback, or provider-specific runtime-core policy is authorized in this phase.
 Fallback remains disabled.
 
-The seven current direct Claude Action invocations are the explicit production adapter path behind the unified selection boundary.
-They run only in the separately permissioned `claude-model.yml` workflow after a trusted parent job uploads a bounded content-addressed `AgentTask` handoff.
-Every direct step is conditional on the resolved Claude mode, and no provider failure can trigger a different adapter.
+Every spend-capable event first creates a durable default-token card claim keyed by `agent_runtime.admission.normalized_event_identity`: issue triage binds action plus exact target revision; PR triage and its correction also bind the queue-authorized review-context digest and any checked-in one-use recovery digest; NL additionally binds the exact comment ID; deep review binds its normalized trigger identity; and assisted conflict resolution binds the exact target, card, and PR head.
+Existing workflow concurrency serializes same-event claim creation, duplicate delivery exits before task construction, and consumers edit the claim rather than creating duplicate model-result comments.
+AgentTask `idempotencyKey` is the normalized event-key hash.
+Content-free `wheelhouse-agent-stage` records begin at admission and bind action, Wheelhouse source SHA, event-key hash, and execution ID when available; they never carry prompt, comment, target, search, or credential content.
+
+The nine pinned Claude Action steps remain present and deployable behind the unified selection boundary; seven serve the non-repair actions (and the triage correction turn, which rides the original action's own step), and two are the schema-repair rollback path.
+One direct supervisor step serves both schema-repair actions because they share the same one-turn, no-tool profile.
+They run only in the separately permissioned `claude-model.yml` reusable workflow after a trusted parent job uploads a bounded content-addressed `AgentTask` handoff.
+Each local reusable-workflow call resolves from the caller's exact commit and also passes that commit as `expected_commit_sha`; the model job must observe the same `GITHUB_SHA` before hydration, checkpointing, or provider execution.
+Every invocation step is conditional on the admitted adapter and action, and no provider failure can trigger a different adapter.
 Those production steps share the same Claude **subscription** token from `claude setup-token`, never an Anthropic API key.
-Every production step remains pinned to `anthropics/claude-code-action` `v1.0.161` at commit `fad22eb3fa582b7357fc0ea48af6645851b884fd` and passes the immutable `--model claude-sonnet-4-6` identifier.
+Every action step remains pinned to `anthropics/claude-code-action` `v1.0.178` at commit `af0559ee4f514d1ef21826982bed13f7edc3c35e` (Claude Code `2.1.215`, Agent SDK `0.3.215`) and passes the immutable `--model claude-sonnet-4-6` identifier.
+The direct schema-repair lane pins `ubuntu-24.04`, installs and verifies the exact Bubblewrap package from `runtime.lock.json`, proves a minimal namespace before provider admission, verifies Claude CLI `2.1.215`, passes the OAuth token only through a private file into the Claude child environment, and uses the existing Bubblewrap supervisor with native structured output and zero tools.
 Trusted preflight builds an immutable `AgentTask`, and the post-action bridge requires the execution transcript's observed `system/init.model` to match before it emits an atomic `AgentResult`.
-The model workflow has only `actions: read` and `contents: read`, receives no `FLEET_TOKEN`, verifies the complete handoff into a fresh workspace, and enables the pinned action's subprocess isolation.
-Trusted parent jobs retain default-token card writes and `FLEET_TOKEN` target operations outside the model boundary, supervise the hard deadline, and normalize only a task-bound transcript plus observed enforcement record.
+Repository inputs are packaged by `agent_runtime/task_builder.py` from the exact bound Git commit (object DB + clean index/worktree), not from live filesystem shape: ordinary `100644`/`100755` blobs are included; committed relative mode `120000` links are materialized as regular bounded content (file links copy the target blob; directory links expand committed descendants under the alias path, with alias bytes/files counted); mode `160000` gitlinks are rejected; absolute/traversal/broken/cyclic/dirty/untracked links fail closed; no live symlink may reach the handoff or model workspace (post-snapshot handoff rejection stays).
+A source checkout may be branch-attached because `actions/checkout@v4` checks an external repository's default branch out with `git checkout -B`; exact HEAD equality plus clean pre/post conditions bind that production issue-triage shape, while AgentTask `git.detached` describes the emitted content-addressed snapshot.
+See `tests/test_agent_runtime_repo_snapshot.py`.
+The model workflow has only `actions: read` and `contents: read`, receives no `FLEET_TOKEN`, and verifies the complete handoff into a fresh workspace.
+Its finalizer re-verifies the handoff, normalizes action results or accepts only the direct supervisor's atomic result, enforces task/profile binding, then exposes only a bounded verified result artifact to the trusted caller-side consumer.
+The reusable model job owns the task-bound execution timeout; its finalizer normalizes only a task-bound action transcript plus observed enforcement record, or accepts the direct supervisor's atomic result.
+The pinned claude-code-action owns its model process, so the task-bound job timeout must include setup and finalization overhead. Terminal triage errors do not self-heal or retry automatically; the operator-run exact-card replay remains their recovery path. `docs/AGENT_RUNTIME.md` owns the detailed deadline policy; `tests/test_agent_runtime_child_timeout.py` pins its per-action values and single-owner wiring.
+Trusted caller-side jobs retain default-token card writes and `FLEET_TOKEN` target operations outside the model boundary and accept only the verified normalized result artifact.
 
 The shared injection model remains unchanged: only trusted workflow prompts and owner/maintainer-authored text are instructions; target content and optional search output are delimited untrusted data; and no model process receives `FLEET_TOKEN`.
 
@@ -1137,30 +1320,37 @@ The shared injection model remains unchanged: only trusted workflow prompts and 
   pr-review is opt-out through `auto_triage`; issue-triage is opt-out through the INDEPENDENT `auto_triage_issues` - both global default true, per-repo override allowed, and both inert unless `CLAUDE_CODE_OAUTH_TOKEN` is present. Neither flag affects the other.
   For a pr-review card it checks out the target PR head read-only with `FLEET_TOKEN`, `persist-credentials: false`, and verifies the head did not move since queueing.
   For an issue-triage card it checks out the repo's DEFAULT branch read-only the same way (same substrate `deep-review.yml` uses for an issue card) - there is no head to verify.
-  Both paths then run Claude with lower `--max-turns` than deep-review to produce structured `{summary, product_implications, recommended_action, recommended_reason, evidence}` context; the issue-triage prompt fetches the issue's title/body/comments (no diff), the pr-review prompt the PR title/body/diff, each with its own action set.
+  Both paths then run Claude with lower `--max-turns` than deep-review to produce structured `{summary, product_implications, recommended_action, recommended_reason, evidence}` context; the issue-triage prompt fetches the issue's title/body/comments (no diff), the pr-review prompt the PR title/body/diff, each with its own action set. PR triage still requires a complete native ReviewObservation and exact observation binding, but a well-formed bound `truncated` or `unavailable` related-work context may run as visible advisory prose. `assessment_admission.py` remains strict about the target - exact observation/head binding, observation completeness, and check-basis truth - while DecisionContext status, content, or `context_id` rotation never creates or withholds Accept, G6, or action authority. The model sees related candidates only through `decision_context.compact_model_context`: deterministic status/counts plus at most 10 concise titles and full URLs, never relation records, bodies, diffs, paths, heads, or card metadata.
   **Pass-by-reference prompt (do not reinline).**
   The runner writes verified target content to bounded `target.txt`, checks out code at `target-src/`, and names those files in a small, target-size-independent prompt for Read/Grep/Glob; target content and `vision.md` must never be copied into the action `prompt:` input.
   `DIFF_COMPLETE` means the whole non-binary/LFS/submodule diff is present within the 1,500,000-byte on-disk cap; truncation fails closed with no auto-merge verdict.
   Required `evidence` is validation-only: `normalize_triage` rejects missing evidence, and `triage-apply` anchor-checks it against `target.txt`, failing open only when that file cannot be read.
   `tests/test_triage_prompt_size.py` owns the structural regression checks.
-  Trusted code still renders the visible `### Triage` section, including a human-readable Recommended next step line, with `github.token`, never by Claude directly, and labels known harness polling/status transcript lines as automated status.
+  Trusted code still renders the visible `### Triage` section with `github.token`, never by Claude directly, and labels known harness polling/status transcript lines as automated status.
+  That section carries analysis only - summary, product implications, and the honest primary-failure/admission warnings - never the model's advisory action (see "One canonical recommendation surface" in Sharp edges).
   When the structured action is fresh, successful, per-kind allowlisted, and has any required reason text, trusted code persists `triage_recommendation` and may add the `Accept recommendation` checkbox.
   The result is advisory until the owner/maintainer ticks that checkbox, at which point `apply_decision.py` maps it to an existing deterministic action with the same guards.
   Apart from publishing a held card's own `pending-triage` label and placeholder decision section, plus that conditional accept shortcut, it never changes classification, managed labels, merge/close/approve behavior, fork-CI safety, author filtering, or conflict routing.
   Before dispatch, the queueing path writes `triaged_sha=<current revision>` and `triage_status=queued`, so errors and timeouts fail open without retriggering the same revision on every scan.
   Existing open cards of either kind with no `triaged_sha` are intentionally stale and backfill once on the next eligible scan.
   Optional `READONLY_TOKEN` search uses the unchanged `wheelhouse-search` wrapper and remains untrusted evidence only.
+  On the exact `triage.pr.search` action, the wrapper's existing bounded anonymous `public_clone` operation lets the model act as the independent reviewer for applicable trusted VISION source criteria. The structured verdict distinguishes local-only policy from external-source-dependent policy. An external-source-positive verdict must match the trusted post-turn URL/ref/commit/manifest record and exact-file SHA-256 observations that `verify_public_clone_claims` derives by re-cloning and independently observing each successful in-turn claim; failed claims are not cloned again, and their records contain only re-validated source values plus a trusted failure token. Missing, forged, failed, ambiguous, mismatched, or unobserved evidence drops the VISION-positive fields. Contributor assertions are leads, never independent evidence. This is source-only: target, cloned, and package execution remain forbidden, and requirements exceeding that capability fail closed.
+  **Nothing in a model turn may require privilege (cards #2320/#1483/#1676/#1398).** Wheelhouse sets `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"` on every pinned Claude action step, which makes Claude Code wrap EVERY model Bash command in `bwrap --unshare-user --cap-drop ALL --unshare-pid`; `sudo` and every other escalation is impossible there. A `sudo`-based provenance write inside the broker therefore failed on both the success and failure paths, converting every completed clone into `trusted public clone provenance recording failed` and blocking all axi catalog vision verdicts. Trusted state a model turn produces must be verified AFTER the turn instead: `nl_readonly_search.verify_public_clone_claims` re-clones successful claims in the trusted post-turn step and independently derives their recorded facts; failure records contain only re-validated source values and a trusted failure token. Bookkeeping must also never replace a real error - the failure path records best-effort and re-raises the original. Guarded by `tests/test_public_clone.py` (`test_sandboxed_turn_never_escalates_privilege`, `test_post_turn_verification_owns_every_recorded_fact`) and the catalog acceptance case in `tests/test_public_clone_e2e.py`.
+  **A non-empty prose `VISION.md` is sufficient and is the documented opt-in** (README, `docs/ONBOARDING.md`, `wheelhouse.config.yml`). Vision alignment remains the model's attested semantic judgment; the optional `wheelhouse-vision-source-dependencies` declaration only narrows admission when one of its criteria applies. `docs/AGENT_RUNTIME.md` owns the complete declaration and binding contract, and `tests/test_automerge_card_ui.py` owns the regression matrix. The vision-bound UNAVAILABLE rows and the card's `_needs VISION.md_` hint are driven by the card's `triaged_vision_sha` and the actual `g0_vision_present` result, never by a substring over child evidence.
   The Claude action allows only `github-actions[bot]`, never `*`, because scan/ingest dispatches use `github.token`.
   `render_card.py triage-apply`/`triage-fail` take a kind-agnostic `--revision` CLI argument (a PR's head SHA or an issue's `updated_at`), replacing the old pr-review-only `--head-sha` flag name.
   Result delivery is independent of transcript retention: `triage-result` extracts the compact final result event before applying the 262144-byte cap solely to the retained debug transcript.
   `tests/test_triage_result_delivery.py` guards this ordering and the uncapped direct extraction in `deep-review.yml`.
-  When a DELIVERED result then fails parse/normalize (the #551/#547 schema-miss class - NOT a missing result), a single bounded, tokenless, no-tool `claude_repair` turn reshapes the candidate to the required schema; the repaired output is re-validated (same parse/normalize + evidence-anchor guards) or the card lands on the visible triage-unavailable error carrying the structural reason - see "Bounded schema repair" in Sharp edges and `tests/test_triage_schema_repair.py`.
+  The single context-equivalent triage correction and its authority rules are
+  owned by `docs/AGENT_RUNTIME.md`; see
+  `tests/test_triage_schema_repair.py` for regression coverage.
 - **`deep-review.yml` - ALWAYS-ON, code-grounded (no enable flag).** Triggered by ticking the **Investigate** box on a card, by the repo owner applying the `needs-deep-review` label, or by the repo owner running `workflow_dispatch` with only `issue=...` for direct verification.
   Bot-dispatched Investigate runs use the immutable target inputs passed by `decision-handler.yml`; owner issue-only runs and manual label runs parse the current card body with `github.token`.
   It checks out the TARGET's code read-only (`FLEET_TOKEN`, `persist-credentials: false`, the PR head for a review card / the default branch for an issue card) and runs Claude restricted to `--allowedTools Read,Grep,Glob` over that checkout when search is disabled - so it traces real code paths, never just the diff, and can NEVER execute the target's code.
   It uses the same pass-by-reference prompt invariant as `triage.yml`; only the bounded decision-card body remains inline.
   When `READONLY_TOKEN` is absent, this remains the production no-search path: no shell `GH_TOKEN`, no Bash tool, and `github_token: github.token`.
   When `READONLY_TOKEN` is present, Claude also uses that read-only public-scoped token as both the action `github_token` input and shell `GH_TOKEN`, plus `Write` for `search-request.json` and `Bash(wheelhouse-search)`.
+  This direct in-process token exposure is deliberate; see `docs/READONLY_TOKEN_DELIVERY.md` for the accepted decision and tradeoff.
   The wrapper is still the existing `scripts/nl_readonly_search.py` install path, scoped to the target repo plus configured fleet repos, so deep-review can cross-reference related, duplicate, or superseding PRs/issues and code context.
   Search output is UNTRUSTED DATA and advisory evidence only; the model still produces only verdict text, and `FLEET_TOKEN` never reaches it.
   No deterministic downstream step reads raw model output because the trusted bridge validates the action `execution_file` and exposes only `AgentResult`.
@@ -1176,15 +1366,27 @@ The shared injection model remains unchanged: only trusted workflow prompts and 
   Opt-in: inert unless `nl_decisions: true` AND `CLAUDE_CODE_OAUTH_TOKEN`
   present.
   `READONLY_TOKEN` is optional.
-  If it is absent, Claude stays in the production no-shell mode
-  (`--allowedTools Read,Grep,Glob,Write`), writes only `decision.json`, has no
-  `GH_TOKEN`, and runs no commands.
+  Both primary Claude branches pass the exact content-bound canonical `nl-decision-v1` schema through the pinned action's `--json-schema` support. The bridge prefers terminal `structured_output`; when that carrier alone is absent, it may accept the terminal `result` only after strict JSON parsing and validation against the same bound schema.
+  The trusted bridge independently enforces the byte bound, schema, task binding, and downstream `nl-route` allowlist before anything can be posted or acted on; native generation and plain terminal JSON are never treated as trusted validation by themselves.
+  Absent or genuinely invalid results fail closed into the one bounded `nl-decision.schema-repair` turn, which runs through the direct `claude-cli-pinned` worker on Claude Code `2.1.215` and must itself return native structured output.
+  If it is absent, Claude stays in the production no-shell mode (`--allowedTools Read,Grep,Glob`), has no `GH_TOKEN`, and runs no commands. The model is never asked to hand-serialize a decision file; trusted code parses and serializes result objects.
   If it is present, Claude also uses `READONLY_TOKEN` as the action
   `github_token` input and shell `GH_TOKEN`, plus the
   `Bash(wheelhouse-search)` allow-list (tools
   `Read,Grep,Glob,Write,Bash(wheelhouse-search)`) so it can run scoped read-only
   `gh` searches across the target repo and configured fleet repos for related,
   duplicate, or superseding PRs/issues and code context.
+  On the exact `nl-decision.search` and `triage.pr.search` actions only, the
+  wrapper also accepts one anonymous `public_clone` request with a complete
+  public HTTPS Git URL and optional safe ref. It retains
+  one bounded, shallow, no-tags/no-submodules/no-LFS/no-hooks data-only clone
+  under `RUNNER_TEMP` for Read/Grep/Glob. In-turn claims are untrusted; the
+  trusted post-turn verifier re-clones successful claims and derives every
+  recorded fact independently before the workflow removes the clone and claim
+  log. Git receives a fresh credential-free environment; the authenticated
+  `gh` owner/fleet allowlist is unchanged. See
+  `docs/READONLY_TOKEN_DELIVERY.md` for the accepted DNS-rebinding residual and
+  `tests/test_public_clone.py` / `tests/test_public_clone_e2e.py` for guards.
   Like `triage.yml`/`deep-review.yml`, the NL prompt is pass-by-reference:
   `nl-fetch` writes target title/body/diff to bounded on-disk `target.txt` with
   an explicit truncation marker, while `apply_decision.build_nl_prompt` only
@@ -1214,13 +1416,9 @@ The shared injection model remains unchanged: only trusted workflow prompts and 
 
 ## Contributor-facing copy
 
-Messages Wheelhouse posts onto **target repos** (e.g. a rebase nudge on a contributor's PR) speak naturally, like a friendly maintainer bot.
-They must not name the product ("Wheelhouse") or use internal-state jargon ("maintainer queue", "resurface", bucket/kind names).
-This includes pending-contributor cleanup reminders and close comments.
-For a rebase nudge and its rebase-specific pending-contributor repeat reminder, lead with a visible automation disclosure (`Automated reminder:`) - `FLEET_TOKEN` posts as a human login, so without that label the message reads as a personal maintainer ping.
-The initial nudge explains that the branch has a merge conflict with the base branch, asks the contributor to rebase onto or merge the latest base branch and push the resolved conflict, and says that checks will re-run and the PR will get looked at again.
-The repeat reminder says the PR is still blocked, repeats the rebase and push guidance, and retains its inactivity warning.
-Templates live in `wheelhouse_core._rebase_nudge_body` and the `needs-rebase` branch of `_pending_reminder_body`; both the standard conflict path and the CI-approval-noop conflict path share the nudge template.
+Messages Wheelhouse posts onto **target repos** speak naturally, like a friendly maintainer bot. They must not name the product ("Wheelhouse") or use internal-state jargon ("maintainer queue", "resurface", bucket/kind names). This includes pending-contributor cleanup reminders, close comments, and the maintainer-edits policy notice.
+
+The maintainer-edits policy notice starts with `Automated notice:` because `FLEET_TOKEN` posts as a human login. Its exact contributor-facing copy is owned by `scripts/maintainer_edits_policy.py`; it explains the personal-fork **Allow edits from maintainers** requirement and never asks the contributor to rebase.
 
 Owner-facing decision cards and comments on **this repo's** issues are the private queue; those may keep the Wheelhouse name and internal vocabulary.
 
@@ -1235,31 +1433,48 @@ It is best-effort by construction (`_thank_contributor` swallows every exception
 ## Validation
 
 No build step.
-Validate with `python -m py_compile agent_runtime/*.py agent_runtime/adapters/*.py scripts/*.py tests/*.py`.
-Run the unit tests:
-- `python tests/test_agent_runtime_contract.py`, `test_agent_runtime_capabilities.py`, `test_agent_runtime_security.py`, `test_agent_runtime_lifecycle.py`, `test_agent_runtime_consumers.py`, and `test_agent_runtime_workflows.py` - offline Agent Runtime Contract v1 coverage for strict schemas and hashing, fail-before-spend negotiation, the pinned disabled Codex app-server protocol evidence, exact typed tools and external sandbox boundary, redaction, cancellation and process-group cleanup, malformed/missing/delivered results, all action-profile consumers, and explicit Claude production selection wiring with fallback disabled.
+Use the authoritative [local validation command list](CONTRIBUTING.md#local-validation).
+The notes below record selected non-obvious regression coverage:
+
+- `python tests/test_agent_runtime_contract.py`, `test_agent_runtime_capabilities.py`, `test_agent_runtime_security.py`, `test_agent_runtime_lifecycle.py`, `test_agent_runtime_consumers.py`, `test_agent_runtime_workflows.py`, `test_agent_runtime_repo_snapshot.py`, `test_agent_runtime_admission.py`, `test_agent_runtime_result_binding.py`, and `test_agent_outage_recovery_gate.py` - offline Agent Runtime Contract v1 coverage for strict schemas and hashing, fail-before-spend negotiation, the pinned disabled Codex app-server protocol evidence, exact typed tools and external sandbox boundary, redaction, cancellation and process-group cleanup, malformed/missing/delivered results, all action-profile consumers, explicit Claude production selection wiring with fallback disabled, exact event admission and result/event binding, the complete provider-free eight-path ZIP/fresh-interpreter recovery gate, hosted artifact preservation of signed hidden paths, and Git-object-oracle repository packaging (committed relative symlinks materialize as regular content; absolute/traversal/dirty/gitlink denials; Firstmate-style `CLAUDE.md` / `.claude/skills` fixtures).
 - `python tests/test_decision.py` - mocks the LLM, no network, and also covers the non-consuming investigate routing, allow-set, `clear_checkbox`, the pre-merge workflow-touch gate (it inspects net-diff + history `.github/workflows/**`, checks both sides of a rename, returns terminal `blocked` with manual UI-merge guidance, fails closed on incomplete reads, and does not Workflows-gate action.yml), the `thank_on_merge` post-merge thank-you (config on/off, per-repo override, owner/maintainer/bot skip, custom-message substitution, best-effort swallow, and every non-success merge outcome posting none), that `route_decision` qualifies bare cross-repo refs in `answer`/`clarify` replies using `STATE["repo"]` + owner, never the model's own text, and that a HELD card (render_card.py "Held cards") is inert to `cmd_parse` (checkbox tick and slash-command alike) and `cmd_nl_eligible`, while the identical card once published is actionable again. Also covers `request-changes`: it is pr-review-only in `ALLOWED` (not ci-approval/issue-triage) and, unlike `investigate`, IS in `nl_allowed`; `/request-changes <text>` and its `/request_changes` alias slash-parse to the action with the text as free_text (and parse to nothing without text, or when the card's kind doesn't allow it); the `decision:request-changes` label path is ignored because labels cannot carry review text; `route_decision` drives `execute` for a well-formed request-changes action, downgrades to `clarify` when `free_text` is missing or the kind disallows it, and the built NL prompt lists `request-changes` with its judgment guidance for pr-review only; and `do_request_changes` (mocked `gh_rest`) posts exactly one `POST .../pulls/{n}/reviews` with `{"body": text, "event": "REQUEST_CHANGES"}` and a `"none"` (card-stays-open) terminal state, refuses with a clear error (no API call) when the PR author is the repo owner, rejects blank review text before any API call, surfaces a raw API failure as an `"error"` terminal state, and only arms pending-contributor cleanup when config/targets allow it and the target author is a non-maintainer human.
 - `python tests/test_nl_decisions_search.py` - offline YAML wiring checks for the optional READONLY_TOKEN search path, scoped actor-check bypass, token isolation, prompt gating, unchanged `nl-route`/`execute` boundary, the `GITHUB_REPOSITORY_OWNER` threading into the `route` step's `env -i` sandbox, the NL prompt's cross-repo-qualification instruction, and that `route_decision` qualification is driven by deterministic state rather than model-claimed repos.
+- `python tests/test_nl_schema_repair.py` - native-first NL structured output, schema-valid terminal-result admission, and bounded direct repair, no network: exact canonical `nl-decision-v1` schema binding through the pinned action; trusted acceptance of one terminal `structured_output`; missing, multiple, invalid, and dishonest-native-success denial paths; the malformed `\`-before-backtick regression; bounded, tokenless, one-turn, no-tool repair; success-on-repair routing to a real answer; still-invalid repair denial with precise retryable projection; and static workflow proof that neither runtime branch can recurse into another repair attempt.
 - `python tests/test_card_refresh.py` - the card-refresh change-detection, activity-reflection, refreshability-guard, and label-replace logic, pure functions, no network; also covers the `CARD_RENDER_VERSION` 1 -> 2 retroactive triage-ref-qualification propagation and current version stamp: a render-version-behind card with a bare-ref cached `### Triage` section gets it qualified and stamped with the current `render_version` on the next refresh, a render-version-behind card with an older cached automated harness status line gets it labeled exactly once, a card already at the current version with already-qualified triage is a full no-op unless target activity advances, already-qualified refs/URLs/markdown links/non-ref `#` uses in the preserved section are left untouched, and qualification is driven by `GITHUB_REPOSITORY_OWNER` + the card's own state repo rather than the item or model text.
-- `python tests/test_reconcile.py` - reconcile routing, target-activity state-only reflection, fixed-K adjacent-run soft-close lifecycle/provenance, hard-close and stale-snapshot race safety, and stale-card self-healing, no network. Also covers the #551 approve/wait freeze: a `ci_wait_pr_numbers` PR-kind card is FROZEN (never consumed), its stale-head display is refreshed to the new head's pending state via `ci_wait_refresh_items` (anti-masquerade) without ever creating a card, the refresh is a no-op once the card is already current (no churn), and the intervening workflow run invalidates any prior absence streak before terminal checks release the freeze.
+- `python tests/test_target_observation.py` - pure versioned target-observation/action-receipt/projection-reference contracts, tamper-evident identities, approval invalidation effects, and current/pending/unknown projection planning.
+- `python tests/test_option_b_architecture.py` - complete offline Option B contracts, projection golden, E2E-01 through E2E-07, denied-preclaim no-write/no-reorder, scheduled lifecycle/manual interleave, check-basis contradiction, class tri-state and exact card-1620 class-B fixture, timestamp-stable observation/context identity, repository-qualified closing-issue relations, reciprocal advisory context, card-1663's 237-candidate/3-relation regression, DecisionContext neutrality for authority (context status/content/`context_id` rotation neither grants nor denies; observation/head rotation still invalidates), the axi#84 14-changed-file `comparison_incomplete` admission, card-1676 hub-path fanout suppression with genuine non-hub relations surviving, strength-ordered candidate capping distinguishable from genuine comparison incompleteness, zero-spend re-admission of retired-context-rule assessments on ordinary refresh, compact title/full-URL-only model payloads, persisted-v1 context compatibility, advisory spend on bound incomplete v2 context, visible triage-suppression reasons, durable result recovery, owner-race serialization, legacy PR-write deferral, migration, and static workflow/token ownership.
+- `python tests/test_decision_label_recovery.py` - production-composed decision-label projection-race recovery: exact authorized actor/card/repository/head/observation/context and post-erasure body-digest admission, complete fixed recoverable-label history, trusted projection erasure sequence, fixed-cap complete event/comment reads, one durable claim, post-claim and pre-action revalidation, and fail-closed owner body/checkbox edits, cross-label decisions, old, duplicate, replayed, superseded, explicitly removed, ambiguous, unsupported, malformed, or foreign cases.
+- `python tests/test_target_reconcile_transaction.py` - production-composed timed fork-CI regression through `build_repo`, shared exact observer/check reduction/classifier, real reconcile/upsert/render, and the in-memory card boundary: same-scan terminal completion, still-pending current head, incomplete context list, force-push mismatch, persisted as-of identity, and fleet/card token restoration.
+- `python tests/test_reconcile.py` - reconcile routing, target-activity state-only reflection, fixed-K adjacent scheduled-observation soft-close lifecycle/provenance, hard-close and stale-snapshot race safety, and stale-card self-healing, no network. Also covers the #551 approve/wait freeze: a `ci_wait_pr_numbers` PR-kind card is FROZEN (never consumed), its stale-head display is exact-reread and refreshed to pending or explicit unknown via `ci_wait_refresh_items` (anti-masquerade) without ever creating a card, the refresh is a no-op once the semantic projection is already current (no churn), and the intervening scheduled observation invalidates any prior absence streak before terminal checks release the freeze.
 - `python tests/test_card_reuse.py` - deterministic end-to-end coverage through the actual reconcile, renderer/upsert, triage, decision, criteria, and trusted auto-merge indexing modules with an in-memory GitHub boundary: same/new-head and CI-to-PR reuse, strict provenance/actor/identity exclusions, legacy behavior, complete pagination, mutation races, partial failures, global lifecycle serialization, post-open uniqueness rollback, unchanged auto-merge duplicate denial, and the full two-absence waiting/re-entry lifecycle.
-- `python tests/test_merge_conflict.py` - mergeability fail-open vs CONFLICTING routing, idempotent rebase nudges, the contributor-fork CI-noop conflict-nudge exception (including UNKNOWN/error no-nudge and no cleanup arming), author-filter nudge skips, optional pending-contributor cleanup arming for normal `needs-rebase` nudges, and reconcile self-healing for conflicted PR cards, no network.
-- `python tests/test_ci_autoapprove.py` - the shared `ci_safety` verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed. Also covers `approve_ci`'s dedup-by-`workflowDatabaseId`: two `action_required` runs of the same workflow for one head_sha approve exactly one (the higher/newer run id), same-named distinct workflows or runs without workflow identity stay distinct, and the risky-file HOLD still short-circuits before dedup/run-list/approve even when duplicates are present. Also asserts the advisory security summary is attached to a carded risky ci-approval PR (via a stubbed summarizer) but never computed on the auto-approved or suppressed-card paths. Also covers the #551 approve/wait emission: a freshly auto-approved fork PR and a `ci-running` PR are reported in `ci_wait_pr_numbers` with a non-green refresh-only pr-review item in `ci_wait_refresh_items`, while an unsafe carded PR, a verified `noop`, an author-excluded approved PR, and a terminal merge-ready PR are all deliberately NOT frozen (approval eligibility and the author-filter self-heal are unchanged).
+- `python tests/test_merge_conflict.py` - mergeability-independent readiness, source pushability policy routing, inert policy card rendering, and Phase 0 captain-facing manual-conflict copy, no network.
+- `python tests/test_merge_assist.py` - captain-initiated assisted in-place merge, no network: conflict parsing and zero-novel-line reconstruction; every pre-spend escalation including the schema-derived hunk cap; the model-result boundary; an end-to-end real-local-git resolution proving exact parents, contributor commit identity, trailer, and confinement; same-repository and editable-fork source admission; plain non-force push confinement and credential isolation; the non-material head-bound card record and section; confirmation routing; fail-closed config; and normalized workflow proof that only the fork push step receives `ASSISTED_MERGE_PUSH_TOKEN` while the model stays read-only.
+- `python tests/test_ci_autoapprove.py` - the shared `ci_safety` verdict, `pull_request_target` posture detection, and the auto-approve-vs-card routing plus scan-log observability in `build_repo`, all with the network-touching helpers stubbed.
+  It covers the completed-context plus separate `action_required` masking regression, fail-closed pending-run discovery, the unchanged draft/fork/author boundaries, and approval of every verified same-workflow duplicate run.
+  It also asserts that the risky-file HOLD still short-circuits before run listing or approval, the advisory security summary is attached only to a carded risky contributor PR, and the #551 approve/wait freeze remains limited to freshly approved or running CI.
 - `python tests/test_ci_security_summary.py` - the advisory read-only CI-approval security summary (`ci_security_summary`), no network: the HOLD stays effective and the summary CANNOT act (every gh call is a read, `approve_ci` is never invoked); risky patterns are surfaced (`pull_request_target` + PR-head checkout, write permissions, `secrets: inherit`, referenced secret NAMES, unpinned third-party actions) while SHA-pinned actions and benign first-party workflows raise no flags; secret VALUES / verbatim file lines are never echoed and contributor values are sanitized against markdown breakout; it fails closed (unreadable/incomplete file lists and unreadable/unparseable files -> a manual-review note, never raises); composite `action.yml` files are analyzed; and the render side scopes `### Security review (advisory)` to ci-approval, frames it advisory/untrusted, keeps `security_summary` out of the state block, and never triggers a material refresh.
-- `python tests/test_check_status.py` - direct unit tests for `check_status()`'s `compliance` aggregation: two check-run contexts sharing the `compliance_check` name (one `CANCELLED`, one `SUCCESS`) yield `comp == "fail"` in both array orders (the card #392 incident - worst-wins, not last-write-wins), the `statusCheckRollup.state == "FAILURE"` backstop refuses to report `pass` even when every per-context read is `SUCCESS`, and a genuinely-green PR still classifies `comp == "pass"` / `tests == "green"`, no network. Also covers card #543's axi two-signal `test_check_patterns: ["build-and-test", "drift"]` (the JS-SDK gate plus the catalog-consistency gate, which run on disjoint paths): a docs/catalog PR with only `drift` green computes `tests == green` and classifies `merge-ready`, `drift` red/pending is not merge-ready (test worst-wins), the SDK `build-and-test` posture is byte-for-byte unchanged (red/pending blocks, green passes), and the mixed both-present case stays worst-wins.
+- `python tests/test_check_status.py` - direct, offline unit coverage for the `check_status()` aggregation invariant above, the rollup fail-closed backstop, genuinely green PRs, and card #543's disjoint axi test signals.
+- `python tests/test_compliance_event_evidence.py` - offline contract coverage for opted-in current-body compliance evidence: exact workflow/run/CheckRun identity, complete bounded pagination and scan-local caching, monotonic latest-event selection independent of API/completion order, signed/unsigned/signed histories, conservative malformed/missing/cancelled/action-required evidence, legacy reduction isolation, a fresh G7 observation, and production-shaped PR #549 history without target mutation.
 - `python tests/test_author_filter.py` - queue author filtering across PR review, CI approval, and issue triage, PR target `updatedAt` propagation for activity sorting, cleanup-closed PR removal before addressed-issue recomputation, plus open-issue/PR/closing-reference pagination guards, no network.
-- `python tests/test_pending_contributor_cleanup.py` - deterministic stale pending-contributor cleanup: config defaults/overrides, PR-only scope, reminder and close thresholds, visible-reminder requirement, close-comment wording, idempotent reminder/close behavior, keep-open, contributor activity detection, maintainer/bot non-reset behavior, head-move cleanup, fail-open timeline/edit-history/proof cases, legacy rebase marker retrofit, and CI/disabled-target exclusions, no network. Also covers the reviewed-event timestamp shape (`_timeline_event_time` reading `submitted_at`, so a maintainer/bot review no longer fails open as "reviewed event missing timestamp" and a review-caused `updated_at` bump is attributable while a truly unexplained bump still fails open), the re-read-by-id recovery (`_backfill_missing_review_times` recovering a missing review/`reviewed`-event timestamp, and a failed re-read failing open), and the widened provable-ask set (an un-armed, maintainer-reviewed, conflicting fork nudge backlog PR reminds first then closes on a later scan, still honoring keep-open and contributor-activity fail-open; and a nudged ci-noop `needs-ci-approval` PR that is authoritatively `mergeable == CONFLICTING` enters the same reminder-then-close lifecycle via `_pr_conflicting_for_cleanup`, while a non-conflicting `needs-ci-approval` PR - None/MERGEABLE/UNKNOWN - is skipped with no reads and honors keep-open).
-- `python tests/test_auto_triage.py` - automatic PR-card AND issue-card triage: `auto_triage`/`auto_triage_issues` config defaults/overrides/independence, per-revision (`head_sha`/`updated_at`) cache and legacy-card backfill for both kinds, `activity_reflected_at` remaining non-material and being folded into queued writes, rendered section/no-mention behavior for both kinds, deterministic automated-status labeling for the narrow harness-line allowlist, reconcile/ingest dispatch gates including same-pass newly-created-card queueing by issue number, `triage.yml` token isolation including the issue-triage default-branch/no-head-verify path, and cross-repo ref qualification in the rendered `### Triage` section (`triage_section`/`body_with_triage_result` owner threading, the `triage.yml` prompt's qualification instruction, and `GITHUB_REPOSITORY_OWNER` reaching both `triage-apply`/`triage-fail` through the `env -i` sandbox), all offline. Also covers held cards for both kinds: `should_hold` gating parity with `should_auto_triage`, the placeholder render (no `opt:` markers, `pending-triage` label, `held` state key, `needs-decision` retained), `upsert_card` creating held only when triage would actually be queued, preserving held-ness while refresh eligibility still holds, publishing silently when refreshed eligibility turns off, a no-op refresh when unchanged, `update_card_triage` publishing on success AND on failure (fail-open), a stale-revision publish attempt being a no-op, unheld-card behavior staying byte-for-byte unchanged, reconcile self-healing a held card whose target closed, the dispatch-failure fail-open publish added to both `reconcile.py` and the `queue-triage` CLI, and the `triage-recover` fail-open safety net (`triage.yml`'s final `always()` recovery step wiring, and the CLI publishing a card genuinely stuck held+queued for its exact revision while being a no-op for a never-held card, an already-published card, or one queued for a different/superseded revision). Also covers the pass-by-reference `evidence` schema field (`normalize_triage` requires a non-empty `evidence`, rejects missing/blank/non-string, and never leaks it into the rendered triage dict) and the `evidence_anchor_ok`/`_triage_evidence_verified` lazy/fabrication guard (a genuine on-disk quote verifies whitespace/case-insensitively, a fabricated quote or no-quote evidence is rejected, and an unreadable `target.txt` fails OPEN).
+- `python tests/test_pending_contributor_cleanup.py` - offline coverage for deterministic, fail-open request-changes cleanup, including thresholds, proof and activity handling, timestamp recovery, silent legacy-rebase disarming, and the CI-approval clear-only path.
+- `python tests/test_presentation_migration.py` - offline contract coverage for the bounded presentation-only exception documented in `docs/OPTION_B_CARD_PROJECTION.md`.
+- `python tests/test_confirming_accept_copy.py` - confirming/inert recommendation framing vs Accept control presence (card #1721 / scan-5), no network: a confirming card with a current admitted recommendation keeps analysis and the inert decision copy, renders zero checkboxes, and never says "Tick **Accept recommendation**"; an ordinary published card with the same recommendation keeps the actionable Tick line and Accept checkbox; legacy contradictory bodies heal under `body_with_controls_aware_recommendation` / `body_with_reconcile_absence` and the read-only census proves the affected cohort reaches zero under the new renderer; clearing absence restores the actionable framing; `CARD_RENDER_VERSION` 13 -> 14 is the migration owner for that copy fix (current version is later).
+- `python tests/test_advisory_telemetry_consistency.py` - one coherent current triage state per card, no network: a failed primary plus advisory consumption plus a current admitted assessment renders analysis + Accept without the historical advisory-failure warning, while diagnostic `triage_primary_*` / `triage_consumption` state remains; the same telemetry without current authority stays explicitly unavailable with no Accept; corrected-authority copy still names the correction; ordinary projection refresh and the pure `body_with_coherent_advisory_telemetry` heal are idempotent and change no authority keys; the read-only census reports exact affected cards; `CARD_RENDER_VERSION` 14 -> 15 is the migration owner.
+- `python tests/test_canonical_recommendation.py` - the one canonical recommendation surface, no network and no model: the exact card-1746 production shape (advisory merge prose beside `output.schema_invalid`, `basis.missing_or_invalid`, G6/G3 UNMET) renders with no deterministic recommendation, no advisory action presented as a recommendation, both honest warnings preserved, and G6 evidence stating no valid agent recommendation was established; the unsupported `configured-tests` kind and the omitted `optin_default_off` each stay schema-invalid in isolation and no positive green-checks kind exists; the real PR-triage prompt enumerates exactly the three valid basis kinds on the shared pr-review branch, drops the bare `configured-tests basis` shorthand, routes a green-checks rationale to `other`, and marks `optin_default_off` always required in both automerge branches; plus the controls - an admitted merge recommendation renders exactly once, an admitted non-merge recommendation renders correctly with deterministic ref qualification, invalid/non-admitted/pre-triage/queued/no-result cards present none, issue and PR paths stay coherent, the deterministic producers are gone, and a render-version-stale v11 card migrates with byte-identical authority state, unchanged G6 rows, no fresh triage spend, and a no-op next scan.
+- `python tests/test_auto_triage.py` - automatic PR-card AND issue-card triage: `auto_triage`/`auto_triage_issues` config defaults/overrides/independence, per-revision (`head_sha`/`updated_at`) cache and legacy-card backfill for both kinds, `activity_reflected_at` remaining non-material and being folded into queued writes, rendered section/no-mention behavior for both kinds, deterministic automated-status labeling for the narrow harness-line allowlist, reconcile/ingest dispatch gates including same-pass newly-created-card queueing by issue number, `triage.yml` token isolation including the issue-triage default-branch/no-head-verify path, and cross-repo ref qualification in the rendered `### Triage` section (`triage_section`/`body_with_triage_result` owner threading, the `triage.yml` prompt's qualification instruction, and `GITHUB_REPOSITORY_OWNER` reaching both `triage-apply`/`triage-fail` through the `env -i` sandbox), all offline. Also covers held cards for both kinds: `should_hold` gating parity with `should_auto_triage`, the placeholder render (no `opt:` markers, `pending-triage` label, `held` state key, `needs-decision` retained), `upsert_card` creating held only when triage would actually be queued, preserving held-ness while refresh eligibility still holds, publishing silently when refreshed eligibility turns off, a no-op refresh when unchanged, `update_card_triage` publishing on success AND on failure (fail-open), a stale-revision publish attempt being a no-op, unheld-card behavior staying byte-for-byte unchanged, reconcile self-healing a held card whose target closed, the dispatch-failure fail-open publish added to both `reconcile.py` and the `queue-triage` CLI, and the `triage-recover` fail-open safety net (`triage.yml`'s final `always()` recovery step wiring, and the CLI publishing a card genuinely stuck held+queued for its exact revision while being a no-op for a never-held card, an already-published card, or one queued for a different/superseded revision). Also covers the pass-by-reference `evidence` schema field (`normalize_triage` requires a non-empty string or non-empty string list, rejects missing/blank/malformed lists, and never leaks it into the rendered triage dict) and the `evidence_anchor_ok`/`_triage_evidence_verified` lazy/fabrication guard (genuine single-quoted, double-quoted, markdown-normalized, or conservative fallback target spans verify; fabricated or too-short spans are rejected; and an unreadable `target.txt` fails OPEN).
+- `python tests/test_triage_budget.py` - fully offline automatic-triage spend-guard coverage for typed cap and ceiling configuration, strict non-material attempt records, cap exhaustion, trusted by-number daily-ledger creation and verification, UTC rollover, all fail-closed ledger failures, safe reservation leakage, the sealed dispatch boundary, workflow admission, shared concurrency, and the bounded two-call schema-repair amplification.
+- `python tests/test_triage_context_allowance.py` - fully offline coverage for the separate verified base/VISION context-refresh allowance (audit F13): config defaults/boundaries/per-repo override/fail-closed classes, ingest normalization, the verified-movement detection matrix (legacy and first-VISION cards stay ordinary), strict `triage_context_allowance` record trust, the F13 acceptance scenario (two distinct context moves consume only the allowance while the ordinary count stays put), identical-identity repetition granting nothing, ordinary same-context replay retries staying on the original cap, allowance-zero disablement, issue-triage isolation, production-shaped v2 projection-card reservation/sealed-permit/idempotency boundaries, exhaustion emitting the bounded `context.deferred` diagnostic with no reservation or dispatch, G6 revalidation binding the refreshed base/VISION identity, and non-materiality plus same-revision preservation of the record.
+- `python tests/test_triage_replay.py` - fully offline operator-only replay coverage for exact-number card/source reads, strict exact-revision and identity gates, claim tombstone verification, duplicate-only re-entry, terminal-error and absent-cache recovery, admission-duplicate card projection, fail-closed malformed/mismatch matrices, dry-run zero-write behavior, reviewable wave bounds, bounded dual-written triage result records, the two exact-cohort one-use evidence-array attempts resets, the code-defined one-use incident permit with the global cap pinned at 2, and the exact-selector-only advisory-cache recovery (production-shaped card #1746 acceptance with its zero-write auditable dry-run basis line, the card #1739 admitted-assessment control, ordinary successful caches, every independently refused predicate, generic/cohort discovery isolation, stale-revision refusal, and one-shot marker behavior). It also covers observation-drift targeted refresh: the exact-selector fallback for production-shaped card #1584, plus ordinary maintenance self-healing for complete current observations in the card #1819 class through the shared queue path, with incomplete, mismatched, locked, exhausted, already-current, and non-drift shapes remaining inert.
 - `python tests/test_triage_prompt_size.py` - the PASS-BY-REFERENCE prompt architecture (card #517 E2BIG fix), offline static YAML inspection: the load-bearing invariant that neither `triage.yml` nor `deep-review.yml` inlines target content into the Claude `prompt.txt` block (no `cat target.txt`/`cat vision.md`/`gh pr diff`/`gh pr view`/`gh api` there), the prompt stays under a small fixed byte budget and far below `MAX_ARG_STRLEN` raw AND json-escaped, a worst-case synthetic PR (diffs up to 5 MB) never enters the prompt and the prompt size is FLAT regardless of diff size (with a demonstration that the OLD inline design WOULD exceed the limit), the prompt names `target.txt`/`target-src/` and directs Read/Grep/Glob, target.txt is always written and its diff/comments are bounded (deep-review's formerly-UNCAPPED diff is now capped), the untrusted-data framing survives when content is read from files, both the READONLY_TOKEN and no-token Claude steps consume the same by-reference prompt (no-token step is Read/Grep/Glob only), the `DIFF_COMPLETE` fail-closed-on-oversize / complete-on-disk semantics, and the `--target-file` anchor-check wiring.
 - `python tests/test_nl_prompt_size.py` - offline guards for the bounded pass-by-reference NL prompt, tool isolation, explicit target truncation, and marker-keyed failure note.
 - `python tests/test_triage_result_delivery.py` - card #556 delivered-result-drop regression, no network: a >256KiB Claude transcript that ends in a valid successful `result` event still delivers its verdict (`extract_result_to_file` returns a bounded compact file that flows through `extract_claude_result`->`parse_triage_json`->`normalize_triage`->the visible `### Triage` section with `triage_status:succeeded`), the CLI `extract-result` round-trips and exits non-zero when no result exists, and static YAML checks that `triage.yml`'s `triage-result` step extracts via `render_card.py extract-result` BEFORE the 262144 gate (so the size cap bounds only the retained `transcript.json` copy, never `result_path`) plus the audit that `deep-review.yml` never had a size-cap execution-file drop.
-- `python tests/test_triage_schema_repair.py` - cards #551/#547 bounded schema-repair, no network: the TRIGGER discipline (`plan_triage_repair`/`decide_triage_apply` repair a DELIVERED-but-invalid result, but NEVER a missing result - E2BIG/auth/rate-limit/infra - nor an evidence-anchor failure, and a valid result is untouched); success-on-repair (invalid candidate -> valid repair -> the card gets a real `### Triage` section, `triage_status:succeeded`, and `triage_repair_status:repaired`); the repair-failure cap (still-invalid repair, no repair output, or a repair whose evidence no longer anchors all land on the visible triage-unavailable error carrying the STRUCTURAL reason with `triage_repair_status:repair-failed`, exactly one attempt); `triage_schema_reason` being purely structural (field name + defect, never a field value) so no target/comment content leaks into the persisted `triage_error`/`triage_repair_reason` or card body; `build_repair_prompt` naming every required schema field in lockstep with `normalize_triage`, embedding the candidate, byte-bounding a pathological candidate, and forbidding file reads/re-analysis; the NON-MATERIAL telemetry keys (`triage_repair_status`/`triage_repair_reason` absent from `MATERIAL_FIELDS`, a repaired success differing from a normal success ONLY by those two keys, and a later non-repair write clearing them); the `triage-repair-prep` CLI emitting `repair_needed`/`reason`/`repair_prompt` to `$GITHUB_OUTPUT`; the `triage-apply --repair-execution-file` CLI end-to-end with mocked card I/O; and static `triage.yml` wiring (repair-prep -> claude_repair -> repair-result ordered after triage-result and before the card update, the repair turn tokenless with `--max-turns 1`, an empty `--allowedTools`, and a fail-closed `permissions.deny` tool set, gated on `repair_needed`, pass-by-reference with no inlined target content).
+- `python tests/test_triage_schema_repair.py` - the context-equivalent single correction turn plus the evidence-quote byte policy, no network: correction eligibility (a DELIVERED candidate failing the bound schema, byte policy, or evidence anchoring is eligible - including advisory-normalizable candidates and anchor failures - while missing results and every infrastructure class refuse via the `CORRECTION_ELIGIBLE_ERROR_CODES` allowlist); exact binding refusals (stale revision, source-SHA mismatch, handoff identity, result/task hash, correction-of-a-correction); full spec parity of the built correction task with the original (selection/capabilities/tools/isolation/limits/inputs/output plus search scope), the `metadata.correction` bindings, the original-prompt-plus-candidate-plus-every-trusted-error correction prompt, and the `retry.repairTask: null` no-recursion policy; `decide_triage_apply` routing (`success`/`repaired`/`advisory`/`repair-failed`/`no-result`, bridge error codes barring the authority path, corrected results validated on their own with no basis restore); authority semantics (valid primary and valid corrected results keep authority with `triage_consumption` `primary`/`corrected`, a failed correction leaves the original explicitly advisory-only with no admission/Accept/recommendation/auto-merge verdict); the byte-policy boundaries (1024/1025/2048 valid, 2049 invalid, multibyte char/byte divergence, the exact 253-byte card #1693 production quote pinned valid, the schema 2048-char bound as secondary defense, and the 1024-byte prompt rule in every branch); `triage_schema_reason` staying purely structural; the NON-MATERIAL telemetry keys; the legacy no-tool planner/prompt helpers kept only for the disabled codex evidence branch; the `triage-apply --repair-execution-file` CLI end-to-end with mocked card I/O; and static `triage.yml` wiring (handoff download -> bind-verified primary result -> `correction-eligible` -> claim-gated `build-correction-task` -> `claude-model-call` with the original search scope, the unchanged `triage.schema-repair` claim identity, and the consume job passing `--primary-error-code`/`--repair-error-code`).
 - `python tests/test_deep_review.py` - the always-on/code-grounded deep-review and Investigate wiring: render options, the removed enable flag, the token-absent note, the `persist-credentials: false` checkout plus read-only tool isolation, the narrow `allowed_bots`, the optional READONLY_TOKEN-gated `wheelhouse-search` wiring, normalized `AgentResult` verdict capture, issue-only manual dispatch, the handler's immutable-input `workflow_dispatch` trigger, and the "Post the verdict" step's automated-status labeling plus `qualify_issue_refs` call (with the deterministic `TARGET_REPO`/`GITHUB_REPOSITORY_OWNER` inputs) running before the `gh issue comment` post, plus the prompt's qualification instruction, all by inspecting the scripts/YAML, no network.
 - `python tests/test_workflow_lint.py` - a regression guard that scans every `.github/workflows/*.yml` `run:` step for a `gh api` invocation combining `--slurp` with `--jq` (mutually exclusive in the installed `gh` CLI - `gh api --slurp` yields an array of per-page arrays and must instead be piped into a standalone `jq`), no network.
 - `python tests/test_qualify_refs.py` - direct unit tests for `wheelhouse_core.qualify_issue_refs` (bare `#N` -> `owner/repo#N`, already-qualified/URL/markdown-link/`GH-123`/`#123abc` left untouched, multiple refs in one string, `None`/empty safety, idempotency, and that qualification is driven by the caller-supplied slug rather than any repo the text itself names), no network.
-- `python tests/test_scan_reliability.py` - the card #411 scan reliability + correctness hardening, no network: `_gh_graphql_data` retry/backoff (transient-vs-fatal classification, recover-after-5xx, exhaust-then-raise, non-transient fails-fast, transient GraphQL `errors` and unparseable bodies retried, bounded/growing backoff with `_sleep` stubbed); small-page cursor pagination (`_page_open_prs` multi-page assembly and mid-page failure propagating so `build_repo` marks `truncated`); the fleet-scan health ledger (`parse_scan_health`/`update_scan_health`/`render_scan_health_body` increment/reset/carry-forward/legacy-int, and `cmd_scan_health` emitting `::error::` + non-zero exit past threshold, staying green otherwise, and failing OPEN on missing scan.json or ledger I/O error); and the UNKNOWN-mergeability policy (`_settle_mergeable` poll-first-conclusive/fail-open, `_resolve_pr_bucket` polling an explicit `UNKNOWN` and returning `needs-rebase` on settled CONFLICTING / `merge-ready` on settled MERGEABLE / `MERGEABILITY_PENDING` when it never settles, no poll for a known-MERGEABLE PR, plus `build_repo` integration: UNKNOWN->CONFLICTING nudges with no card, UNKNOWN->MERGEABLE emits a merge-ready card, unsettled UNKNOWN emits no item and lands in `indeterminate_pr_numbers` with no nudge, and the #111 acceptance that a statically-conflicting PR never enters the worklist across readable-CONFLICTING and post-base-push-UNKNOWN scans). The reconcile freeze of an `indeterminate_pr_numbers` card (no close, no refresh) and the unchanged non-indeterminate soft-close live in `tests/test_reconcile.py`.
-- `python tests/test_config_schema.py` - structural load test that `wheelhouse_core.load_config()` accepts the checked-in `wheelhouse.config.yml`: every `repos:` entry is well-formed (name is trimmed and matches its key; `compliance_check` is null or a trimmed non-empty string; `test_check_patterns` is a list of trimmed non-empty strings; `merge_method` is unset or squash|merge|rebase) and repo names are case-insensitively unique. Deliberately pins no repo names or fleet size, so it keeps guarding the file as the fleet grows/shrinks, no network.
-- `python tests/test_auto_merge_v1.py` - scan-time auto-merge (V1), no network and no target-repo writes: the config + exclusion helpers (`_auto_merge_enabled` default-off/overrides, `_auto_merge_exclusions` covering every category incl. VISION.md self-authorization); the pure `verdict_eligible` gate (A/B/C eligibility, class-C opt-in/default-off, malformed/stale/absent verdicts, fail-closed defaults) plus `normalize_automerge_verdict` parsing/coercion; the blast-radius caps at the exact 20-file and 1000-line boundaries; every deterministic gate G0-G6 walked through PASS and HOLD via representative live-card fixtures in `act_on_scan`; the G7 live head + merge-state re-check immediately before acting (and the scan-vs-live head mismatch); the `wheelhouse:no-auto-merge` escape hatch and global/per-repo kill switches; the ok:false/truncated/indeterminate freeze; base-branch-ONLY VISION.md reads (contents API, no `?ref`); the durable ledger (parse/append/render/cap) + audit comment + `record` CLI resolving the card and appending the ledger (best-effort/no-op paths); the `do_merge` race/error outcomes; and the DELIBERATE ABSENCE of an open-PR file-overlap gate and any per-contributor/per-scan rate cap; the claim-time author-duality normalization (real `get_card`-shaped `{"login": "app/github-actions"}` fixtures normalize and are trusted, `github-actions[bot]` stays trusted, and a human login / a different `app/*` slug / bare `github-actions` / lookalikes all stay fail-closed rejected); plus offline YAML wiring checks (FLEET act step, github.token record step, act->reconcile->record order, the criteria handoff, and the triage.yml base-VISION verdict prompt).
+- `python tests/test_scan_reliability.py` - the card #411 scan reliability and correctness hardening: GraphQL retry/backoff, paginated scans, health ledger, and complete-scan worklist behavior, no network.
+- `python tests/test_config_schema.py` - structural load test that `wheelhouse_core.load_config()` accepts the checked-in `wheelhouse.config.yml`: every `repos:` entry is well-formed (name is trimmed and matches its key; `compliance_check` is null or a trimmed non-empty string; `compliance_evidence`, when present, matches its exact supported schema; `test_check_patterns` is a list of trimmed non-empty strings; `merge_method` is unset or squash|merge|rebase) and repo names are case-insensitively unique. Deliberately pins no repo names or fleet size, so it keeps guarding the file as the fleet grows/shrinks, no network.
+- `python tests/test_auto_merge_v1.py` - scan-time auto-merge (V1), no network and no target-repo writes: the config + exclusion helpers (`_auto_merge_enabled` default-off/overrides, `_auto_merge_exclusions` covering every category incl. VISION.md self-authorization); the pure `verdict_eligible` gate (A/B/C eligibility, class-B restoration and semantic contradiction admission, class-C opt-in/default-off, malformed/stale/absent verdicts, fail-closed defaults) plus `normalize_automerge_verdict` parsing/coercion; the blast-radius caps at the exact 20-file and 1000-line boundaries; every deterministic gate G0-G6 walked through PASS and HOLD via representative live-card fixtures in `act_on_scan`; the G7 live head + merge-state + same-closing-issue overlap re-check immediately before acting (including scan-clear/act-ambiguous and unreadable evidence); the `wheelhouse:no-auto-merge` escape hatch and global/per-repo kill switches; the ok:false/truncated/indeterminate freeze; base-branch-ONLY VISION.md reads (contents API, no `?ref`); the durable ledger (parse/append/render/cap) + audit comment + `record` CLI resolving the card and appending the ledger (best-effort/no-op paths); the `do_merge` race/error outcomes; the required same-closing-issue ambiguity hold; and the DELIBERATE ABSENCE of an open-PR same-file overlap gate and any per-contributor/per-scan rate cap; the claim-time author-duality normalization (real `get_card`-shaped `{"login": "app/github-actions"}` fixtures normalize and are trusted, `github-actions[bot]` stays trusted, and a human login / a different `app/*` slug / bare `github-actions` / lookalikes all stay fail-closed rejected); plus offline YAML wiring checks (FLEET preclaim/act steps, default-token claim/record steps, preclaim->claim->validate->act->record->reconcile order, the criteria handoff, and the triage.yml base-VISION verdict prompt).
 - `python tests/test_automerge_card_ui.py` - authoritative auto-merge criterion UI, no network: every stable row's positive and fail-closed negative state, owner/bot/history distinctions, workflow/security exclusions, dirty/unknown mergeability and checks, verdict freshness and A/B/C details, blast limits, held/claimed card state, the real axi#96 shape through evaluator and renderer, old-card fallback, criterion-only refresh, and proof that persisted display rows cannot grant eligibility.
 - `python tests/test_automerge_workflow_hold.py` - durable history-only workflow manual-merge hold, no network: the real two-hour claim/validate/act/record/reconcile lifecycle, structured final-gate evidence, same-head no-reclaim behavior, G7 `UNMET` presentation, clean and still-dirty new heads, G2 net-diff separation, unreadable/incomplete fail-closed paths, malformed/stale state, persistence recovery, same-head maintenance and trusted reuse, immediate hard close, and default-card-token isolation.
 YAML-parse `.github/workflows/*.yml` plus `wheelhouse.config.yml` plus `.github/ISSUE_TEMPLATE/*.yml`.

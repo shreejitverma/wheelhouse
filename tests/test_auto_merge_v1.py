@@ -21,6 +21,7 @@ input HOLDS for human review. These tests cover, end-to-end through the
     self-authorization, live green+CLEAN mergeability, blast radius) via
     representative live-card fixtures walked through PASS and HOLD outcomes;
   * the G7 live head + merge-state re-check immediately before acting;
+  * same-closing-issue ambiguity at scan time and at the final act boundary;
   * the per-PR `wheelhouse:no-auto-merge` escape hatch and the global/per-repo
     kill switches;
   * the durable audit ledger (parse/append/render + cap) and the resolved
@@ -28,13 +29,14 @@ input HOLDS for human review. These tests cover, end-to-end through the
   * base-branch-ONLY VISION.md reads (never the PR head);
   * the fleet-wide `auto_merge: true` switch this fork commits: the global flag
     alone opts a repo in (no per-repo key needed) yet a base-branch VISION.md is
-    still required (no claim, no merge, no verdict spend without it), the
+    still required (no claim, no merge, and no vision-bound verdict without it), the
     self-authorization exclusion and base-branch read still hold under global
     true, and the shipped code default stays OFF when the global key is absent;
-  * the DELIBERATE ABSENCE of an open-PR file-overlap gate and of any
+  * the DELIBERATE ABSENCE of an open-PR same-file overlap gate and of any
     per-contributor / per-scan rate cap (captain override).
 """
 
+import hashlib
 import io
 import json
 import os
@@ -51,6 +53,10 @@ import wheelhouse_core as core  # noqa: E402
 import render_card  # noqa: E402
 import apply_decision  # noqa: E402
 import auto_merge as am  # noqa: E402
+import automerge_criteria as schema  # noqa: E402
+import target_observation  # noqa: E402
+import decision_context  # noqa: E402
+import assessment_admission  # noqa: E402
 
 _failures = []
 
@@ -61,16 +67,38 @@ def check(name, cond):
         _failures.append(name)
 
 
+BEHAVIOR_ADMISSION = {
+    "version": 1,
+    "contradicts_existing_contract": False,
+}
+CLASS_B_ADMISSION = {
+    **BEHAVIOR_ADMISSION,
+    "corrected_defect": "Daemon restart lost an open monitored run.",
+    "intended_behavior_restored": (
+        "An open monitored run remains recoverable."
+    ),
+}
 ELIGIBLE_A = {
     "behavior_class": "A",
+    "behavior_admission": BEHAVIOR_ADMISSION,
     "aligns_with_vision": True,
     "changes_existing_or_default_behavior": False,
     "recommend_merge": True,
     "vision_sha": "vsha",
     "base_sha": "b1" * 20,
 }
-ELIGIBLE_B = dict(ELIGIBLE_A, behavior_class="B")
+ELIGIBLE_B = dict(
+    ELIGIBLE_A,
+    behavior_class="B",
+    behavior_admission=CLASS_B_ADMISSION,
+)
 ELIGIBLE_C = dict(ELIGIBLE_A, behavior_class="C", optin_default_off=True)
+INDEPENDENT_A = {
+    "behavior_class": "A",
+    "behavior_admission": BEHAVIOR_ADMISSION,
+    "changes_existing_or_default_behavior": False,
+    "optin_default_off": False,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -107,6 +135,96 @@ def make_pr(
     }
 
 
+def admitted_assessment_state(repo, number, head, action="merge"):
+    observation = target_observation.make_observation(
+        "owner",
+        repo,
+        number,
+        head_sha=head,
+        base_sha="b1" * 20,
+        expected_head_sha=head,
+        observed_at="2026-07-10T00:00:00Z",
+        source="exact-reread",
+        completeness={
+            "complete": True,
+            "target": True,
+            "checks": True,
+            "action_required_runs": True,
+            "head_matches_expected": True,
+            "check_contexts_seen": 2,
+            "check_contexts_total": 2,
+            "mergeability": "conclusive",
+        },
+        facts={
+            "open": True,
+            "title": "Target",
+            "author": "alice",
+            "updated_at": "2026-07-10T00:00:00Z",
+            "draft": False,
+            "cross_repo": True,
+            "head_ref": "topic",
+            "mergeable": "MERGEABLE",
+            "ci": True,
+            "comp": "pass",
+            "tests": "green",
+            "bucket": "merge-ready",
+            "approval_phase": "not-required",
+            "check_phase": "terminal",
+            "configured_checks": [
+                {"name": "gate", "role": "compliance", "outcome": "pass"},
+                {"name": "tests", "role": "test", "outcome": "pass"},
+            ],
+        },
+        changed_paths=target_observation.changed_path_facts(
+            ["src/main.py"], complete=True, count=1
+        ),
+    )
+    snapshot = decision_context.repository_snapshot(
+        [
+            {
+                "owner": "owner",
+                "repo": repo,
+                "number": number,
+                "head_sha": head,
+                "title": "Fixture PR %s" % number,
+                "paths_complete": True,
+                "paths": ["src/main.py"],
+                "closing_complete": True,
+                "closing_issues": [],
+                "references_complete": True,
+                "references": [],
+                "card_issue": 0,
+                "url": "https://github.com/owner/%s/pull/%s" % (repo, number),
+                "card_url": "",
+            }
+        ],
+        "2026-07-10T00:00:00Z",
+    )
+    context = decision_context.build_decision_context(observation, snapshot)
+    assessment = assessment_admission.admit_assessment(
+        {
+            "summary": "Current PR assessment.",
+            "product_implications": "Routine bounded change.",
+            "recommended_action": action,
+            "recommended_reason": "Review the current exact revision.",
+            "recommendation_basis": {
+                "kind": "other",
+                "observation_id": observation["observation_id"],
+                "context_id": context["context_id"],
+                "check_names": [],
+            },
+        },
+        observation,
+        context,
+    )
+    return {
+        render_card.PROJECTION_OWNER_FIELD: render_card.PROJECTION_OWNER,
+        render_card.REVIEW_OBSERVATION_FIELD: observation,
+        render_card.DECISION_CONTEXT_FIELD: context,
+        render_card.ASSESSMENT_FIELD: assessment,
+    }
+
+
 def make_card(
     card_issue,
     repo,
@@ -128,6 +246,12 @@ def make_card(
         "triaged_sha": head,
         "triage_status": triage_status,
     }
+    if triage_status == "succeeded":
+        state.update(
+            admitted_assessment_state(
+                repo, number, head, action=triage_recommendation or "hold"
+            )
+        )
     if held:
         state["held"] = True
     if automerge_verdict is not None:
@@ -160,6 +284,25 @@ def make_card(
     }
 
 
+def preclaim_records(items, cards):
+    index = am._card_index(cards)
+    records = []
+    for item in items:
+        key = (item["repo"], str(item["number"]))
+        entry = index[key]
+        value = {
+            "repo": key[0],
+            "number": key[1],
+            "head_sha": item["head_sha"],
+            "card_issue": entry["issue"],
+            "card_updated_at": entry["updated_at"],
+            "card_body_sha256": am._preclaim_id(entry["body"]),
+        }
+        value["preclaim_id"] = am._preclaim_id(value)
+        records.append(value)
+    return records
+
+
 def make_item(repo, number, head, comp="pass", tests="green", bucket="merge-ready"):
     return {
         "repo": repo,
@@ -169,6 +312,9 @@ def make_item(repo, number, head, comp="pass", tests="green", bucket="merge-read
         "head_sha": head,
         "comp": comp,
         "tests": tests,
+        "labels": [],
+        "labels_truncated": False,
+        "same_closing_issue_overlap": "",
     }
 
 
@@ -186,6 +332,8 @@ class World:
         self.files = {}  # (slug, str(number)) -> (files, ok, complete)
         self.check_status = {}
         self.check_status_seq = {}
+        self.closing_issue_overlap = {}
+        self.closing_issue_overlap_seq = {}
         self.do_merge_calls = []
         self.do_merge_clean_guards = []
         self.do_merge_final_guards = []
@@ -232,6 +380,13 @@ class World:
         if sequence:
             return sequence.pop(0) if len(sequence) > 1 else sequence[0]
         return self.check_status.get(key, (True, "comp=pass tests=green"))
+
+    def same_closing_issue_overlap(self, owner, repo, number):
+        key = (owner, repo, str(number))
+        sequence = self.closing_issue_overlap_seq.get(key)
+        if sequence:
+            return sequence.pop(0) if len(sequence) > 1 else sequence[0]
+        return self.closing_issue_overlap.get(key, (True, ""))
 
     def do_merge(
         self,
@@ -284,6 +439,8 @@ def run_act(world, items, cards, has_token=True, has_card_token=True):
         "live": am.live_pr,
         "compare": am.immutable_compare_files,
         "checks": am.live_check_status,
+        "closing_overlap": core.same_closing_issue_overlap,
+        "target_label_state": core.target_label_state,
         "domerge": apply_decision.do_merge,
         "get_card": render_card.get_card,
         "edit_body": render_card._edit_issue_body,
@@ -301,6 +458,19 @@ def run_act(world, items, cards, has_token=True, has_card_token=True):
     am.live_pr = world.live_pr
     am.immutable_compare_files = world.immutable_compare_files
     am.live_check_status = world.live_check_status
+    core.same_closing_issue_overlap = world.same_closing_issue_overlap
+
+    def target_label_state(owner, repo, number, label):
+        pr = world.last_pr.get(("%s/%s" % (owner, repo), str(number)))
+        if not isinstance(pr, dict) or not isinstance(pr.get("labels"), list):
+            return None
+        return label in {
+            value.get("name")
+            for value in pr["labels"]
+            if isinstance(value, dict)
+        }
+
+    core.target_label_state = target_label_state
     apply_decision.do_merge = world.do_merge
     am.closed_audit_intent_entries = lambda card_token: getattr(
         world, "closed_audit_intents", {}
@@ -351,6 +521,8 @@ def run_act(world, items, cards, has_token=True, has_card_token=True):
         am.live_pr = saved["live"]
         am.immutable_compare_files = saved["compare"]
         am.live_check_status = saved["checks"]
+        core.same_closing_issue_overlap = saved["closing_overlap"]
+        core.target_label_state = saved["target_label_state"]
         apply_decision.do_merge = saved["domerge"]
         render_card.get_card = saved["get_card"]
         render_card._edit_issue_body = saved["edit_body"]
@@ -527,6 +699,436 @@ def test_verdict_classes_ABC():
         check("verdict: class %s eligible" % label, ok is True and cls == label)
 
 
+def test_class_b_semantic_admission_boundary():
+    defect_quote = "Daemon restart lost an open monitored run."
+    restored_quote = "An open monitored run remains recoverable."
+    product_claim = (
+        "Narrow corrective fix restoring documented recovery behavior "
+        "without changing default behavior"
+    )
+    restoration = {
+        "corrected_defect": defect_quote,
+        "corrected_defect_evidence": {
+            "source": "target.txt",
+            "quote": defect_quote,
+        },
+        "intended_behavior_restored": restored_quote,
+        "intended_behavior_restored_evidence": {
+            "source": "target-src/lib/recovery.py",
+            "quote": restored_quote,
+        },
+    }
+
+    def candidate(**overrides):
+        value = {
+            "summary": "Fixes recovery after a daemon restart.",
+            "product_implications": product_claim + ".",
+            "recommended_action": "merge",
+            "recommended_reason": "The narrow recovery regression is covered.",
+            "evidence": "target.txt: '%s'" % defect_quote,
+            "automerge": {
+                "behavior_class": "B",
+                "behavior_assertions": [
+                    {
+                        "claim": product_claim,
+                        "subject": "default_behavior",
+                        "effect": "restored",
+                        "evidence": {
+                            "source": "target.txt",
+                            "quote": product_claim,
+                        },
+                    },
+                    {
+                        "claim": product_claim,
+                        "subject": "default_behavior",
+                        "effect": "unchanged",
+                        "evidence": {
+                            "source": "target.txt",
+                            "quote": product_claim,
+                        },
+                    }
+                ],
+                "class_b_restoration": restoration,
+                "changes_existing_or_default_behavior": False,
+                "optin_default_off": False,
+                "aligns_with_vision": True,
+                "recommend_merge": True,
+            },
+        }
+        value.update(overrides)
+        return value
+
+    def normalize(value, verified=None):
+        bounded = dict(value)
+        bounded[render_card._VERIFIED_EVIDENCE_SPANS_FIELD] = tuple(
+            (
+                ("target.txt", render_card._normalize_evidence_text(defect_quote)),
+                ("target.txt", render_card._normalize_evidence_text(product_claim)),
+                (
+                    "target-src/lib/recovery.py",
+                    render_card._normalize_evidence_text(restored_quote),
+                ),
+            )
+            if verified is None
+            else verified
+        )
+        return render_card.normalize_triage(bounded)
+
+    valid = normalize(candidate())["automerge_verdict"]
+    check(
+        "class B admission: narrow corrective restoration remains eligible",
+        am.verdict_eligible(valid)[0] is True,
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        target_file = os.path.join(temp_dir, "target.txt")
+        target_src = os.path.join(temp_dir, "target-src")
+        os.makedirs(os.path.join(target_src, "lib"))
+        with open(target_file, "w", encoding="utf-8") as source_file:
+            source_file.write(defect_quote + "\n" + product_claim)
+        with open(
+            os.path.join(target_src, "lib", "recovery.py"),
+            "w",
+            encoding="utf-8",
+        ) as source_file:
+            source_file.write(restored_quote)
+        bound = render_card._bind_verified_evidence_spans(
+            candidate(), target_file, target_src
+        )
+        check(
+            "class B admission: target-src restoration reference is verified",
+            am.verdict_eligible(
+                render_card.normalize_triage(bound)["automerge_verdict"]
+            )[0]
+            is True,
+        )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repository = os.path.join(temp_dir, "repository")
+        bundle = os.path.join(temp_dir, "bundle")
+        os.makedirs(os.path.join(repository, "lib"))
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.name", "fixture"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.email", "fixture@example.com"],
+            check=True,
+        )
+        with open(
+            os.path.join(repository, "lib", "recovery.py"),
+            "w",
+            encoding="utf-8",
+        ) as source_file:
+            source_file.write(restored_quote)
+        subprocess.run(["git", "-C", repository, "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "commit", "-qm", "fixture"],
+            check=True,
+        )
+        revision = subprocess.run(
+            ["git", "-C", repository, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        render_card.build_target_source_evidence(repository, bundle, revision)
+        manifest = os.path.join(bundle, "manifest.json")
+        files = os.path.join(bundle, "files")
+        check(
+            "source evidence: exact-revision manifest verifies",
+            render_card.verify_target_source_evidence(files, manifest, revision)
+            is not None,
+        )
+        check(
+            "source evidence: revision mismatch fails closed",
+            render_card.verify_target_source_evidence(
+                files, manifest, "0" * len(revision)
+            )
+            is None,
+        )
+        with open(
+            os.path.join(files, "lib", "recovery.py"),
+            "a",
+            encoding="utf-8",
+        ) as source_file:
+            source_file.write("tampered")
+        check(
+            "source evidence: digest mismatch fails closed",
+            render_card.verify_target_source_evidence(files, manifest, revision)
+            is None,
+        )
+
+
+    # ----------------------------------------------------------------- #
+    # Mechanical negatives (captain decision, card #2148 pivot): trusted
+    # admission checks shapes, bounds, and verbatim-verified spans only.
+    # Semantic faithfulness is the model's attested judgment.
+    # ----------------------------------------------------------------- #
+    unverified = normalize(
+        candidate(),
+        verified=(
+            ("target.txt", render_card._normalize_evidence_text(defect_quote)),
+            ("target.txt", render_card._normalize_evidence_text(product_claim)),
+        ),
+    )["automerge_verdict"]
+    check(
+        "class B admission: an unverified restoration reference is unavailable",
+        render_card.behavior_admission_status(unverified)[0] == "unavailable"
+        and am.verdict_eligible(unverified)[0] is False,
+    )
+
+    same_ref_input = candidate()
+    same_ref_input["automerge"] = dict(same_ref_input["automerge"])
+    same_ref_input["automerge"]["class_b_restoration"] = dict(
+        restoration,
+        intended_behavior_restored_evidence={
+            "source": "target.txt",
+            "quote": defect_quote,
+        },
+    )
+    same_ref = normalize(same_ref_input)["automerge_verdict"]
+    check(
+        "class B admission: one shared evidence reference is unavailable",
+        render_card.behavior_admission_status(same_ref)[0] == "unavailable",
+    )
+
+    canonical_duplicate_input = candidate()
+    canonical_duplicate_input["automerge"] = dict(
+        canonical_duplicate_input["automerge"]
+    )
+    canonical_duplicate_input["automerge"]["class_b_restoration"] = dict(
+        restoration,
+        intended_behavior_restored_evidence={
+            "source": "target.txt",
+            "quote": "**DAEMON   RESTART LOST AN OPEN MONITORED RUN.**",
+        },
+    )
+    canonical_duplicate = normalize(canonical_duplicate_input)[
+        "automerge_verdict"
+    ]
+    distinct_same_source_input = candidate()
+    distinct_same_source_input["automerge"] = dict(
+        distinct_same_source_input["automerge"]
+    )
+    distinct_same_source_input["automerge"]["class_b_restoration"] = dict(
+        restoration,
+        intended_behavior_restored_evidence={
+            "source": "target.txt",
+            "quote": product_claim,
+        },
+    )
+    distinct_same_source = normalize(distinct_same_source_input)[
+        "automerge_verdict"
+    ]
+    check(
+        "class B admission: canonical duplicate denies but distinct spans admit",
+        render_card.behavior_admission_status(canonical_duplicate)[0]
+        == "unavailable"
+        and render_card.behavior_admission_status(distinct_same_source)[0]
+        == "admitted",
+    )
+
+    duplicated_input = candidate()
+    duplicated_input["automerge"] = dict(duplicated_input["automerge"])
+    duplicated_input["automerge"]["class_b_restoration"] = dict(
+        restoration, intended_behavior_restored=defect_quote
+    )
+    duplicated = normalize(duplicated_input)["automerge_verdict"]
+    check(
+        "class B admission: duplicated defect/restoration claims are unavailable",
+        render_card.behavior_admission_status(duplicated)[0] == "unavailable",
+    )
+
+    incomplete_input = candidate()
+    incomplete_input["automerge"] = dict(incomplete_input["automerge"])
+    incomplete = dict(restoration)
+    incomplete.pop("intended_behavior_restored_evidence")
+    incomplete_input["automerge"]["class_b_restoration"] = incomplete
+    incomplete_verdict = normalize(incomplete_input)["automerge_verdict"]
+    check(
+        "class B admission: a missing restoration field is unavailable",
+        render_card.behavior_admission_status(incomplete_verdict)[0]
+        == "unavailable",
+    )
+
+    overlong_input = candidate()
+    overlong_input["automerge"] = dict(overlong_input["automerge"])
+    overlong_input["automerge"]["class_b_restoration"] = dict(
+        restoration, corrected_defect="x" * 501
+    )
+    overlong = normalize(overlong_input)["automerge_verdict"]
+    check(
+        "class B admission: an overlong restoration claim is unavailable",
+        render_card.behavior_admission_status(overlong)[0] == "unavailable",
+    )
+
+    def with_assertions(assertions):
+        value = candidate()
+        value["automerge"] = dict(value["automerge"])
+        value["automerge"]["behavior_assertions"] = assertions
+        return normalize(value)["automerge_verdict"]
+
+    bad_subject = with_assertions(
+        [
+            {
+                "claim": product_claim,
+                "subject": "configured-tests",
+                "effect": "unchanged",
+                "evidence": {"source": "target.txt", "quote": product_claim},
+            }
+        ]
+    )
+    check(
+        "assertions: an unknown subject enum fails the whole list closed",
+        render_card.behavior_admission_status(bad_subject)[0] == "unavailable",
+    )
+    bad_effect = with_assertions(
+        [
+            {
+                "claim": product_claim,
+                "subject": "default_behavior",
+                "effect": "green",
+                "evidence": {"source": "target.txt", "quote": product_claim},
+            }
+        ]
+    )
+    check(
+        "assertions: an unknown effect enum fails the whole list closed",
+        render_card.behavior_admission_status(bad_effect)[0] == "unavailable",
+    )
+    fabricated = with_assertions(
+        [
+            {
+                "claim": product_claim,
+                "subject": "default_behavior",
+                "effect": "unchanged",
+                "evidence": {
+                    "source": "target.txt",
+                    "quote": "Fabricated support that never verified.",
+                },
+            }
+        ]
+    )
+    check(
+        "assertions: an unverified quote fails the whole list closed",
+        render_card.behavior_admission_status(fabricated)[0] == "unavailable",
+    )
+    oversized = with_assertions(
+        [
+            {
+                "claim": product_claim,
+                "subject": "default_behavior",
+                "effect": "unchanged",
+                "evidence": {"source": "target.txt", "quote": product_claim},
+            }
+        ]
+        * 13
+    )
+    check(
+        "assertions: an oversized assertion list fails closed",
+        render_card.behavior_admission_status(oversized)[0] == "unavailable",
+    )
+
+    contradiction_input = candidate()
+    contradiction_input["automerge"] = dict(contradiction_input["automerge"])
+    contradiction_input["automerge"]["behavior_assertions"] = list(
+        contradiction_input["automerge"]["behavior_assertions"]
+    ) + [
+        {
+            "claim": product_claim,
+            "subject": "delivery_contract",
+            "effect": "tightened",
+            "evidence": {"source": "target.txt", "quote": product_claim},
+        }
+    ]
+    contradiction = normalize(contradiction_input)["automerge_verdict"]
+    check(
+        "assertions: a declared protected-contract change reads contradictory",
+        render_card.behavior_admission_status(contradiction)[0] == "contradictory"
+        and am.verdict_eligible(contradiction)[0] is False,
+    )
+
+    docs_change_input = candidate()
+    docs_change_input["automerge"] = dict(docs_change_input["automerge"])
+    docs_change_input["automerge"]["behavior_assertions"] = list(
+        docs_change_input["automerge"]["behavior_assertions"]
+    ) + [
+        {
+            "claim": product_claim,
+            "subject": "documentation_or_tests",
+            "effect": "changed",
+            "evidence": {"source": "target.txt", "quote": product_claim},
+        }
+    ]
+    docs_change = normalize(docs_change_input)["automerge_verdict"]
+    check(
+        "assertions: a declared documentation-only change stays admitted",
+        render_card.behavior_admission_status(docs_change)[0] == "admitted",
+    )
+
+    at_defect = "Daemon restart lost an open monitored run @primary."
+    at_restored = "An open monitored run @primary remains recoverable."
+    at_input = candidate(
+        summary="Fixes recovery for @primary after a daemon restart.",
+        recommended_reason="Merge after verifying @primary recovery.",
+    )
+    at_input["automerge"] = dict(at_input["automerge"])
+    at_input["automerge"]["class_b_restoration"] = {
+        "corrected_defect": at_defect,
+        "corrected_defect_evidence": {
+            "source": "target.txt",
+            "quote": at_defect,
+        },
+        "intended_behavior_restored": at_restored,
+        "intended_behavior_restored_evidence": {
+            "source": "target-src/lib/recovery.py",
+            "quote": at_restored,
+        },
+    }
+    at_verified = (
+        ("target.txt", render_card._normalize_evidence_text(at_defect)),
+        ("target.txt", render_card._normalize_evidence_text(product_claim)),
+        (
+            "target-src/lib/recovery.py",
+            render_card._normalize_evidence_text(at_restored),
+        ),
+    )
+    at_bounded = dict(at_input)
+    at_bounded[render_card._VERIFIED_EVIDENCE_SPANS_FIELD] = at_verified
+    at_normalized = render_card.normalize_triage(at_bounded)
+    at_verdict = at_normalized["automerge_verdict"]
+    at_item = make_item("fmt", 5, "ab" * 20)
+    at_body = render_card.body_with_triage_result(
+        render_card.render(at_item)["body"],
+        at_item["head_sha"],
+        triage=at_bounded,
+        automerge_behavior_available=True,
+    )
+    at_state = core.parse_state_block(at_body)
+    at_visible = render_card._existing_triage_section(at_body)
+    check(
+        "class B admission: @identifier survives production semantics",
+        am.verdict_eligible(at_verdict)[0] is True
+        and at_verdict["behavior_admission"]["corrected_defect"]
+        == at_defect
+        and at_verdict["behavior_admission"][
+            "intended_behavior_restored"
+        ]
+        == at_restored
+        and at_state["automerge_verdict"]["behavior_admission"][
+            "corrected_defect"
+        ]
+        == at_defect
+        and at_normalized["triage_recommendation"]["reason"]
+        == "Merge after verifying primary recovery.",
+    )
+    check(
+        "class B admission: rendered @identifier cannot notify",
+        "@primary" not in at_visible
+        and "primary" in at_visible,
+    )
+
+
 def test_verdict_class_C_requires_optin_default_off():
     ok, cls, reason = am.verdict_eligible(
         dict(ELIGIBLE_A, behavior_class="C")  # no optin_default_off
@@ -551,6 +1153,48 @@ def test_verdict_ineligible_and_fail_closed_defaults():
         check("verdict: malformed %r held" % (bad,), ok is False)
 
 
+def test_vision_independent_facts_are_evaluated_without_granting_eligibility():
+    facts, cls = am.behavior_verdict_facts(INDEPENDENT_A)
+    check(
+        "verdict split: independent class is evaluated",
+        cls == "A" and facts["g6_behavior_class"]["status"] == schema.STATUS_MET,
+    )
+    check(
+        "verdict split: default behavior and class-C mode are evaluated",
+        facts["g6_default_behavior"]["status"] == schema.STATUS_MET
+        and facts["g6_class_c_mode"]["status"] == schema.STATUS_MET,
+    )
+    check(
+        "verdict split: vision facts remain unavailable",
+        facts["g6_vision_alignment"]["status"] == schema.STATUS_UNAVAILABLE
+        and facts["g6_verdict_merge"]["status"] == schema.STATUS_UNAVAILABLE,
+    )
+    ok, _, reason = am.verdict_eligible(INDEPENDENT_A)
+    check(
+        "verdict split: independent facts alone never grant eligibility",
+        ok is False and "VISION.md" in reason,
+    )
+
+    default_change = dict(
+        INDEPENDENT_A, changes_existing_or_default_behavior=True
+    )
+    class_c_not_opted_in = dict(
+        INDEPENDENT_A, behavior_class="C", optin_default_off=False
+    )
+    check(
+        "verdict split: real default behavior failure is UNMET",
+        am.behavior_verdict_facts(default_change)[0]["g6_default_behavior"]["status"]
+        == schema.STATUS_UNMET,
+    )
+    check(
+        "verdict split: real class-C mode failure is UNMET",
+        am.behavior_verdict_facts(class_c_not_opted_in)[0]["g6_class_c_mode"][
+            "status"
+        ]
+        == schema.STATUS_UNMET,
+    )
+
+
 def test_verdict_normalization_and_persistence_fail_closed():
     # A missing required boolean means the verdict is never persisted (hold).
     bad = {"behavior_class": "A", "aligns_with_vision": True, "recommend_merge": True}
@@ -570,6 +1214,18 @@ def test_verdict_normalization_and_persistence_fail_closed():
     check(
         "verdict: normalize coerces + upper-cases class",
         good and good["behavior_class"] == "B" and good["aligns_with_vision"] is True,
+    )
+    independent = render_card.normalize_automerge_verdict(
+        dict(INDEPENDENT_A, behavior_assertions=[]),
+        triage_data={
+            "summary": "No product behavior change.",
+            "product_implications": "Routine internal change.",
+            "evidence": "target.txt: 'internal refactor only'",
+        },
+    )
+    check(
+        "verdict split: normalizer preserves complete-diff independent facts",
+        independent == INDEPENDENT_A,
     )
 
 
@@ -651,6 +1307,308 @@ def test_class_C_without_optin_holds_end_to_end():
     payload, err = run_act(w, items, cards)
     check("act: class C w/o opt-in holds", not payload["merges"] and payload["holds"])
     check("act: no merge attempted", not w.do_merge_calls)
+
+
+def test_same_closing_issue_overlap_holds_end_to_end():
+    w, items, cards = default_world()
+    items[0]["same_closing_issue_overlap"] = "overlaps PR(s) #6 (all close issue #42)"
+    payload, _ = run_act(w, items, cards)
+    check(
+        "act: same-closing-issue ambiguity holds",
+        not payload["merges"] and bool(payload["holds"]),
+    )
+    check("act: same-closing-issue ambiguity never merges", not w.do_merge_calls)
+
+
+def test_no_same_closing_issue_overlap_still_merges():
+    w, items, cards = default_world()
+    payload, _ = run_act(w, items, cards)
+    check(
+        "act: proven absence of same-closing-issue overlap still merges",
+        len(payload["merges"]) == 1,
+    )
+    check(
+        "act: final same-closing-issue guard passes on a complete clear read",
+        w.do_merge_final_guards == [(True, "")],
+    )
+
+
+def test_unknown_scan_same_closing_issue_overlap_holds_fail_closed():
+    for label, value in (
+        ("missing", None),
+        ("null", None),
+        ("boolean", False),
+        ("object", {}),
+    ):
+        w, items, cards = default_world()
+        if label == "missing":
+            items[0].pop("same_closing_issue_overlap")
+        else:
+            items[0]["same_closing_issue_overlap"] = value
+        payload, _ = run_act(w, items, cards)
+        check(
+            "act: %s scan overlap evidence holds fail closed" % label,
+            not payload["merges"]
+            and "unavailable" in _held_reason(payload)
+            and not w.do_merge_calls,
+        )
+
+
+def test_G7_same_closing_issue_overlap_is_rechecked_at_merge_boundary():
+    w, items, cards = default_world()
+    w.closing_issue_overlap[("owner", "fmt", "5")] = (
+        True,
+        "overlaps PR(s) #6 (all close issue #42)",
+    )
+    payload, _ = run_act(w, items, cards)
+    check(
+        "G7: overlap appearing after the clear scan is held",
+        not payload["merges"]
+        and "same-closing-issue ambiguity" in _held_reason(payload),
+    )
+    check(
+        "G7: overlap is checked inside the final do_merge guard",
+        w.do_merge_final_guards
+        == [
+            (
+                False,
+                "same-closing-issue ambiguity: overlaps PR(s) #6 (all close issue #42)",
+            )
+        ],
+    )
+
+
+def test_G7_unreadable_same_closing_issue_overlap_holds_fail_closed():
+    w, items, cards = default_world()
+    w.closing_issue_overlap[("owner", "fmt", "5")] = (False, "")
+    payload, _ = run_act(w, items, cards)
+    check(
+        "G7: unreadable overlap re-read is held",
+        not payload["merges"] and "could not be re-read" in _held_reason(payload),
+    )
+    check(
+        "G7: unreadable overlap re-read fails the final guard",
+        w.do_merge_final_guards
+        == [(False, "same-closing-issue overlap could not be re-read")],
+    )
+
+
+def test_G7_malformed_later_closing_ref_page_holds_fail_closed():
+    cases = (
+        (
+            "malformed",
+            {
+                "totalCount": 2,
+                "pageInfo": {},
+                "nodes": [{"number": 43}],
+            },
+        ),
+        (
+            "raced",
+            {
+                "totalCount": 3,
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"number": 43}],
+            },
+        ),
+    )
+    original_overlap = core.same_closing_issue_overlap
+    saved_open = core.gh_graphql_open_pr_closing_refs_page
+    saved_closing = core.gh_graphql_closing_refs_page
+    try:
+        for label, second_closing_page in cases:
+            w, items, cards = default_world()
+            w.same_closing_issue_overlap = lambda owner, repo, number: original_overlap(
+                owner, repo, number
+            )
+
+            def open_pr_page(owner, repo, after=None):
+                return {
+                    "totalCount": 1,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {
+                            "number": 5,
+                            "closingIssuesReferences": {
+                                "totalCount": 2,
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": "close-2",
+                                },
+                                "nodes": [{"number": 42}],
+                            },
+                        }
+                    ],
+                }
+
+            core.gh_graphql_open_pr_closing_refs_page = open_pr_page
+            core.gh_graphql_closing_refs_page = (
+                lambda owner, repo, number, after: second_closing_page
+            )
+            payload, _ = run_act(w, items, cards)
+            check(
+                "G7: %s later closing-ref page holds fail closed" % label,
+                not payload["merges"]
+                and "could not be re-read" in _held_reason(payload),
+            )
+            check(
+                "G7: %s later closing-ref page never clears" % label,
+                w.do_merge_final_guards
+                == [(False, "same-closing-issue overlap could not be re-read")],
+            )
+    finally:
+        core.gh_graphql_open_pr_closing_refs_page = saved_open
+        core.gh_graphql_closing_refs_page = saved_closing
+
+
+def test_G7_malformed_open_pr_first_page_nodes_hold_fail_closed():
+    cases = (
+        ("missing", object()),
+        ("null", None),
+        ("object", {}),
+        ("string", "not-a-list"),
+    )
+    original_overlap = core.same_closing_issue_overlap
+    saved_open = core.gh_graphql_open_pr_closing_refs_page
+    try:
+        for label, value in cases:
+            w, items, cards = default_world()
+            w.same_closing_issue_overlap = lambda owner, repo, number: original_overlap(
+                owner, repo, number
+            )
+
+            def open_pr_page(owner, repo, after=None):
+                if after is None:
+                    page = {
+                        "totalCount": 1,
+                        "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+                    }
+                    if label != "missing":
+                        page["nodes"] = value
+                    return page
+                return {
+                    "totalCount": 1,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "nodes": [
+                        {
+                            "number": 5,
+                            "closingIssuesReferences": {
+                                "totalCount": 1,
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                                "nodes": [{"number": 42}],
+                            },
+                        }
+                    ],
+                }
+
+            core.gh_graphql_open_pr_closing_refs_page = open_pr_page
+            complete, note = original_overlap("owner", "fmt", 5)
+            check(
+                "G7 read: %s first-page nodes fail closed" % label,
+                complete is False and note == "",
+            )
+            payload, _ = run_act(w, items, cards)
+            check(
+                "G7: %s first-page nodes hold fail closed" % label,
+                not payload["merges"]
+                and "could not be re-read" in _held_reason(payload),
+            )
+            check(
+                "G7: %s first-page nodes never clear" % label,
+                w.do_merge_final_guards
+                == [(False, "same-closing-issue overlap could not be re-read")],
+            )
+    finally:
+        core.gh_graphql_open_pr_closing_refs_page = saved_open
+
+
+def test_live_same_closing_issue_overlap_reuses_scan_note_computation():
+    def pr(number, closes):
+        return {
+            "number": number,
+            "closingIssuesReferences": {
+                "totalCount": len(closes),
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"number": issue} for issue in closes],
+            },
+        }
+
+    saved = core._open_pr_closing_refs
+    try:
+        core._open_pr_closing_refs = lambda owner, repo: [pr(5, [42]), pr(6, [42])]
+        complete, note = core.same_closing_issue_overlap("owner", "fmt", 5)
+        check(
+            "G7 read: live overlap uses the existing presentation note",
+            complete and note == "overlaps PR(s) #6 (all close issue #42)",
+        )
+
+        core._open_pr_closing_refs = lambda owner, repo: [pr(5, [42]), pr(6, [43])]
+        complete, note = core.same_closing_issue_overlap("owner", "fmt", 5)
+        check("G7 read: a complete non-overlap is clear", complete and note == "")
+
+        def unreadable(owner, repo):
+            raise RuntimeError("unreadable")
+
+        core._open_pr_closing_refs = unreadable
+        complete, note = core.same_closing_issue_overlap("owner", "fmt", 5)
+        check(
+            "G7 read: unreadable open-PR evidence fails closed",
+            complete is False and note == "",
+        )
+    finally:
+        core._open_pr_closing_refs = saved
+
+
+def test_live_same_closing_issue_overlap_open_pr_pagination_is_strict():
+    def refs(number, issue):
+        return {
+            "number": number,
+            "closingIssuesReferences": {
+                "totalCount": 1,
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [{"number": issue}],
+            },
+        }
+
+    first = {
+        "totalCount": 2,
+        "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+        "nodes": [refs(5, 42)],
+    }
+    second = {
+        "totalCount": 2,
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [refs(6, 42)],
+    }
+    calls = []
+    saved = core.gh_graphql_open_pr_closing_refs_page
+    try:
+
+        def page(owner, repo, after=None):
+            calls.append(after)
+            return first if after is None else second
+
+        core.gh_graphql_open_pr_closing_refs_page = page
+        complete, note = core.same_closing_issue_overlap("owner", "fmt", 5)
+        check(
+            "G7 read: every open-PR page participates in overlap detection",
+            complete
+            and note == "overlaps PR(s) #6 (all close issue #42)"
+            and calls == [None, "next"],
+        )
+
+        second["totalCount"] = 3
+        calls.clear()
+        complete, note = core.same_closing_issue_overlap("owner", "fmt", 5)
+        check(
+            "G7 read: changed pagination totals fail closed",
+            complete is False and note == "" and calls == [None, "next"],
+        )
+    finally:
+        core.gh_graphql_open_pr_closing_refs_page = saved
 
 
 # --------------------------------------------------------------------------- #
@@ -1091,7 +2049,7 @@ def test_claim_rechecks_and_locks_current_card():
     render_card._gh = claim
     scan = {"items": items}
     try:
-        claims = am.claim_cards(scan, [initial])
+        claims = am.claim_cards(scan, [initial], preclaim_records(items, [initial]))
         check(
             "claim: current card is re-read and locked",
             len(claims) == 1
@@ -1150,7 +2108,9 @@ def test_claim_vetoes_owner_comment_since_scan_snapshot():
     render_card._gh = lambda *args, **kwargs: calls.append(("edit", args))
     os.environ["WHEELHOUSE_AUTOMERGE_HAS_TOKEN"] = "true"
     try:
-        claims = am.claim_cards({"items": items}, [initial])
+        claims = am.claim_cards(
+            {"items": items}, [initial], preclaim_records(items, [initial])
+        )
         check(
             "claim: owner comment since scan snapshot vetoes the claim",
             claims == [] and calls == [],
@@ -1214,7 +2174,9 @@ def test_claim_vetoes_existing_trusted_hold_or_close_comment():
             )
         )
         natural_veto, _ = am._card_has_pending_owner_action(current)
-        claims = am.claim_cards({"items": items}, [initial])
+        claims = am.claim_cards(
+            {"items": items}, [initial], preclaim_records(items, [initial])
+        )
         check(
             "claim: existing trusted slash and natural-language actions veto the claim",
             slash_veto and natural_veto and claims == [] and calls == [],
@@ -1260,7 +2222,9 @@ def test_claim_rejects_changed_decision_card():
     render_card.get_card = lambda number: current
     os.environ["WHEELHOUSE_AUTOMERGE_HAS_TOKEN"] = "true"
     try:
-        claims = am.claim_cards({"items": items}, [initial])
+        claims = am.claim_cards(
+            {"items": items}, [initial], preclaim_records(items, [initial])
+        )
         check("claim: changed decision card is not claimed", claims == [])
     finally:
         render_card.get_card = saved["get"]
@@ -1323,7 +2287,9 @@ def test_claim_rechecks_owner_selection_after_locking():
     render_card._gh = edit
     os.environ["WHEELHOUSE_AUTOMERGE_HAS_TOKEN"] = "true"
     try:
-        claims = am.claim_cards({"items": items}, [initial])
+        claims = am.claim_cards(
+            {"items": items}, [initial], preclaim_records(items, [initial])
+        )
         labels = am._card_label_names(current)
         check(
             "claim: post-lock owner selection cancels the claim",
@@ -1394,7 +2360,9 @@ def test_claim_rechecks_owner_comment_activity_after_locking():
     render_card._gh = edit
     os.environ["WHEELHOUSE_AUTOMERGE_HAS_TOKEN"] = "true"
     try:
-        claims = am.claim_cards({"items": items}, [initial])
+        claims = am.claim_cards(
+            {"items": items}, [initial], preclaim_records(items, [initial])
+        )
         labels = am._card_label_names(current)
         check(
             "claim: post-lock owner comment cancels the claim",
@@ -1447,7 +2415,9 @@ def test_claim_requires_fresh_verdict_before_locking_card():
     render_card._gh = lambda *args, **kwargs: calls.append(("edit", args))
     os.environ["WHEELHOUSE_AUTOMERGE_HAS_TOKEN"] = "true"
     try:
-        claims = am.claim_cards({"items": items}, [initial])
+        claims = am.claim_cards(
+            {"items": items}, [initial], preclaim_records(items, [initial])
+        )
         check(
             "claim: a successful triage without a verdict leaves no claim churn",
             claims == [] and calls == [],
@@ -2244,7 +3214,7 @@ def test_G6_token_kill_switch_holds():
     payload, _ = run_act(w, items, cards, has_token=False)
     check(
         "G6: absent triage token holds persisted verdict",
-        "TOKEN" in _held_reason(payload),
+        "model credential" in _held_reason(payload),
     )
 
 
@@ -2285,6 +3255,7 @@ def test_triage_persists_trusted_policy_revisions():
         triage=triage,
         vision_sha="trusted-vision-sha",
         base_sha="b" * 40,
+        automerge_behavior_available=True,
     )
     verdict = core.parse_state_block(body).get("automerge_verdict")
     check(
@@ -2295,8 +3266,44 @@ def test_triage_persists_trusted_policy_revisions():
     )
 
 
+def test_complete_diff_triage_persists_independent_facts_without_vision():
+    item = make_item("fmt", 5, "iv" * 20)
+    triage = {
+        "summary": "A focused change.",
+        "product_implications": "No broad behavior change.",
+        "evidence": "target.txt: quoted a line from the change",
+        "recommended_next_step": "merge - narrow and safe.",
+        "automerge": INDEPENDENT_A,
+    }
+    body = render_card.body_with_triage_result(
+        render_card.render(item)["body"],
+        item["head_sha"],
+        triage=triage,
+        vision_sha="",
+        base_sha="b" * 40,
+        automerge_behavior_available=True,
+    )
+    state = core.parse_state_block(body)
+    verdict = state.get("automerge_verdict")
+    check(
+        "triage split: no-VISION result persists independent behavior facts",
+        verdict == INDEPENDENT_A,
+    )
+    check(
+        "triage split: no-VISION result keeps base cache but no vision binding",
+        state.get("triaged_base_sha") == "b" * 40
+        and "triaged_vision_sha" not in state
+        and "vision_sha" not in verdict
+        and "base_sha" not in verdict,
+    )
+    check(
+        "triage split: persisted independent record remains ineligible",
+        am.verdict_eligible(verdict)[0] is False,
+    )
+
+
 # --------------------------------------------------------------------------- #
-# repo-state freeze invariants (ok:false / truncated / indeterminate)
+# repo-state freeze invariants (ok:false / truncated)
 # --------------------------------------------------------------------------- #
 def _run_with_scan(world, items, cards, repos_scan):
     world.repos_scan = repos_scan
@@ -2307,10 +3314,6 @@ def test_scan_freeze_invariants():
     for label, scan in (
         ("ok:false", {"fmt": {"ok": False}}),
         ("truncated", {"fmt": {"ok": True, "truncated": True}}),
-        (
-            "indeterminate",
-            {"fmt": {"ok": True, "indeterminate_pr_numbers": [5]}},
-        ),
     ):
         w, items, cards = default_world(head="fz" * 20)
         payload, _ = _run_with_scan(w, items, cards, scan)
@@ -2353,11 +3356,36 @@ def test_do_merge_race_and_error_outcomes():
         "act: blocked workflow outcome emits a ::warning::", "auto-merge held" in err3
     )
 
+    # Recoverable merge-conflict terminal "none" is held (claim released), not
+    # an ambiguous error outcome that withholds release.
+    w4, items4, cards4 = default_world(head="cf" * 20)
+    w4.do_merge_returns = {
+        ("fmt", "5"): (
+            "Merge of fmt#5 failed because the PR has a merge conflict.",
+            "none",
+        )
+    }
+    payload4, err4 = run_act(w4, items4, cards4)
+    check(
+        "act: recoverable merge conflict is held, not recorded merge",
+        not payload4["merges"]
+        and payload4["holds"]
+        and not payload4["ambiguous_outcomes"],
+    )
+    check(
+        "act: recoverable merge conflict releases the claim",
+        any(r.get("card_issue") for r in payload4.get("releases") or []),
+    )
+    check(
+        "act: recoverable merge conflict emits a ::warning::",
+        "auto-merge held" in err4,
+    )
+
 
 # --------------------------------------------------------------------------- #
 # DELIBERATE ABSENCE of an overlap gate and any rate cap (captain override)
 # --------------------------------------------------------------------------- #
-def test_no_open_pr_overlap_gate():
+def test_no_open_pr_file_overlap_gate():
     # Two open merge-ready PRs whose file sets fully overlap BOTH merge - there
     # is intentionally no open-PR file-overlap gate in V1.
     w = World()
@@ -2376,12 +3404,12 @@ def test_no_open_pr_overlap_gate():
     ]
     payload, _ = run_act(w, items, cards)
     check(
-        "absence: overlapping-file PRs BOTH auto-merge (no overlap gate)",
+        "absence: overlapping-file PRs BOTH auto-merge (no same-file gate)",
         len(payload["merges"]) == 2,
     )
     check(
-        "absence: no overlap helper exists in auto_merge",
-        not any("overlap" in n for n in dir(am)),
+        "absence: no same-file overlap helper exists in auto_merge",
+        not any("file_overlap" in n for n in dir(am)),
     )
 
 
@@ -2500,7 +3528,7 @@ def test_global_switch_on_is_the_practical_optin_via_vision():
     )
 
 
-def test_global_true_without_vision_holds_no_claim_no_merge_no_spend():
+def test_global_true_without_vision_holds_no_claim_merge_or_vision_verdict():
     # A repo opted in purely by the fleet-wide switch (no per-repo override) still
     # auto-merges NOTHING until it commits a default-branch VISION.md. G0 holds:
     # no merge attempt, no claim, and no behavior-verdict spend.
@@ -2518,9 +3546,9 @@ def test_global_true_without_vision_holds_no_claim_no_merge_no_spend():
         not w.do_merge_calls and not payload["merges"],
     )
 
-    # No CLAIM: a repo without VISION.md never gets a behavior verdict persisted
-    # (triage only produces one when VISION is present), and the claim phase
-    # requires a fresh eligible verdict, so such a card can never be claimed.
+    # No CLAIM: complete-diff triage persists the independent behavior facts,
+    # but the vision-bound alignment and merge recommendation stay absent. The
+    # claim phase still requires the complete eligible verdict.
     no_vision_state = {
         "repo": "fmt",
         "number": 5,
@@ -2529,16 +3557,22 @@ def test_global_true_without_vision_holds_no_claim_no_merge_no_spend():
         "triaged_sha": "h1" * 20,
         "triage_status": "succeeded",
         "triage_recommendation": {"action": "merge", "reason": ""},
-        # deliberately NO "automerge_verdict" - the no-VISION card state
+        "automerge_verdict": INDEPENDENT_A,
     }
     ok, _, _ = am._fresh_verdict_for_head(no_vision_state, "h1" * 20)
     check(
-        "global true + no VISION.md: claim gate refuses a verdict-less card",
+        "global true + no VISION.md: claim gate refuses independent facts alone",
         ok is False,
     )
+    no_vision_facts, _ = am.fresh_verdict_facts(no_vision_state, "h1" * 20)
+    check(
+        "global true + no VISION.md: independent rows remain informative",
+        no_vision_facts["g6_default_behavior"]["status"] == schema.STATUS_MET
+        and no_vision_facts["g6_class_c_mode"]["status"] == schema.STATUS_MET,
+    )
 
-    # No VERDICT SPEND: the base-branch VISION SHA that triage keys the auto-merge
-    # verdict on is empty when no VISION.md exists, so triage never asks for one.
+    # No VISION-BOUND VERDICT: the base-branch VISION SHA that binds alignment and
+    # final merge recommendation stays empty when no VISION.md exists.
     saved = core.gh_rest
     try:
 
@@ -2547,13 +3581,14 @@ def test_global_true_without_vision_holds_no_claim_no_merge_no_spend():
 
         core.gh_rest = _absent
         check(
-            "global true + no VISION.md: empty vision SHA -> no verdict spend",
+            "global true + no VISION.md: vision-bound verdict has no policy SHA",
             core._default_branch_vision_sha("owner/fmt") == "",
         )
-        core.gh_rest = lambda path: {"type": "file", "sha": "vsha"}
+        vision_sha = "a" * 40
+        core.gh_rest = lambda path: {"type": "file", "sha": vision_sha}
         check(
             "with VISION.md present: vision SHA is attached (verdict may be produced)",
-            core._default_branch_vision_sha("owner/fmt") == "vsha",
+            core._default_branch_vision_sha("owner/fmt") == vision_sha,
         )
     finally:
         core.gh_rest = saved
@@ -3071,7 +4106,7 @@ def test_atomic_claim_handoffs_release_claims_and_fail_loudly():
     }
     card = {"number": 101}
     released = []
-    am.claim_cards = lambda scan, cards: [card]
+    am.claim_cards = lambda scan, cards, preclaims: [card]
     am.validate_claimed_cards = lambda cards: [card]
     am._write_json_atomically = lambda path, data: (_ for _ in ()).throw(
         OSError("disk full")
@@ -3085,11 +4120,16 @@ def test_atomic_claim_handoffs_release_claims_and_fail_loudly():
                 json.dump({}, f)
             with open(cards_path, "w", encoding="utf-8") as f:
                 json.dump([], f)
+            preclaims_path = os.path.join(directory, "preclaims.json")
+            with open(preclaims_path, "w", encoding="utf-8") as f:
+                json.dump([], f)
             for label, env_key, command in (
                 (
                     "claims",
                     "WHEELHOUSE_AUTOMERGE_CLAIMS",
-                    lambda: am.cmd_claim(scan_path, cards_path),
+                    lambda: am.cmd_claim(
+                        scan_path, cards_path, preclaims_path
+                    ),
                 ),
                 (
                     "validated claims",
@@ -3277,7 +4317,7 @@ def test_scan_backstop_wiring_and_token_discipline():
     check(
         "wiring: missing act results release validated claims under github.token",
         rec
-        and rec.get("if") == "always()"
+        and rec.get("if", "").startswith("${{ always()")
         and "record automerge.json automerge-valid-claims.json" in rec.get("run", ""),
     )
     check(
@@ -3295,7 +4335,9 @@ def test_scan_backstop_wiring_and_token_discipline():
     )
     check(
         "wiring: reconcile still runs when audit recovery fails",
-        by_name.get("Reconcile the queue", {}).get("if") == "always()",
+        by_name.get("Reconcile the queue", {})
+        .get("if", "")
+        .startswith("${{ always()"),
     )
     handler = yaml.safe_load(_read(".github/workflows/decision-handler.yml"))
     handler_steps = handler["jobs"]["handle"]["steps"]
@@ -3340,16 +4382,31 @@ def test_triage_reads_vision_from_base_only_and_asks_verdict():
         "contents/VISION.md?ref=" not in text and "VISION.md?" not in text,
     )
     check(
-        "triage: asks for the A/B/C behavior_class verdict when VISION present",
-        '"behavior_class"' in text and '"optin_default_off"' in text,
+        "triage: asks for A/B/C, restoration, and independent behavior facts",
+        '"behavior_class"' in text
+        and '"behavior_assertions"' in text
+        and '"class_b_restoration"' in text
+        and '"corrected_defect"' in text
+        and '"corrected_defect_evidence"' in text
+        and '"intended_behavior_restored"' in text
+        and '"intended_behavior_restored_evidence"' in text
+        and '"optin_default_off"' in text,
     )
     check(
-        "triage: verdict is gated on VISION_PRESENT (base VISION.md exists)",
-        "VISION_PRESENT" in text,
+        "triage: complete diffs produce independent facts without VISION.md",
+        'if [ "$DIFF_COMPLETE" = "true" ]; then' in text
+        and "AUTOMERGE_BEHAVIOR_AVAILABLE=true" in text
+        and 'elif [ "$AUTOMERGE_BEHAVIOR_AVAILABLE" = "true" ]; then' in text,
+    )
+    check(
+        "triage: alignment and final merge remain gated on trusted VISION.md",
+        'if [ "$VISION_PRESENT" = "true" ] \\\n              && [ "$TARGET_FACTS_PRESENT" = "true" ] \\\n              && [ "$AUTOMERGE_BEHAVIOR_AVAILABLE" = "true" ]; then'
+        in text
+        and "AUTOMERGE_VERDICT_AVAILABLE=true" in text,
     )
     check(
         "triage: the VISION policy is labeled TRUSTED owner-authored (not head)",
-        "TRUSTED owner-authored policy" in text,
+        "TRUSTED owner policy from the default branch" in text,
     )
     check(
         "triage: binds verdict storage to the fetched VISION.md SHA",
@@ -3359,10 +4416,8 @@ def test_triage_reads_vision_from_base_only_and_asks_verdict():
         and '--base-sha "$BASE_SHA"' in text,
     )
     check(
-        "triage: incomplete diffs suppress auto-merge verdict storage",
-        'if [ "$VISION_PRESENT" = "true" ] && [ "$DIFF_COMPLETE" = "true" ]; then'
-        in text
-        and "AUTOMERGE_VERDICT_AVAILABLE=true" in text,
+        "triage: incomplete diffs suppress every behavior fact",
+        "AUTOMERGE_BEHAVIOR_AVAILABLE=false" in text,
     )
     check(
         "triage: unavailable assessments retain the base revision for cache freshness",
@@ -3390,6 +4445,19 @@ def test_triage_reads_vision_from_base_only_and_asks_verdict():
         and "HEAD_SHA: ${{ steps.resolve.outputs.revision }}" in text
         and 'gh pr diff "$NUMBER"' not in text,
     )
+    check(
+        "triage: in-job source evidence uses the actual workspace checkout",
+        "TARGET_SRC_DIR: ${{ github.workspace }}/target-src" in text
+        and '--target-src-dir "${TARGET_SRC_DIR:-}"' in text,
+    )
+    check(
+        "triage: cross-job source evidence is bounded and manifest-bound",
+        "source-evidence-build" in text
+        and "target-src-evidence" in text
+        and "target_source_revision:" in text
+        and '--target-src-manifest "${TARGET_SRC_MANIFEST:-}"' in text
+        and '--target-src-revision "${TARGET_SRC_REVISION:-}"' in text,
+    )
 
 
 def test_triage_rejects_lfs_and_submodule_diff_markers():
@@ -3416,6 +4484,469 @@ def test_triage_rejects_lfs_and_submodule_diff_markers():
             "triage: %s marker makes the diff unavailable" % label,
             bool(pattern) and result.returncode == 0,
         )
+
+
+def test_default_behavior_gate_uses_three_state_copy():
+    """Card #2148 line 4: known-true must not hedge as if nobody knows."""
+    base = {"behavior_class": "A", "optin_default_off": False}
+    known_false = am.behavior_verdict_facts(
+        dict(base, changes_existing_or_default_behavior=False)
+    )[0]["g6_default_behavior"]
+    check(
+        "default-behavior copy: known-false stays MET with unchanged copy",
+        known_false["status"] == schema.STATUS_MET
+        and known_false["evidence"] == "no existing/default behavior change",
+    )
+    known_true = am.behavior_verdict_facts(
+        dict(base, changes_existing_or_default_behavior=True)
+    )[0]["g6_default_behavior"]
+    check(
+        "default-behavior copy: known-true names the reported change",
+        known_true["status"] == schema.STATUS_UNMET
+        and known_true["evidence"]
+        == "the triage verdict reports an existing/default behavior change"
+        and known_true["reason"]
+        == "verdict reports an ineligible existing/default behavior change",
+    )
+    unknown = am.behavior_verdict_facts(dict(base))[0]["g6_default_behavior"]
+    check(
+        "default-behavior copy: missing fact stays fail-closed not-ruled-out",
+        unknown["status"] == schema.STATUS_UNMET
+        and unknown["evidence"]
+        == "existing/default behavior change not ruled out (no usable verdict fact)",
+    )
+    malformed = am.behavior_verdict_facts(
+        dict(base, changes_existing_or_default_behavior="no")
+    )[0]["g6_default_behavior"]
+    check(
+        "default-behavior copy: malformed fact stays fail-closed not-ruled-out",
+        malformed["status"] == schema.STATUS_UNMET
+        and "not ruled out" in malformed["evidence"],
+    )
+
+
+def test_source_evidence_skips_oversized_files_without_voiding_artifact():
+    """Card #2148 line 3 blocker 1: one 3 MB binary must never disable every
+    other file's target-src semantic evidence for the whole repository."""
+    cited_quote = "The export queue is preserved."
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repository = os.path.join(temp_dir, "repository")
+        bundle = os.path.join(temp_dir, "bundle")
+        os.makedirs(os.path.join(repository, "lib"))
+        os.makedirs(os.path.join(repository, "assets"))
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.name", "fixture"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", repository, "config", "user.email", "f@example.com"],
+            check=True,
+        )
+        with open(
+            os.path.join(repository, "lib", "export.py"), "w", encoding="utf-8"
+        ) as source_file:
+            source_file.write(cited_quote)
+        with open(os.path.join(repository, "assets", "banner.png"), "wb") as blob:
+            blob.write(b"\x89" * (render_card.SOURCE_EVIDENCE_MAX_FILE_BYTES + 1))
+        subprocess.run(["git", "-C", repository, "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", repository, "commit", "-qm", "fixture"], check=True
+        )
+        revision = subprocess.run(
+            ["git", "-C", repository, "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        manifest = render_card.build_target_source_evidence(
+            repository, bundle, revision
+        )
+        check(
+            "source evidence: oversized file is excluded per-file, not voiding",
+            manifest["available"] is True
+            and manifest["file_count"] == 1
+            and manifest["excluded_count"] == 1
+            and manifest["excluded"][0]["path"] == "assets/banner.png"
+            and manifest["excluded"][0]["reason"] == "file-too-large",
+        )
+        files_dir = os.path.join(bundle, "files")
+        manifest_file = os.path.join(bundle, "manifest.json")
+        indexed = render_card.verify_target_source_evidence(
+            files_dir, manifest_file, revision
+        )
+        check(
+            "source evidence: cited normal file verifies beside the exclusion",
+            indexed is not None
+            and "lib/export.py" in indexed
+            and "assets/banner.png" not in indexed,
+        )
+        check(
+            "source evidence: cited-but-excluded path still fails closed",
+            render_card._read_declared_evidence_source(
+                "target-src/assets/banner.png",
+                "",
+                files_dir,
+                manifest_file,
+                revision,
+            )
+            == ""
+            and render_card._read_declared_evidence_source(
+                "target-src/lib/export.py",
+                "",
+                files_dir,
+                manifest_file,
+                revision,
+            )
+            == cited_quote,
+        )
+
+
+def test_source_evidence_rejects_boolean_numeric_fields():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        files_dir = os.path.join(temp_dir, "files")
+        manifest_file = os.path.join(temp_dir, "manifest.json")
+        os.makedirs(files_dir)
+        content = b"x"
+        with open(os.path.join(files_dir, "source.txt"), "wb") as source_file:
+            source_file.write(content)
+        manifest = {
+            "version": render_card.SOURCE_EVIDENCE_VERSION,
+            "revision": "revision",
+            "available": True,
+            "file_count": 1,
+            "total_bytes": 1,
+            "files": [
+                {
+                    "path": "source.txt",
+                    "size": 1,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            ],
+            "excluded_count": 1,
+            "excluded": [
+                {
+                    "path": "excluded.bin",
+                    "size": 1,
+                    "reason": "file-too-large",
+                }
+            ],
+        }
+        with open(manifest_file, "w", encoding="utf-8") as manifest_stream:
+            json.dump(manifest, manifest_stream)
+        valid_result = render_card.verify_target_source_evidence(
+            files_dir, manifest_file, "revision"
+        )
+        variants = []
+        for field in ("version", "file_count", "total_bytes", "excluded_count"):
+            variant = json.loads(json.dumps(manifest))
+            variant[field] = True
+            variants.append(variant)
+        for collection in ("files", "excluded"):
+            variant = json.loads(json.dumps(manifest))
+            variant[collection][0]["size"] = True
+            variants.append(variant)
+        results = []
+        for variant in variants:
+            with open(manifest_file, "w", encoding="utf-8") as manifest_stream:
+                json.dump(variant, manifest_stream)
+            results.append(
+                render_card.verify_target_source_evidence(
+                    files_dir, manifest_file, "revision"
+                )
+            )
+        check(
+            "source evidence: boolean numeric manifest fields fail closed",
+            valid_result
+            == {"source.txt": os.path.realpath(os.path.join(files_dir, "source.txt"))}
+            and all(result is None for result in results),
+        )
+
+
+def test_evidence_ref_accepts_prompt_blessed_quote_lengths():
+    """Card #2148 line 3 blocker 2: the prompt promises 1024 UTF-8 bytes per
+    quote; the semantic-ref validator must share the one captain-fixed byte
+    policy instead of silently rejecting prompt-blessed quotes at 240 chars."""
+    from agent_runtime.output_validation import EVIDENCE_QUOTE_MAX_UTF8_BYTES
+
+    def quote_of(length):
+        return "q" * length
+
+    production_length = quote_of(245)  # 245 chars, the card #2148 quote length
+    check(
+        "evidence ref: the production 245-char quote is accepted",
+        len(production_length) == 245
+        and render_card._normalize_evidence_ref(
+            {"source": "target.txt", "quote": production_length},
+            preserve_handles=True,
+        )
+        is not None,
+    )
+    prompt_bound = quote_of(1024)
+    check(
+        "evidence ref: a 1024-byte prompt-blessed quote is accepted",
+        len(prompt_bound.encode("utf-8")) == 1024
+        and render_card._normalize_evidence_ref(
+            {"source": "target-src/lib/export.py", "quote": prompt_bound}
+        )
+        is not None,
+    )
+    ceiling = quote_of(EVIDENCE_QUOTE_MAX_UTF8_BYTES)
+    over = quote_of(EVIDENCE_QUOTE_MAX_UTF8_BYTES + 1)
+    check(
+        "evidence ref: the shared hard byte ceiling is inclusive",
+        len(ceiling.encode("utf-8")) == EVIDENCE_QUOTE_MAX_UTF8_BYTES
+        and render_card._normalize_evidence_ref(
+            {"source": "target.txt", "quote": ceiling}
+        )
+        is not None
+        and render_card._normalize_evidence_ref(
+            {"source": "target.txt", "quote": over}
+        )
+        is None,
+    )
+    check(
+        "evidence ref: the 12-char minimum still holds",
+        render_card._normalize_evidence_ref(
+            {"source": "target.txt", "quote": "tiny quote"}
+        )
+        is None,
+    )
+
+
+def _class_b_natural_candidate(defect, restored, restored_source):
+    return {
+        "summary": "Fixes an export regression in session cleanup.",
+        "product_implications": "Routine low-risk fix, no owner discussion needed.",
+        "recommended_action": "merge",
+        "recommended_reason": "Narrow fix with regression coverage.",
+        "evidence": "target.txt: '%s'" % defect,
+        "automerge": {
+            "behavior_class": "B",
+            "behavior_assertions": [],
+            "class_b_restoration": {
+                "corrected_defect": defect,
+                "corrected_defect_evidence": {
+                    "source": "target.txt",
+                    "quote": defect,
+                },
+                "intended_behavior_restored": restored,
+                "intended_behavior_restored_evidence": {
+                    "source": restored_source,
+                    "quote": restored,
+                },
+            },
+            "changes_existing_or_default_behavior": False,
+            "optin_default_off": False,
+            "aligns_with_vision": True,
+            "recommend_merge": True,
+        },
+    }
+
+
+def _normalize_with_spans(candidate, verified):
+    bounded = dict(candidate)
+    bounded[render_card._VERIFIED_EVIDENCE_SPANS_FIELD] = tuple(verified)
+    return render_card.normalize_triage(bounded)
+
+
+def test_class_b_natural_prose_golden_corpus_admits():
+    """Card #2148 line 3 blockers 4-5: the linkage grammar must be
+    domain-neutral - taught templates in ANY repository's vocabulary admit,
+    instead of only the historical fixture domains (zero fleet admissions)."""
+    corpus = (
+        (
+            "Session cleanup dropped the export queue.",
+            "The export queue is preserved.",
+            "target-src/lib/export.py",
+        ),
+        (
+            "A race broke saved drafts.",
+            "Saved drafts are preserved.",
+            "target-src/lib/drafts.py",
+        ),
+        (
+            "Config reload lost custom keybindings.",
+            "Custom keybindings are restored.",
+            "target-src/lib/keys.py",
+        ),
+    )
+    with tempfile.TemporaryDirectory() as temp_dir:
+        target_file = os.path.join(temp_dir, "target.txt")
+        target_src = os.path.join(temp_dir, "target-src")
+
+        def apply_candidate(defect, restored, source):
+            source_file = os.path.join(target_src, source[len("target-src/") :])
+            os.makedirs(os.path.dirname(source_file), exist_ok=True)
+            with open(target_file, "w", encoding="utf-8") as output:
+                output.write(defect)
+            with open(source_file, "w", encoding="utf-8") as output:
+                output.write(restored)
+            candidate = _class_b_natural_candidate(defect, restored, source)
+            decision = render_card.decide_triage_apply(
+                json.dumps(candidate), "", target_file, target_src
+            )
+            triage = render_card.normalize_triage(decision.get("triage"))
+            return decision, (triage or {}).get("automerge_verdict")
+
+        for defect, restored, source in corpus:
+            decision, verdict = apply_candidate(defect, restored, source)
+            status, evidence, _ = render_card.behavior_admission_status(verdict)
+            check(
+                "class B golden corpus: %r admits end-to-end" % defect,
+                decision["outcome"] == "success"
+                and verdict.get("behavior_class") == "B"
+                and status == "admitted"
+                and evidence
+                == "class B with bounded corrected-defect and restored-behavior evidence"
+            )
+
+        # Natural qualified phrasing is the model's attested judgment, never a
+        # trusted-grammar concern (captain decision, card #2148 pivot): a
+        # mechanically valid package with a temporal qualifier admits; whether
+        # that qualifier changes the restoration object is judged by the model
+        # before it claims class B, per the prompt contract.
+        temporal_decision, temporal_verdict = apply_candidate(
+            "Session cleanup dropped the export queue after retries.",
+            "The export queue is preserved.",
+            "target-src/lib/export.py",
+        )
+        check(
+            "class B golden corpus: qualified natural phrasing admits mechanically",
+            temporal_decision["outcome"] == "success"
+            and render_card.behavior_admission_status(temporal_verdict)[0]
+            == "admitted",
+        )
+
+        duplicate_claim_decision, duplicate_claim_verdict = apply_candidate(
+            "Session cleanup dropped the export queue.",
+            "**SESSION   CLEANUP DROPPED THE EXPORT QUEUE.**",
+            "target-src/lib/export.py",
+        )
+        check(
+            "class B golden corpus: canonical duplicate claims stay denied",
+            duplicate_claim_decision["outcome"] == "success"
+            and render_card.behavior_admission_status(duplicate_claim_verdict)[0]
+            == "unavailable",
+        )
+
+        # The mechanical guarantee that DOES belong to trusted code: a claim
+        # whose evidence quote is not verbatim in the cited source never
+        # admits, regardless of how plausible the prose reads.
+        fabricated_decision, fabricated_verdict = apply_candidate(
+            "Session cleanup dropped the export queue.",
+            "The export queue is preserved.",
+            "target-src/lib/export.py",
+        )
+        fabricated_input = _class_b_natural_candidate(
+            "Session cleanup dropped the export queue.",
+            "The export queue is preserved and replicated hourly.",
+            "target-src/lib/export.py",
+        )
+        fabricated = render_card.decide_triage_apply(
+            json.dumps(fabricated_input), "", target_file, target_src
+        )
+        fabricated_triage = render_card.normalize_triage(fabricated.get("triage"))
+        check(
+            "class B golden corpus: a fabricated restoration quote stays denied",
+            fabricated_decision["outcome"] == "success"
+            and render_card.behavior_admission_status(fabricated_verdict)[0]
+            == "admitted"
+            and render_card.behavior_admission_status(
+                (fabricated_triage or {}).get("automerge_verdict")
+            )[0]
+            == "unavailable",
+        )
+
+
+def test_behavior_admission_reads_declared_enums_never_prose():
+    """Captain decision (card #2148 pivot): trusted admission performs no
+    linguistic analysis of prose or quotes. No text creates a coverage duty,
+    and the contradiction record derives solely from the model's own declared
+    assertion subject/effect enums."""
+
+    def class_a_candidate(**overrides):
+        value = {
+            "summary": "Fixes an export regression in session cleanup.",
+            "product_implications": "Routine low-risk fix.",
+            "recommended_action": "merge",
+            "recommended_reason": "Narrow fix.",
+            "evidence": (
+                "target-src/lib/export.py: "
+                "'if mode == default: verdict = 1; run default behavior check.'"
+            ),
+            "automerge": {
+                "behavior_class": "A",
+                "behavior_assertions": [],
+                "changes_existing_or_default_behavior": False,
+                "optin_default_off": False,
+            },
+        }
+        value.update(overrides)
+        return value
+
+    junk_verdict = _normalize_with_spans(class_a_candidate(), ())[
+        "automerge_verdict"
+    ]
+    check(
+        "declared enums: quoted code fragments create no coverage duty",
+        render_card.behavior_admission_status(junk_verdict)[0] == "admitted",
+    )
+    # Prose is never parsed by trusted code: the model attests its judgment in
+    # the declared verdict fields, so contract-bearing prose alone does not
+    # deny - the honesty duty lives in the prompt contract, and a dishonest
+    # attested verdict is a model-quality issue, not a trusted-grammar one.
+    prose_only = class_a_candidate(
+        product_implications="This tightens the default behavior of exports."
+    )
+    prose_only_verdict = _normalize_with_spans(prose_only, ())["automerge_verdict"]
+    check(
+        "declared enums: prose alone neither denies nor contradicts",
+        render_card.behavior_admission_status(prose_only_verdict)[0] == "admitted",
+    )
+    contra_claim = "The default behavior is changed."
+    contradiction = class_a_candidate(product_implications=contra_claim)
+    contradiction["automerge"] = dict(contradiction["automerge"])
+    contradiction["automerge"]["behavior_assertions"] = [
+        {
+            "claim": contra_claim,
+            "subject": "default_behavior",
+            "effect": "changed",
+            "evidence": {"source": "target.txt", "quote": contra_claim},
+        }
+    ]
+    contradiction_verdict = _normalize_with_spans(
+        contradiction,
+        (("target.txt", render_card._normalize_evidence_text(contra_claim)),),
+    )["automerge_verdict"]
+    check(
+        "declared enums: a declared contract change reads contradictory",
+        render_card.behavior_admission_status(contradiction_verdict)[0]
+        == "contradictory",
+    )
+    doc_claim = "Documentation is updated."
+    extra = class_a_candidate(
+        summary="Adds usage notes for the export command.",
+        product_implications="Routine low-risk docs improvement.",
+        evidence="target.txt: '%s'" % doc_claim,
+    )
+    extra["automerge"] = dict(extra["automerge"])
+    extra["automerge"]["behavior_assertions"] = [
+        {
+            "claim": doc_claim,
+            "subject": "documentation_or_tests",
+            "effect": "changed",
+            "evidence": {"source": "target.txt", "quote": doc_claim},
+        }
+    ]
+    extra_verdict = _normalize_with_spans(
+        extra,
+        (("target.txt", render_card._normalize_evidence_text(doc_claim)),),
+    )["automerge_verdict"]
+    check(
+        "declared enums: a documentation-only declared change stays admitted",
+        render_card.behavior_admission_status(extra_verdict)[0] == "admitted",
+    )
 
 
 # --------------------------------------------------------------------------- #

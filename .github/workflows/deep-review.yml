@@ -72,6 +72,12 @@ on:
       head_sha:
         description: "Target PR head SHA from the decision-card state"
         required: false
+      revision:
+        description: "Exact target revision (PR head or issue updatedAt)"
+        required: false
+      trigger_event_id:
+        description: "Normalized source trigger identity from the trusted parent"
+        required: false
 
 permissions:
   actions: write
@@ -114,6 +120,29 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
+    outputs:
+      gate_mode: ${{ steps.gate.outputs.mode }}
+      issue: ${{ steps.target.outputs.issue }}
+      slug: ${{ steps.resolve.outputs.slug }}
+      repo: ${{ steps.resolve.outputs.repo }}
+      number: ${{ steps.resolve.outputs.number }}
+      kind: ${{ steps.resolve.outputs.kind }}
+      revision: ${{ steps.resolve.outputs.revision }}
+      head_ok: ${{ steps.verify_head.outputs.head_ok }}
+      head_verdict: ${{ steps.verify_head.outputs.verdict }}
+      event_admitted: ${{ steps.event-claim.outputs.admitted }}
+      event_action: ${{ steps.event-claim.outputs.action }}
+      event_key: ${{ steps.event-claim.outputs.event_key }}
+      claim_id: ${{ steps.event-claim.outputs.comment_id }}
+      claim_marker: ${{ steps.event-claim.outputs.marker }}
+      pre_model_fresh: ${{ steps.pre-model-freshness.outputs.fresh }}
+      claude_ready: ${{ steps.claude-model.outcome == 'success' }}
+      input_artifact: ${{ steps.claude-model.outputs.input-artifact }}
+      output_artifact: ${{ steps.claude-model.outputs.output-artifact }}
+      handoff_sha256: ${{ steps.claude-model.outputs.handoff-sha256 }}
+      correlation_id: ${{ steps.claude-model.outputs.correlation-id }}
+      child_timeout_minutes: ${{ steps.claude-model.outputs.child-timeout-minutes }}
+      codex_result_artifact: ${{ steps.codex-result-name.outputs.artifact }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -165,6 +194,9 @@ jobs:
           INPUT_NUMBER: ${{ github.event.inputs.number }}
           INPUT_KIND: ${{ github.event.inputs.kind }}
           INPUT_HEAD_SHA: ${{ github.event.inputs.head_sha }}
+          INPUT_REVISION: ${{ github.event.inputs.revision }}
+          INPUT_TRIGGER_EVENT_ID: ${{ github.event.inputs.trigger_event_id }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ "$EVENT_NAME" = "workflow_dispatch" ] &&
@@ -175,6 +207,7 @@ jobs:
             number="$INPUT_NUMBER"
             kind="$INPUT_KIND"
             head_sha="$INPUT_HEAD_SHA"
+            revision="$INPUT_REVISION"
           else
             if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
               ISSUE_BODY="$(gh issue view "$INPUT_ISSUE" --json body --jq .body)"
@@ -186,6 +219,10 @@ jobs:
             number="$(python scripts/wheelhouse_core.py state number)"
             kind="$(python scripts/wheelhouse_core.py state kind)"
             head_sha="$(python scripts/wheelhouse_core.py state head_sha)"
+            revision="$head_sha"
+            if [ -z "$revision" ]; then
+              revision="$(python scripts/wheelhouse_core.py state updated_at)"
+            fi
           fi
 
           case "$kind" in
@@ -204,12 +241,31 @@ jobs:
             echo "::error::invalid target head SHA: $head_sha"
             exit 1
           fi
+          if [ "$kind" = "issue-triage" ]; then
+            if ! printf '%s' "$revision" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'; then
+              echo "::error::invalid target issue revision: $revision"
+              exit 1
+            fi
+          elif [ "$revision" != "$head_sha" ]; then
+            echo "::error::target revision does not match PR head"
+            exit 1
+          fi
+          trigger_event_id="$INPUT_TRIGGER_EVENT_ID"
+          if [ -z "$trigger_event_id" ]; then
+            if [ "$EVENT_NAME" = "issues" ]; then
+              trigger_event_id="label:$WORKFLOW_RUN_ID"
+            else
+              trigger_event_id="manual:$WORKFLOW_RUN_ID"
+            fi
+          fi
 
           {
             echo "repo=$repo"
             echo "number=$number"
             echo "kind=$kind"
             echo "head_sha=$head_sha"
+            echo "revision=$revision"
+            echo "trigger_event_id=$trigger_event_id"
             echo "slug=${GITHUB_REPOSITORY_OWNER}/${repo}"
             if [ "$kind" = "issue-triage" ]; then
               echo "ref="                         # empty -> the target's default branch
@@ -218,7 +274,24 @@ jobs:
             fi
           } >> "$GITHUB_OUTPUT"
 
-      # The ONLY gate: the model credential must be present. No config flag.
+      - id: source-policy
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Defer to source-policy reconciliation
+        if: steps.source-policy.outputs.admitted != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run scan-backstop.yml
+          exit 1
+
+      # The ONLY model gate: the model credential must be present. No config flag.
       - id: gate
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -231,6 +304,27 @@ jobs:
             action="deep-review.local"
           fi
           python scripts/agent_runtime.py auth-status --action "$action" --repo "$TARGET_REPO"
+
+      - name: Record denied deep-review admission
+        if: steps.gate.outputs.enabled != 'true' && steps.resolve.outputs.revision != ''
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.resolve.outputs.repo }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+          ISSUE: ${{ steps.target.outputs.issue }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
+          EVENT_ID: ${{ steps.resolve.outputs.trigger_event_id }}
+          HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
+        run: |
+          if [ "$HAS_READONLY_TOKEN" = "true" ]; then action="deep-review.search"; else action="deep-review.local"; fi
+          event_key="$(python scripts/agent_runtime.py event-key \
+            --action "$action" --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            --event-id "$EVENT_ID")"
+          python scripts/agent_runtime.py stage \
+            --action "$action" --source-sha "${{ github.sha }}" \
+            --event-key "$event_key" --stage denied --status skipped \
+            --code admission.auth_unavailable
 
       # Token absent: self-explain on the card instead of silently no-opping.
       - name: Explain missing token
@@ -281,12 +375,29 @@ jobs:
             echo "head_ok=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - id: final-source-policy
+        if: steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
+      - name: Queue final deep-review source-policy reconciliation
+        if: ${{ steps.final-source-policy.outputs.admitted == 'false' && (steps.final-source-policy.outputs.mode == 'fork-reject' || steps.final-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
       # Optional read-only model search. READONLY_TOKEN is a public-read token
       # that may be safely handed to Claude for context gathering. If the secret
       # is absent, the prompt and Claude tool list stay in the production no-search
       # mode.
       - id: readonly
-        if: steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false'
+        if: steps.final-source-policy.outputs.admitted == 'true'
         env:
           HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
         run: |
@@ -297,6 +408,73 @@ jobs:
             echo "deep-review readonly search disabled (READONLY_TOKEN absent)"
           fi
 
+      - id: event-claim
+        name: Claim the exact deep-review trigger before spend
+        if: steps.final-source-policy.outputs.admitted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ steps.resolve.outputs.repo }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+          ISSUE: ${{ steps.target.outputs.issue }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
+          EVENT_ID: ${{ steps.resolve.outputs.trigger_event_id }}
+          HAS_READONLY_TOKEN: ${{ secrets.READONLY_TOKEN != '' }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_READONLY_TOKEN" = "true" ]; then action="deep-review.search"; else action="deep-review.local"; fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          python scripts/agent_claim.py \
+            --action "$action" --owner "$OWNER" --repo "$REPO" \
+            --number "$NUMBER" --issue "$ISSUE" --revision "$REVISION" \
+            --event-id "$EVENT_ID" --repo-slug "$REPO_SLUG"
+
+      - id: pre-model-freshness
+        name: Verify target revision before deep-review task build
+        if: steps.event-claim.outputs.admitted == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.resolve.outputs.slug }}
+          NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          EXPECTED_REVISION: ${{ steps.resolve.outputs.revision }}
+          CLAIM_ID: ${{ steps.event-claim.outputs.comment_id }}
+          CLAIM_MARKER: ${{ steps.event-claim.outputs.marker }}
+          CARD_REPO: ${{ github.repository }}
+        run: |
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            body="Deep review was rejected before task construction because the target revision changed or could not be verified. The card remains open and no target action was taken. ${CLAIM_MARKER}"
+            GH_TOKEN="$CARD_TOKEN" gh api --method PATCH \
+              "repos/$CARD_REPO/issues/comments/$CLAIM_ID" -f "body=$body" >/dev/null
+            python scripts/agent_runtime.py stage \
+              --action "${{ steps.event-claim.outputs.action }}" \
+              --source-sha "${{ github.sha }}" \
+              --event-key "${{ steps.event-claim.outputs.event_key }}" \
+              --stage stale --status failed --code target.stale
+          fi
+
+      - name: Record deep-review admission stage
+        if: always() && steps.event-claim.outputs.event_key != ''
+        run: |
+          status="skipped"; code="admission.duplicate"
+          if [ "${{ steps.event-claim.outputs.admitted }}" = "true" ]; then status="ok"; code="admission.admitted"; fi
+          python scripts/agent_runtime.py stage \
+            --action "${{ steps.event-claim.outputs.action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ steps.event-claim.outputs.event_key }}" \
+            --stage admitted --status "$status" --code "$code"
+
       # Build the prompt: the workflow instruction text plus read-only context.
       # The card body uses the default token; the diff/issue uses FLEET_TOKEN.
       # Pass-by-reference: the target title/body/diff is written to target.txt
@@ -305,7 +483,7 @@ jobs:
       # small and PR-size-independent. Only the small this-repo card body is
       # still inlined.
       - id: prepare
-        if: steps.gate.outputs.enabled == 'true' && steps.verify_head.outputs.head_ok != 'false'
+        if: steps.pre-model-freshness.outputs.fresh == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           FLEET_TOKEN: ${{ secrets.FLEET_TOKEN }}
@@ -424,35 +602,63 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - id: search-tool
-        if: ${{ steps.gate.outputs.enabled == 'true' && steps.gate.outputs.mode == 'claude' && steps.verify_head.outputs.head_ok != 'false' && steps.readonly.outputs.enabled == 'true' }}
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' && steps.readonly.outputs.enabled == 'true' }}
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
           TARGET_REPO: ${{ steps.resolve.outputs.slug }}
         run: echo "repos=$(python scripts/nl_readonly_search.py scope)" >> "$GITHUB_OUTPUT"
 
+      - id: task-source-policy
+        name: Recheck source permission at Claude task admission
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'claude' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: claude-task
         name: Build the immutable Claude deep-review AgentTask
-        if: ${{ steps.gate.outputs.enabled == 'true' && steps.gate.outputs.mode == 'claude' && steps.verify_head.outputs.head_ok != 'false' }}
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.task-source-policy.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.resolve.outputs.repo }}
           NUMBER: ${{ steps.resolve.outputs.number }}
           KIND: ${{ steps.resolve.outputs.kind }}
-          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
           SEARCH: ${{ steps.readonly.outputs.enabled }}
           WHEELHOUSE_REVISION: ${{ github.sha }}
           BUNDLE: ${{ runner.temp }}/wheelhouse-claude-deep-review
+          EVENT_KEY: ${{ steps.event-claim.outputs.event_key }}
         run: |
           set -euo pipefail
           if [ "$SEARCH" = "true" ]; then action="deep-review.search"; else action="deep-review.local"; fi
           repository_commit="$(git -C target-src rev-parse HEAD)"
-          revision="${HEAD_SHA:-$repository_commit}"
           python scripts/agent_runtime.py build-task \
             --action "$action" --prompt prompt.txt --bundle "$BUNDLE" \
             --out "$BUNDLE/task.json" --owner "$OWNER" --repo "$REPO" \
-            --number "$NUMBER" --kind "$KIND" --revision "$revision" \
+            --number "$NUMBER" --kind "$KIND" --revision "$REVISION" \
             --wheelhouse-revision "$WHEELHOUSE_REVISION" --target-file target.txt \
-            --repository-dir target-src --repository-commit "$repository_commit"
+            --repository-dir target-src --repository-commit "$repository_commit" \
+            --event-key "$EVENT_KEY"
+
+      - name: Queue Claude task-admission source-policy reconciliation
+        if: ${{ steps.task-source-policy.outputs.admitted == 'false' && (steps.task-source-policy.outputs.mode == 'fork-reject' || steps.task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
+
+      - name: Record deep-review task-build failure stage
+        if: ${{ always() && steps.event-claim.outputs.admitted == 'true' && steps.gate.outputs.mode == 'claude' && steps.claude-task.outcome == 'failure' }}
+        run: |
+          python scripts/agent_runtime.py stage \
+            --action "${{ steps.event-claim.outputs.action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ steps.event-claim.outputs.event_key }}" \
+            --stage task-failed --status failed --code task.build_failed
 
       - id: claude-model
         name: Run Claude deep review in the read-only model workflow
@@ -465,7 +671,7 @@ jobs:
           allowed-repos: ${{ steps.search-tool.outputs.repos || '[]' }}
 
       - name: Prepare the pinned Codex sandboxed adapter worker
-        if: ${{ steps.gate.outputs.enabled == 'true' && steps.gate.outputs.mode == 'codex' && steps.verify_head.outputs.head_ok != 'false' }}
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
         env:
           CODEX_PREFIX: ${{ runner.temp }}/wheelhouse-codex
         run: |
@@ -491,18 +697,31 @@ jobs:
           "$CODEX_PREFIX/node_modules/.bin/codex" --version | grep -Fx 'codex-cli 0.144.0'
           python scripts/agent_runtime.py verify-pins
 
+      - id: codex-task-source-policy
+        name: Recheck source permission at Codex task admission
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.gate.outputs.mode == 'codex' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          TARGET_NUMBER: ${{ steps.resolve.outputs.number }}
+          KIND: ${{ steps.resolve.outputs.kind }}
+          HEAD_SHA: ${{ steps.resolve.outputs.revision }}
+        run: python scripts/apply_decision.py source-policy
+
       - id: agent-runtime-task
         name: Build the immutable deep-review AgentTask
-        if: ${{ steps.gate.outputs.enabled == 'true' && steps.gate.outputs.mode == 'codex' && steps.verify_head.outputs.head_ok != 'false' }}
+        if: ${{ steps.pre-model-freshness.outputs.fresh == 'true' && steps.codex-task-source-policy.outputs.admitted == 'true' && steps.gate.outputs.mode == 'codex' }}
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ steps.resolve.outputs.repo }}
           NUMBER: ${{ steps.resolve.outputs.number }}
           KIND: ${{ steps.resolve.outputs.kind }}
-          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+          REVISION: ${{ steps.resolve.outputs.revision }}
           SEARCH: ${{ steps.readonly.outputs.enabled }}
           WHEELHOUSE_REVISION: ${{ github.sha }}
           BUNDLE: ${{ runner.temp }}/wheelhouse-agent-deep-review
+          EVENT_KEY: ${{ steps.event-claim.outputs.event_key }}
         run: |
           set -euo pipefail
           if [ "$SEARCH" = "true" ]; then
@@ -511,7 +730,6 @@ jobs:
             action="deep-review.local"
           fi
           repository_commit="$(git -C target-src rev-parse HEAD)"
-          revision="${HEAD_SHA:-$repository_commit}"
           python scripts/agent_runtime.py build-task \
             --action "$action" \
             --prompt prompt.txt \
@@ -521,11 +739,18 @@ jobs:
             --repo "$REPO" \
             --number "$NUMBER" \
             --kind "$KIND" \
-            --revision "$revision" \
+            --revision "$REVISION" \
             --wheelhouse-revision "$WHEELHOUSE_REVISION" \
             --target-file target.txt \
             --repository-dir target-src \
-            --repository-commit "$repository_commit"
+            --repository-commit "$repository_commit" \
+            --event-key "$EVENT_KEY"
+
+      - name: Queue Codex task-admission source-policy reconciliation
+        if: ${{ steps.codex-task-source-policy.outputs.admitted == 'false' && (steps.codex-task-source-policy.outputs.mode == 'fork-reject' || steps.codex-task-source-policy.outputs.mode == 'pushability-unverified') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run scan-backstop.yml
 
       - id: agent-runtime
         name: Run deep review through the Codex app-server contract
@@ -547,18 +772,142 @@ jobs:
         if: ${{ always() && steps.agent-runtime.outputs.result != '' }}
         run: python scripts/agent_runtime.py summary --result '${{ steps.agent-runtime.outputs.result }}'
 
-      # Post the normalized verdict on the card with THIS repo's token.
-      - name: Post the verdict on the card
-        if: ${{ always() && steps.gate.outputs.enabled == 'true' }}
+      - id: codex-result-name
+        if: ${{ always() && steps.agent-runtime.outputs.result != '' }}
+        run: echo "artifact=wheelhouse-deep-codex-result-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the normalized Codex deep-review result
+        if: ${{ always() && steps.agent-runtime.outputs.result != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.codex-result-name.outputs.artifact }}
+          path: ${{ steps.agent-runtime.outputs.result }}
+          if-no-files-found: error
+          retention-days: 1
+
+  deep-model:
+    needs: deep-review
+    if: ${{ needs.deep-review.outputs.claude_ready == 'true' }}
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/claude-model.yml
+    with:
+      input_artifact: ${{ needs.deep-review.outputs.input_artifact }}
+      output_artifact: ${{ needs.deep-review.outputs.output_artifact }}
+      handoff_sha256: ${{ needs.deep-review.outputs.handoff_sha256 }}
+      expected_commit_sha: ${{ github.sha }}
+      correlation_id: ${{ needs.deep-review.outputs.correlation_id }}
+      child_timeout_minutes: ${{ fromJSON(needs.deep-review.outputs.child_timeout_minutes) }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      READONLY_TOKEN: ${{ secrets.READONLY_TOKEN }}
+
+  deep-review-consume:
+    needs: [deep-review, deep-model]
+    if: ${{ always() && needs.deep-review.outputs.event_admitted == 'true' }}
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install deps
+        run: pip install --quiet pyyaml
+
+      - id: trusted-src
+        run: |
+          set -euo pipefail
+          trusted="${RUNNER_TEMP}/wheelhouse-trusted-src"
+          python_path="$(command -v python)"
+          gh_path="$(command -v gh)"
+          safe_path="$(dirname "$python_path"):$(dirname "$gh_path"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          rm -rf "$trusted"
+          mkdir -p "$trusted"
+          tar --exclude=.git -cf - . | tar -xf - -C "$trusted"
+          find "$trusted" -type f -exec chmod a-w {} +
+          find "$trusted" -type d -exec chmod a-w {} +
+          {
+            echo "path=$trusted"
+            echo "python=$python_path"
+            echo "safe_path=$safe_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: claude-result
+        name: Receive the trusted normalized deep-review result
+        if: ${{ needs.deep-review.outputs.gate_mode == 'claude' && needs.deep-model.outputs.result_artifact != '' }}
+        continue-on-error: true
+        uses: ./.github/actions/claude-model-result
+        with:
+          artifact: ${{ needs.deep-model.outputs.result_artifact }}
+          invocation-id: deep-review
+
+      - id: codex-result
+        name: Receive the normalized Codex deep-review result
+        if: ${{ needs.deep-review.outputs.gate_mode == 'codex' && needs.deep-review.outputs.codex_result_artifact != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.deep-review.outputs.codex_result_artifact }}
+          path: ${{ runner.temp }}/wheelhouse-deep-codex-result
+
+      - id: post-model-freshness
+        name: Re-read target revision before deep-review projection
+        if: ${{ needs.deep-review.outputs.pre_model_fresh == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_TOKEN }}
+          CARD_TOKEN: ${{ github.token }}
+          SLUG: ${{ needs.deep-review.outputs.slug }}
+          NUMBER: ${{ needs.deep-review.outputs.number }}
+          KIND: ${{ needs.deep-review.outputs.kind }}
+          EXPECTED_REVISION: ${{ needs.deep-review.outputs.revision }}
+          CLAIM_ID: ${{ needs.deep-review.outputs.claim_id }}
+          CLAIM_MARKER: ${{ needs.deep-review.outputs.claim_marker }}
+          CARD_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          observed=""
+          if [ "$KIND" = "issue-triage" ]; then
+            observed="$(gh api "repos/$SLUG/issues/$NUMBER" --jq '.updated_at // empty' 2>/dev/null || true)"
+          else
+            observed="$(gh api "repos/$SLUG/pulls/$NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+          fi
+          if [ -n "$observed" ] && [ "$observed" = "$EXPECTED_REVISION" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            body="Deep review output was rejected because the target revision changed or could not be verified. The card remains open and no target action was taken. ${CLAIM_MARKER}"
+            GH_TOKEN="$CARD_TOKEN" gh api --method PATCH \
+              "repos/$CARD_REPO/issues/comments/$CLAIM_ID" -f "body=$body" >/dev/null
+            python scripts/agent_runtime.py stage \
+              --action "${{ needs.deep-review.outputs.event_action }}" \
+              --source-sha "${{ github.sha }}" \
+              --event-key "${{ needs.deep-review.outputs.event_key }}" \
+              --stage stale --status failed --code target.stale
+          fi
+
+      - id: verdict-consumer
+        name: Post the verdict on the card
+        if: ${{ steps.post-model-freshness.outputs.fresh == 'true' }}
         working-directory: ${{ steps.trusted-src.outputs.path }}
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ steps.target.outputs.issue }}
-          HEAD_OK: ${{ steps.verify_head.outputs.head_ok }}
-          HEAD_VERDICT: ${{ steps.verify_head.outputs.verdict }}
-          EXECUTION_FILE: ${{ steps.claude-model.outputs.result || steps.agent-runtime.outputs.result }}
-          TARGET_REPO: ${{ steps.resolve.outputs.repo }}
+          ISSUE: ${{ needs.deep-review.outputs.issue }}
+          HEAD_OK: ${{ needs.deep-review.outputs.head_ok }}
+          HEAD_VERDICT: ${{ needs.deep-review.outputs.head_verdict }}
+          EXECUTION_FILE: ${{ needs.deep-review.outputs.gate_mode == 'claude' && steps.claude-result.outputs.result || format('{0}/wheelhouse-deep-codex-result/result.json', runner.temp) }}
+          TARGET_REPO: ${{ needs.deep-review.outputs.repo }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          CLAIM_ID: ${{ needs.deep-review.outputs.claim_id }}
+          CLAIM_MARKER: ${{ needs.deep-review.outputs.claim_marker }}
           TRUSTED_PYTHON: ${{ steps.trusted-src.outputs.python }}
           TRUSTED_PATH: ${{ steps.trusted-src.outputs.safe_path }}
           TRUSTED_HOME: ${{ runner.temp }}/wheelhouse-gh-home
@@ -588,6 +937,8 @@ jobs:
             EXECUTION_FILE="${EXECUTION_FILE:-}" \
             TARGET_REPO="$TARGET_REPO" \
             GITHUB_REPOSITORY_OWNER="$GITHUB_REPOSITORY_OWNER" \
+            CLAIM_ID="$CLAIM_ID" \
+            CLAIM_MARKER="$CLAIM_MARKER" \
             "$TRUSTED_PYTHON" - <<'PY'
           import json
           import os
@@ -597,91 +948,41 @@ jobs:
           sys.path.insert(0, "scripts")
           import render_card as cards
           import wheelhouse_core as core
+          from agent_runtime.consumer import result_text
+          from agent_runtime.size_budget import bounded_github_comment
 
-          FALLBACK = "Deep review ran but produced no verdict (see the workflow run logs)."
-
-          def text_from_content(content):
-              if isinstance(content, str):
-                  return content.strip()
-              if not isinstance(content, list):
-                  return ""
-              parts = []
-              for item in content:
-                  if (
-                      isinstance(item, dict)
-                      and item.get("type") == "text"
-                      and isinstance(item.get("text"), str)
-                  ):
-                      text = item["text"].strip()
-                      if text:
-                          parts.append(text)
-              return "\n".join(parts).strip()
-
-          def extract_verdict(path):
-              if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
-                  return ""
+          verdict = ""
+          path = os.environ.get("EXECUTION_FILE", "")
+          if path:
               try:
-                  from agent_runtime.consumer import result_text
-                  normalized = result_text(path, require_success=True)
-                  if normalized:
-                      return normalized
-              except (ImportError, OSError, ValueError):
+                  verdict = result_text(path, require_success=True)
+              except (OSError, ValueError):
                   pass
-              try:
-                  with open(path, encoding="utf-8") as f:
-                      events = json.load(f)
-              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                  return ""
-              if not isinstance(events, list):
-                  return ""
-
-              for event in reversed(events):
-                  if (
-                      isinstance(event, dict)
-                      and event.get("type") == "result"
-                      and not event.get("is_error")
-                      and isinstance(event.get("result"), str)
-                      and event["result"].strip()
-                  ):
-                      return event["result"].strip()
-
-              for event in reversed(events):
-                  if isinstance(event, dict) and event.get("type") == "assistant":
-                      message = event.get("message")
-                      if isinstance(message, dict):
-                          text = text_from_content(message.get("content"))
-                          if text:
-                              return text
-              return ""
-
-          failed = False
+          failed = not verdict
           if os.environ.get("HEAD_OK") == "false":
-              verdict = os.environ.get("HEAD_VERDICT", "").strip()
-              if not verdict:
-                  verdict = "Deep review did not run because the target PR head moved after the card decision."
+              verdict = os.environ.get("HEAD_VERDICT", "").strip() or "Deep review did not run because the target PR head moved after the card decision."
               failed = True
-          else:
-              verdict = extract_verdict(os.environ.get("EXECUTION_FILE", ""))
-              if not verdict:
-                  verdict = FALLBACK
-                  failed = True
-
-          # The card lives in THIS (cards) repo, but the verdict is about the
-          # TARGET repo. Label known automated harness status lines, then
-          # qualify any bare `#N` the model wrote so it does not autolink to
-          # this repo instead. Owner/repo come from the deterministic `resolve`
-          # step output, never from the model text.
+          elif not verdict:
+              verdict = "Deep review ran but produced no verdict (see the workflow run logs)."
           verdict = cards.label_automated_status_lines(verdict)
-          verdict = core.qualify_issue_refs(
-              verdict,
-              os.environ.get("GITHUB_REPOSITORY_OWNER", ""),
-              os.environ.get("TARGET_REPO", ""),
-          )
-
-          subprocess.run(
-              ["gh", "issue", "comment", os.environ["ISSUE"], "--body", verdict],
-              check=True,
-          )
+          verdict = core.qualify_issue_refs(verdict, os.environ.get("GITHUB_REPOSITORY_OWNER", ""), os.environ.get("TARGET_REPO", ""))
+          body = bounded_github_comment(verdict, os.environ["CLAIM_MARKER"])
+          # The verdict may be up to its schema bound (65536 characters), so it
+          # is passed over stdin: a single argv/env string is capped by the
+          # kernel's MAX_ARG_STRLEN and must never carry model-sized text.
+          subprocess.run(["gh", "api", "--method", "PATCH", "repos/%s/issues/comments/%s" % (os.environ["GH_REPO"], os.environ["CLAIM_ID"]), "--input", "-"], check=True, input=json.dumps({"body": body}).encode("utf-8"))
           if failed:
               sys.exit(1)
           PY
+
+      - name: Record deep-review consumer stage
+        if: ${{ always() }}
+        run: |
+          status="failed"; stage="consumer-rejected"; code="consumer.rejected"
+          if [ "${{ steps.verdict-consumer.outcome }}" = "success" ]; then status="ok"; stage="consumer-committed"; code="consumer.committed"; fi
+          if [ "${{ needs.deep-review.outputs.pre_model_fresh }}" = "false" ] || [ "${{ steps.post-model-freshness.outputs.fresh }}" = "false" ]; then code="consumer.stale"; fi
+          python scripts/agent_runtime.py stage \
+            --action "${{ needs.deep-review.outputs.event_action }}" \
+            --source-sha "${{ github.sha }}" \
+            --event-key "${{ needs.deep-review.outputs.event_key }}" \
+            --stage "$stage" --status "$status" --code "$code"

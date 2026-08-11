@@ -7,6 +7,8 @@ is advisory, non-material state: auto_merge.py always re-evaluates live facts an
 never trusts a displayed or persisted row to authorize a merge.
 """
 
+import re
+
 CRITERIA_VERSION = 1
 STATUS_MET = "met"
 STATUS_UNMET = "unmet"
@@ -32,7 +34,7 @@ CRITERIA_SPECS = (
     ("g4_clean", "G4 - merge state clean"),
     ("g5_file_limit", "G5 - changed-file limit"),
     ("g5_line_limit", "G5 - changed-line limit"),
-    ("g6_triage_available", "G6 - automatic triage available"),
+    ("g6_triage_available", "G6 - automatic triage credential configured"),
     ("g6_triage_success", "G6 - successful triage for current head"),
     ("g6_merge_recommendation", "G6 - top-level recommendation is merge"),
     ("g6_behavior_class", "G6 - eligible behavior class"),
@@ -50,6 +52,32 @@ CRITERIA_SPECS = (
 
 CRITERIA_IDS = tuple(spec[0] for spec in CRITERIA_SPECS)
 CRITERIA_LABELS = dict(CRITERIA_SPECS)
+CRITERION_ID = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+
+# The exact G0 evidence the evaluator emits when the default branch carries no
+# readable VISION.md. The evaluator writes it and the card renderer reads it, so
+# the "needs VISION.md" hint on the vision-bound subtree is driven by the actual
+# G0 result instead of a substring heuristic over child evidence.
+G0_VISION_MISSING_EVIDENCE = "VISION.md missing or unreadable on the default branch"
+
+# These are presentation-only labels. The evaluator and persisted state keep
+# the machine value (including INELIGIBLE) unchanged.
+G6_MANUAL_REVIEW_LABEL = "MANUAL REVIEW REQUIRED"
+G6_INELIGIBLE_EXPLANATION = (
+    "Existing/default behavior changes do not qualify for automatic-merge "
+    "class A, B, or C."
+)
+
+
+def display_evidence(criterion_id, evidence):
+    """Return maintainer-facing evidence without changing criterion semantics."""
+    text = str(evidence or "").strip()
+    if (
+        str(criterion_id or "") == "g6_behavior_class"
+        and "not an eligible A/B/C class" in text
+    ):
+        return "%s - %s" % (G6_MANUAL_REVIEW_LABEL, G6_INELIGIBLE_EXPLANATION)
+    return text
 
 
 def unavailable_criteria(reason="criterion evidence was not produced"):
@@ -66,12 +94,7 @@ def unavailable_criteria(reason="criterion evidence was not produced"):
 
 
 def normalize_criteria(rows, missing_reason="criterion evidence was not produced"):
-    """Return one strict, ordered row for every stable criterion.
-
-    Unknown, duplicate, malformed, or missing rows never become met. They
-    degrade to explicit unavailable rows so old cards and partial handoffs fail
-    closed in the UI.
-    """
+    """Return strict stable rows followed by safe, ordered future rows."""
     by_id = {}
     duplicates = set()
     if isinstance(rows, list):
@@ -79,7 +102,7 @@ def normalize_criteria(rows, missing_reason="criterion evidence was not produced
             if not isinstance(row, dict):
                 continue
             criterion_id = str(row.get("id") or "").strip()
-            if criterion_id not in CRITERIA_LABELS:
+            if not CRITERION_ID.fullmatch(criterion_id):
                 continue
             if criterion_id in by_id:
                 duplicates.add(criterion_id)
@@ -88,9 +111,12 @@ def normalize_criteria(rows, missing_reason="criterion evidence was not produced
             if status not in STATUSES:
                 status = STATUS_UNAVAILABLE
             evidence = str(row.get("evidence") or "").strip()
+            label = CRITERIA_LABELS.get(criterion_id)
+            if label is None:
+                label = str(row.get("label") or criterion_id).strip() or criterion_id
             by_id[criterion_id] = {
                 "id": criterion_id,
-                "label": CRITERIA_LABELS[criterion_id],
+                "label": label,
                 "status": status,
                 "evidence": evidence or str(missing_reason),
             }
@@ -111,4 +137,16 @@ def normalize_criteria(rows, missing_reason="criterion evidence was not produced
                 "evidence": str(reason or "criterion evidence was not produced"),
             }
         )
+    for criterion_id in sorted(set(by_id) - set(CRITERIA_LABELS)):
+        if criterion_id in duplicates:
+            normalized.append(
+                {
+                    "id": criterion_id,
+                    "label": criterion_id,
+                    "status": STATUS_UNAVAILABLE,
+                    "evidence": "duplicate criterion evidence was rejected",
+                }
+            )
+        else:
+            normalized.append(by_id[criterion_id])
     return normalized

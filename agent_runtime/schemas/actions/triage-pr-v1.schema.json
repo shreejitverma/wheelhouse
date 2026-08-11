@@ -3,23 +3,158 @@
   "$id": "wheelhouse/triage-pr/v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "product_implications", "recommended_action", "recommended_reason", "evidence"],
+  "required": ["summary", "product_implications", "recommended_action", "recommended_reason", "evidence", "recommendation_basis"],
   "properties": {
     "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
     "product_implications": {"type": "string", "minLength": 1, "maxLength": 4000},
     "recommended_action": {"type": "string", "enum": ["merge", "request-changes", "decline", "close", "hold", "investigate", "comment"]},
     "recommended_reason": {"type": "string", "minLength": 1, "maxLength": 4000},
-    "evidence": {"type": "string", "minLength": 1, "maxLength": 8000},
+    "evidence": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "recommendation_basis": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "observation_id", "context_id"],
+          "properties": {
+            "kind": {"const": "other"},
+            "observation_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "context_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "observation_id", "context_id", "check_names"],
+          "properties": {
+            "kind": {"enum": ["configured-tests-not-run", "configured-tests-not-green"]},
+            "observation_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "context_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "check_names": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1, "maxLength": 300}
+            }
+          }
+        }
+      ]
+    },
+    "vision_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_owner", "target_repo", "target_number", "target_facts_sha256", "vision_sha", "vision_content_sha256", "base_sha", "target_head_sha", "applicable_criteria"],
+      "properties": {
+        "target_owner": {"type": "string", "minLength": 1, "maxLength": 100},
+        "target_repo": {"type": "string", "minLength": 1, "maxLength": 100},
+        "target_number": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "target_facts_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "vision_sha": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+        "vision_content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "base_sha": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+        "target_head_sha": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
+        "applicable_criteria": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "quote", "external_source_required"],
+            "properties": {
+              "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+              "quote": {"type": "string", "minLength": 8, "maxLength": 2048},
+              "external_source_required": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "source_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "requested_ref", "resolved_commit", "inspected_files"],
+      "properties": {
+        "url": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "requested_ref": {"type": "string", "minLength": 1, "maxLength": 255},
+        "resolved_commit": {"type": "string", "pattern": "^[0-9a-f]{40,64}$"},
+        "inspected_files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+              "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }
+        }
+      }
+    },
     "automerge": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["behavior_class", "aligns_with_vision", "changes_existing_or_default_behavior", "optin_default_off", "recommend_merge"],
+      "required": ["behavior_class", "changes_existing_or_default_behavior", "optin_default_off"],
       "properties": {
         "behavior_class": {"type": "string", "enum": ["A", "B", "C", "ineligible"]},
+        "behavior_assertions": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 12,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["claim", "subject", "effect", "evidence"],
+            "properties": {
+              "claim": {"type": "string", "minLength": 1, "maxLength": 700},
+              "subject": {"type": "string", "enum": ["existing_mode", "default_behavior", "existing_workflow", "delivery_contract", "documentation_or_tests"]},
+              "effect": {"type": "string", "enum": ["unchanged", "restored", "changed", "tightened", "new_requirement"]},
+              "evidence": {"$ref": "#/$defs/behaviorEvidenceRef"}
+            }
+          }
+        },
+        "class_b_restoration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["corrected_defect", "corrected_defect_evidence", "intended_behavior_restored", "intended_behavior_restored_evidence"],
+          "properties": {
+            "corrected_defect": {"type": "string", "minLength": 12, "maxLength": 500},
+            "corrected_defect_evidence": {"$ref": "#/$defs/evidenceRef"},
+            "intended_behavior_restored": {"type": "string", "minLength": 12, "maxLength": 500},
+            "intended_behavior_restored_evidence": {"$ref": "#/$defs/evidenceRef"}
+          }
+        },
+        "external_source_required": {"type": "boolean"},
         "aligns_with_vision": {"type": "boolean"},
         "changes_existing_or_default_behavior": {"type": "boolean"},
         "optin_default_off": {"type": "boolean"},
         "recommend_merge": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "quote"],
+      "properties": {
+        "source": {"type": "string", "pattern": "^(target\\.txt|target-src/[A-Za-z0-9._/-]{1,900})$"},
+        "quote": {"type": "string", "minLength": 12, "maxLength": 2048}
+      }
+    },
+    "behaviorEvidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "quote"],
+      "properties": {
+        "source": {"type": "string", "pattern": "^(target\\.txt|vision\\.md|target-src/[A-Za-z0-9._/-]{1,900})$"},
+        "quote": {"type": "string", "minLength": 12, "maxLength": 2048}
       }
     }
   }
