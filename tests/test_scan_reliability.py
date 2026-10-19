@@ -23,6 +23,7 @@ from contextlib import redirect_stderr, redirect_stdout
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
 )
+import auto_merge  # noqa: E402
 import wheelhouse_core as core  # noqa: E402
 
 _failures = []
@@ -882,6 +883,50 @@ def test_build_repo_multipage_ok_and_complete():
     check("build-multipage: all merge-ready cards emitted", len(items) == 45)
 
 
+def test_build_repo_items_carry_the_auto_merge_label_observation():
+    """Scan items feed auto-merge's escape hatch, which fails closed without a
+    complete label observation, so every merge-ready item must carry one."""
+    unlabeled = _full_pr(1)
+    awaiting = _full_pr(2)
+    awaiting["labels"] = {
+        "totalCount": 1,
+        "nodes": [{"name": core.AWAITING_CAPTAIN_CONFIRM_LABEL}],
+    }
+    truncated = _full_pr(3)
+    truncated["labels"] = {"totalCount": 150, "nodes": [{"name": "bug"}]}
+    first = {
+        "totalCount": 3,
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [unlabeled, awaiting, truncated],
+    }
+    _result, items, _ = _run_build_repo(first)
+    by_number = {item["number"]: item for item in items}
+    check(
+        "build-labels: every merge-ready PR is emitted",
+        sorted(by_number) == [1, 2, 3]
+        and all(item["bucket"] == "merge-ready" for item in items),
+    )
+    check(
+        "build-labels: an unlabeled PR carries a complete empty observation",
+        by_number[1].get("labels") == [] and by_number[1].get("labels_truncated") is False,
+    )
+    check(
+        "build-labels: auto-merge accepts the unlabeled PR's observation",
+        auto_merge._bulk_confirmation_label_hold(by_number[1]) == (False, ""),
+    )
+    check(
+        "build-labels: a pending captain confirmation holds auto-merge",
+        auto_merge._bulk_confirmation_label_hold(by_number[2])
+        == (True, "assisted resolution awaits captain confirmation"),
+    )
+    check(
+        "build-labels: a truncated label connection holds auto-merge",
+        by_number[3].get("labels_truncated") is True
+        and auto_merge._bulk_confirmation_label_hold(by_number[3])
+        == (True, "target label observation is incomplete"),
+    )
+
+
 def test_build_repo_midpage_failure_truncates():
     first = {
         "totalCount": 45,
@@ -930,6 +975,7 @@ def main():
     test_cmd_scan_health_ledger_io_error_fails_open()
     test_build_repo_multipage_ok_and_complete()
     test_build_repo_midpage_failure_truncates()
+    test_build_repo_items_carry_the_auto_merge_label_observation()
     print()
     if _failures:
         print("%d FAILED: %s" % (len(_failures), ", ".join(_failures)))

@@ -3920,6 +3920,8 @@ def _ci_wait_refresh_item(
         "priority": "low",
         "base_sha": pr.get("base_sha") or "",
         "auto_triage": auto_triage_enabled,
+        "labels": list(pr.get("labels") or []),
+        "labels_truncated": bool(pr.get("labels_truncated")),
     }
     if observation:
         item["target_observation"] = observation
@@ -4408,6 +4410,11 @@ def build_repo(
             "same_closing_issue_overlap": overlap,
             "pushability": pushability.get("mode", PUSHABILITY_UNVERIFIED),
             "mergeable": pr.get("mergeable"),
+            # The complete-scan label observation is the bulk input to the
+            # auto-merge escape hatch (assisted-confirmation hold). It fails
+            # closed when absent, so every merge candidate must carry it.
+            "labels": list(pr.get("labels") or []),
+            "labels_truncated": bool(pr.get("labels_truncated")),
         }
         initial_observation = target_contracts.normalize_observation(
             pr.get("target_observation")

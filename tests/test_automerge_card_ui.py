@@ -79,6 +79,8 @@ def item(**overrides):
         "priority": "med",
         "auto_triage": True,
         "same_closing_issue_overlap": "",
+        "labels": [],
+        "labels_truncated": False,
     }
     value.update(overrides)
     return value
@@ -259,6 +261,14 @@ def live_pr(**overrides):
     return value
 
 
+def live_label_state(pr_value, label):
+    """The live single-label read, answered from the stubbed live PR."""
+    labels = (pr_value or {}).get("labels")
+    if not isinstance(labels, list):
+        return None
+    return label in {value.get("name") for value in labels if isinstance(value, dict)}
+
+
 def evaluate(
     *,
     item_value=None,
@@ -294,6 +304,15 @@ def evaluate(
             )
             stack.enter_context(
                 patch.object(am, "immutable_compare_files", return_value=files)
+            )
+            stack.enter_context(
+                patch.object(
+                    core,
+                    "target_label_state",
+                    side_effect=lambda owner, repo, number, label: (
+                        live_label_state(pr_value, label)
+                    ),
+                )
             )
             return am.evaluate_candidate(
                 "kunchenguid",
@@ -1605,6 +1624,17 @@ def test_triage_write_atomically_re_evaluates_and_replaces_stale_criteria():
                 )
             )
             stack.enter_context(patch.object(am, "live_pr", return_value=live_pr()))
+            label_reads = []
+            stack.enter_context(
+                patch.object(
+                    core,
+                    "target_label_state",
+                    side_effect=lambda owner, repo, number, label: (
+                        label_reads.append((owner, repo, number, label))
+                        or live_label_state(live_pr(), label)
+                    ),
+                )
+            )
             stack.enter_context(
                 patch.object(am, "has_prior_merged_pr", return_value=False)
             )
@@ -1687,6 +1717,11 @@ def test_triage_write_atomically_re_evaluates_and_replaces_stale_criteria():
         and written_rows["g6_merge_recommendation"]["status"] == schema.STATUS_MET
         and "✅ **MET** `G6 - successful triage for current head`" in written_body
         and "✅ **MET** `G6 - top-level recommendation is merge`" in written_body,
+    )
+    check(
+        "atomic: the card path reads the live confirmation label for the escape hatch",
+        ("kunchenguid", "axi", 96, core.AWAITING_CAPTAIN_CONFIRM_LABEL) in label_reads
+        and written_rows["safety_escape_hatch"]["status"] == schema.STATUS_MET,
     )
 
 
