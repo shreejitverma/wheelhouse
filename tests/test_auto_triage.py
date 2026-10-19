@@ -1444,7 +1444,11 @@ def test_should_auto_triage_cache_and_gates():
 def test_should_auto_triage_invalidates_base_and_vision_revisions():
     base_a = "a" * 40
     base_b = "b" * 40
-    it = item(base_sha=base_a, automerge_vision_sha="vision-a")
+    vision_a = "c" * 40
+    vision_b = "d" * 40
+    it = item(
+        base_sha=base_a, automerge_vision_sha=vision_a, triage_vision_status="present"
+    )
     pure = labels("needs-decision", "kind:pr-review")
     fresh = core.parse_state_block(
         rc.body_with_triage_queued(rc.render(it)["body"], it)
@@ -1456,7 +1460,11 @@ def test_should_auto_triage_invalidates_base_and_vision_revisions():
     check(
         "cache: changed base requeues triage for the same head",
         rc.should_auto_triage(
-            item(base_sha=base_b, automerge_vision_sha="vision-a"),
+            item(
+                base_sha=base_b,
+                automerge_vision_sha=vision_a,
+                triage_vision_status="present",
+            ),
             fresh,
             pure,
             has_token=True,
@@ -1466,7 +1474,11 @@ def test_should_auto_triage_invalidates_base_and_vision_revisions():
     check(
         "cache: changed VISION requeues triage for the same head",
         rc.should_auto_triage(
-            item(base_sha=base_a, automerge_vision_sha="vision-b"),
+            item(
+                base_sha=base_a,
+                automerge_vision_sha=vision_b,
+                triage_vision_status="present",
+            ),
             fresh,
             pure,
             has_token=True,

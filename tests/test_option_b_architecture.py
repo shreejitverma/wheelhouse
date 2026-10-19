@@ -5,6 +5,7 @@ No test in this module performs a network call or mutates a live card/target.
 """
 
 import copy
+import hashlib
 import io
 import inspect
 import json
@@ -44,11 +45,20 @@ def check(name, condition):
         FAILURES.append(name)
 
 
+def head_sha(label):
+    """A deterministic 40-hex head SHA per PR label.
+
+    Triage admission binds only well-formed revisions, so fixture heads must
+    look like real commit SHAs; the same label always maps to the same SHA.
+    """
+    return hashlib.sha1(("head-%s" % label).encode()).hexdigest()
+
+
 def observation(
     number=901,
-    head="head-901",
+    head=head_sha(901),
     *,
-    base="base-main",
+    base="b" * 40,
     checks=None,
     paths=None,
     bucket="merge-ready",
@@ -288,17 +298,17 @@ def test_review_observation_contract_and_v1_compatibility():
 
 
 def test_decision_context_contract():
-    obs901 = observation(901, "head-901", paths=["src/central.py", "src/queue.py"])
+    obs901 = observation(901, head_sha(901), paths=["src/central.py", "src/queue.py"])
     rows = [
         candidate(
             901,
-            "head-901",
+            head_sha(901),
             ["src/central.py", "src/queue.py"],
             references=[{"owner": "owner", "repo": "tasks-axi", "number": 21}],
             card_issue=1901,
         ),
-        candidate(905, "head-905", ["src/central.py", "src/writer.py"], card_issue=1905),
-        candidate(21, "head-21", ["packages/tasks.py"], card_issue=1921, repo="tasks-axi"),
+        candidate(905, head_sha(905), ["src/central.py", "src/writer.py"], card_issue=1905),
+        candidate(21, head_sha(21), ["packages/tasks.py"], card_issue=1921, repo="tasks-axi"),
     ]
     context = context_for(obs901, rows)
     relations = {
@@ -375,7 +385,7 @@ def test_decision_context_contract():
         )
     later_observation = observation(
         901,
-        "head-901",
+        head_sha(901),
         paths=["src/central.py", "src/queue.py"],
         observed_at="2026-07-23T13:00:00Z",
     )
@@ -407,14 +417,14 @@ def test_decision_context_contract():
     cross_repo_rows = [
         candidate(
             901,
-            "head-901",
+            head_sha(901),
             ["src/central.py"],
             references=[{"owner": "owner", "repo": "tasks-axi", "number": 21}],
             closing_issues=[10],
         ),
         candidate(
             21,
-            "head-21",
+            head_sha(21),
             ["packages/tasks.py"],
             closing_issues=[10],
             repo="tasks-axi",
@@ -443,10 +453,10 @@ def test_decision_context_contract():
     )
     many_paths = ["src/shared-%s.py" % index for index in range(5)]
     relation_bound = context_for(
-        observation(901, "head-901", paths=many_paths),
+        observation(901, head_sha(901), paths=many_paths),
         [
-            candidate(901, "head-901", many_paths),
-            candidate(905, "head-905", many_paths),
+            candidate(901, head_sha(901), many_paths),
+            candidate(905, head_sha(905), many_paths),
         ],
     )
     shared = relation_bound["candidates"][0]["relations"][0]["paths"]
@@ -556,7 +566,7 @@ def test_assessment_admission_and_class_tristate():
         "contract: assessment tampering is rejected",
         admission.normalize_assessment(stale) is None,
     )
-    other_obs = observation(902, "head-902")
+    other_obs = observation(902, head_sha(902))
     other_context = context_for(other_obs)
     stale_binding = admission.admit_assessment(
         {
@@ -908,8 +918,8 @@ def test_incomplete_v2_context_allows_advisory_spend():
     rotated_context = context_for(
         obs,
         [
-            candidate(901, "head-901", ["src/queue.py", "src/writer.py"]),
-            candidate(955, "head-955", ["docs/guide.md"]),
+            candidate(901, head_sha(901), ["src/queue.py", "src/writer.py"]),
+            candidate(955, head_sha(955), ["docs/guide.md"]),
         ],
     )
     check(
@@ -950,7 +960,7 @@ def test_incomplete_v2_context_allows_advisory_spend():
         None,
         context,
     )
-    other_obs = observation(902, "head-902")
+    other_obs = observation(902, head_sha(902))
     stale_observation = admission.admit_assessment(
         {
             "summary": "s",
@@ -1008,7 +1018,7 @@ def test_incomplete_v2_context_allows_advisory_spend():
         "repo": "firstmate",
         "number": 901,
         "kind": "pr-review",
-        "head_sha": "head-901",
+        "head_sha": head_sha(901),
     }
     check(
         "contract: legacy first-spend card requires a targeted projection migration",
@@ -1136,11 +1146,11 @@ def _scan_context_from_observed(obs, rows):
 
 
 def test_card_1663_high_volume_context_queues_once():
-    obs = observation(200, "head-200", paths=["src/shared.py"])
+    obs = observation(200, head_sha(200), paths=["src/shared.py"])
     enriched = [
         {
             "number": number,
-            "head_sha": "head-%s" % number,
+            "head_sha": head_sha(number),
             "title": "Related fixture %s" % number,
             "changed_paths": {
                 "complete": True,
@@ -1161,10 +1171,6 @@ def test_card_1663_high_volume_context_queues_once():
         "owner", "firstmate", enriched, True
     )
     item = _scan_context_from_observed(obs, rows)
-    # The fixture uses a human-readable base marker rather than a production
-    # hex SHA; omit it from the queue freshness probe so only head caching is
-    # under test here.
-    item["base_sha"] = ""
     context = item["decision_context"]
     compact = decision_context.compact_model_context(context)
     held = card_projection.plan_card_projection(
@@ -1227,10 +1233,10 @@ def test_card_1663_high_volume_context_queues_once():
 
 
 def test_related_cap_keeps_strongest_and_stays_honest():
-    obs = observation(1, "head-1", paths=["src/a.py"])
+    obs = observation(1, head_sha(1), paths=["src/a.py"])
     target_row = candidate(
         1,
-        "head-1",
+        head_sha(1),
         ["src/a.py"],
         closing_issues=[10],
         references=[
@@ -1240,17 +1246,17 @@ def test_related_cap_keeps_strongest_and_stays_honest():
     )
     rows = [target_row]
     # The lowest-numbered candidate has the weakest relation kind.
-    rows.append(candidate(2, "head-2", ["src/a.py"]))
+    rows.append(candidate(2, head_sha(2), ["src/a.py"]))
     rows.extend(
-        candidate(number, "head-%s" % number, ["src/other-%s.py" % number], closing_issues=[10])
+        candidate(number, head_sha(number), ["src/other-%s.py" % number], closing_issues=[10])
         for number in (3, 4, 5, 6, 7)
     )
     rows.extend(
-        candidate(number, "head-%s" % number, ["src/ref-%s.py" % number])
+        candidate(number, head_sha(number), ["src/ref-%s.py" % number])
         for number in (8, 9, 10, 11)
     )
     # The highest-numbered candidate has the strongest relation kind.
-    rows.append(candidate(12, "head-12", ["src/other-12.py"], closing_issues=[10]))
+    rows.append(candidate(12, head_sha(12), ["src/other-12.py"], closing_issues=[10]))
     context = context_for(obs, rows)
     item = item_for(obs, context)
     compact = decision_context.compact_model_context(context)
@@ -1300,15 +1306,15 @@ def test_related_cap_keeps_strongest_and_stays_honest():
         obs,
         [
             dict(target_row, paths_complete=False),
-            candidate(2, "head-2", ["src/a.py"]),
+            candidate(2, head_sha(2), ["src/a.py"]),
         ],
     )
     truncated_copy = "\n".join(render_card._related_work_section(incomplete))
     complete = context_for(
         obs,
         [
-            candidate(1, "head-1", ["src/a.py"]),
-            candidate(2, "head-2", ["src/a.py"]),
+            candidate(1, head_sha(1), ["src/a.py"]),
+            candidate(2, head_sha(2), ["src/a.py"]),
         ],
     )
     complete_copy = "\n".join(render_card._related_work_section(complete))
@@ -1347,7 +1353,7 @@ def test_axi84_comparison_incomplete_keeps_target_authority():
                 dict(
                     candidate(
                         120,
-                        "head-120",
+                        head_sha(120),
                         ["dir-%02d/file.py" % index for index in range(12)],
                     ),
                     paths_complete=False,
@@ -1355,7 +1361,7 @@ def test_axi84_comparison_incomplete_keeps_target_authority():
             )
         else:
             rows.append(
-                candidate(number, "head-%s" % number, ["src/other-%s.py" % number])
+                candidate(number, head_sha(number), ["src/other-%s.py" % number])
             )
     context = context_for(obs, rows)
     check(
@@ -1387,11 +1393,11 @@ def test_card1676_hub_paths_cannot_manufacture_relations():
     the open candidate universe, floor 3) suppresses the manufactured
     relations while genuine non-hub shared paths still relate."""
     hub_paths = ["README.md", "catalog.yaml", "docs/index.html"]
-    obs = observation(114, "head-114", paths=hub_paths)
-    rows = [candidate(114, "head-114", hub_paths)]
+    obs = observation(114, head_sha(114), paths=hub_paths)
+    rows = [candidate(114, head_sha(114), hub_paths)]
     for number in range(115, 128):
-        rows.append(candidate(number, "head-%s" % number, hub_paths))
-    rows.append(candidate(130, "head-130", ["src/unrelated.py"]))
+        rows.append(candidate(number, head_sha(number), hub_paths))
+    rows.append(candidate(130, head_sha(130), ["src/unrelated.py"]))
     context = context_for(obs, rows)
     check(
         "card-1676: every cohort member shares all three catalog files",
@@ -1409,12 +1415,12 @@ def test_card1676_hub_paths_cannot_manufacture_relations():
     )
     # Genuine non-hub shared path: target plus two others in the same 15-PR
     # universe (fanout 3, below half of 15) still forms a relation.
-    genuine_rows = [candidate(114, "head-114", ["src/catalog.py"] + hub_paths)]
+    genuine_rows = [candidate(114, head_sha(114), ["src/catalog.py"] + hub_paths)]
     for number in range(115, 128):
-        genuine_rows.append(candidate(number, "head-%s" % number, hub_paths))
-    genuine_rows.append(candidate(131, "head-131", ["src/catalog.py"]))
-    genuine_rows.append(candidate(132, "head-132", ["src/catalog.py"]))
-    genuine_obs = observation(114, "head-114", paths=["src/catalog.py"] + hub_paths)
+        genuine_rows.append(candidate(number, head_sha(number), hub_paths))
+    genuine_rows.append(candidate(131, head_sha(131), ["src/catalog.py"]))
+    genuine_rows.append(candidate(132, head_sha(132), ["src/catalog.py"]))
+    genuine_obs = observation(114, head_sha(114), paths=["src/catalog.py"] + hub_paths)
     genuine = context_for(genuine_obs, genuine_rows)
     genuine_relations = {
         row["target"]["number"]: [relation["kind"] for relation in row["relations"]]
@@ -1428,24 +1434,24 @@ def test_card1676_hub_paths_cannot_manufacture_relations():
     )
     # Boundary: at exactly half the universe and the absolute floor the path
     # is a hub; one candidate fewer and it is not.
-    half_rows = [candidate(114, "head-114", ["src/half.py"])]
+    half_rows = [candidate(114, head_sha(114), ["src/half.py"])]
     half_rows.extend(
-        candidate(200 + index, "head-%s" % (200 + index), ["src/half.py"])
+        candidate(200 + index, head_sha(200 + index), ["src/half.py"])
         for index in range(5)
     )
-    half_context = context_for(observation(114, "head-114", paths=["src/half.py"]), half_rows)
+    half_context = context_for(observation(114, head_sha(114), paths=["src/half.py"]), half_rows)
     check(
         "card-1676: half-of-universe fanout is the hub boundary",
         half_context["related_candidate_count"] == 0
         and half_context["status"] == "complete",
     )
     incomplete_rows = [
-        candidate(114, "head-114", ["src/observed.py"]),
-        candidate(200, "head-200", ["src/observed.py"]),
-        candidate(201, "head-201", ["src/observed.py"]),
+        candidate(114, head_sha(114), ["src/observed.py"]),
+        candidate(200, head_sha(200), ["src/observed.py"]),
+        candidate(201, head_sha(201), ["src/observed.py"]),
     ]
     incomplete_context = context_for(
-        observation(114, "head-114", paths=["src/observed.py"]),
+        observation(114, head_sha(114), paths=["src/observed.py"]),
         incomplete_rows,
         complete=False,
         reason="repository-candidate-bound",
@@ -1490,11 +1496,11 @@ def test_context_denied_assessment_readmits_on_ordinary_refresh():
     retired advisory-context rule is re-admitted during the ordinary
     same-revision refresh path - no replay, no model call - while genuinely
     denied or observation-rotated assessments stay denied."""
-    obs = observation(114, "head-114", paths=["README.md", "catalog.yaml"])
+    obs = observation(114, head_sha(114), paths=["README.md", "catalog.yaml"])
     rows = [
-        candidate(114, "head-114", ["README.md", "catalog.yaml"]),
+        candidate(114, head_sha(114), ["README.md", "catalog.yaml"]),
         dict(
-            candidate(120, "head-120", ["dir-%02d/file.py" % i for i in range(12)]),
+            candidate(120, head_sha(120), ["dir-%02d/file.py" % i for i in range(12)]),
             paths_complete=False,
         ),
     ]
@@ -1589,7 +1595,7 @@ def test_context_denied_assessment_readmits_on_ordinary_refresh():
     # the legacy assessment stays exactly as persisted.
     rotated_obs = observation(
         114,
-        "head-114",
+        head_sha(114),
         paths=["README.md", "catalog.yaml"],
         checks=[
             {"name": "PR must be raised via no-mistakes", "role": "compliance", "outcome": "pass"},
@@ -1623,11 +1629,11 @@ def test_projection_contract_maxima_fit_one_issue_update():
         for index in range(target_observation.MAX_CHANGED_PATHS)
     ]
     obs = observation(checks=checks, paths=paths)
-    rows = [candidate(901, "head-901", paths, card_issue=1901)]
+    rows = [candidate(901, head_sha(901), paths, card_issue=1901)]
     for index in range(decision_context.MAX_CONTEXT_CANDIDATES):
         row = candidate(
             910 + index,
-            "head-%s" % (910 + index),
+            head_sha(910 + index),
             paths[:3],
             card_issue=1910 + index,
         )
@@ -1898,18 +1904,18 @@ def test_e2e_05_card_1620_fixture_is_retained():
 
 
 def test_e2e_06_competing_work_visible_and_advisory():
-    obs901 = observation(901, "head-901", paths=["src/central.py", "src/queue.py"])
-    obs905 = observation(905, "head-905", paths=["src/central.py", "src/writer.py"])
+    obs901 = observation(901, head_sha(901), paths=["src/central.py", "src/queue.py"])
+    obs905 = observation(905, head_sha(905), paths=["src/central.py", "src/writer.py"])
     rows = [
         candidate(
             901,
-            "head-901",
+            head_sha(901),
             ["src/central.py", "src/queue.py"],
             references=[{"owner": "owner", "repo": "tasks-axi", "number": 21}],
             card_issue=1901,
         ),
-        candidate(905, "head-905", ["src/central.py", "src/writer.py"], card_issue=1905),
-        candidate(21, "head-21", ["packages/tasks.py"], card_issue=1921, repo="tasks-axi"),
+        candidate(905, head_sha(905), ["src/central.py", "src/writer.py"], card_issue=1905),
+        candidate(21, head_sha(21), ["packages/tasks.py"], card_issue=1921, repo="tasks-axi"),
     ]
     context901 = context_for(obs901, rows)
     context905 = context_for(obs905, rows)
@@ -1950,15 +1956,15 @@ def test_e2e_07_result_recovery_and_owner_race():
         "repo": "firstmate",
         "number": 901,
         "kind": "pr-review",
-        "head_sha": "head-901",
-        "triaged_sha": "head-901",
+        "head_sha": head_sha(901),
+        "triaged_sha": head_sha(901),
         "triage_status": "queued",
         render_card.PROJECTION_OWNER_FIELD: render_card.PROJECTION_OWNER,
     }
     row = {"number": 77, "state": state, "labels": [], "body": ""}
     record = assessment_record.make_record(
         state,
-        "head-901",
+        head_sha(901),
         triage={
             "summary": "Recovered",
             "product_implications": "No repeat spend.",

@@ -793,8 +793,12 @@ def test_locked_card_transitions_to_inert_source_policy_audit():
     check(
         "policy: locked card is routed through guarded inert transition",
         len(writes) == 1
-        and writes[0]["existing"] == snapshot
-        and writes[0]["expected_existing"] == snapshot,
+        and all(
+            writes[0]["existing"][field] == snapshot[field]
+            for field in ("number", "title", "body", "labels", "updated_at")
+        )
+        and writes[0]["existing"]["state"] == state
+        and writes[0]["expected_existing"] == writes[0]["existing"],
     )
     check(
         "policy: locked card bypasses ordinary triage maintenance",

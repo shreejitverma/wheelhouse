@@ -4572,6 +4572,9 @@ def test_workflow_exact_selector_replay_only_posture_matrix():
         "Auto-merge eligible PRs",
         "Record auto-merges",
         "Reconcile the queue",
+        "Post maintainer-edits policy notices",
+        "Record maintainer-edits policy outcomes",
+        "Close verified maintainer-edits policy targets",
         "Check fleet-scan health",
     }
 

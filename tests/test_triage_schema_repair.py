@@ -1267,7 +1267,9 @@ def test_triage_yml_repair_wiring():
         fresh.get("env", {}).get("EXPECTED_REVISION")
         == "${{ needs.triage.outputs.revision }}"
         and "issues/$NUMBER" in str(fresh.get("run", ""))
-        and "pulls/$NUMBER" in str(fresh.get("run", ""))
+        # PR heads are re-read live by triage_admission.verify_bound_context.
+        and 'scripts/triage_admission.py' in str(fresh.get("run", ""))
+        and '--revision "$EXPECTED_REVISION"' in str(fresh.get("run", ""))
         and "target.stale" in str(fresh.get("run", "")),
     )
     check(

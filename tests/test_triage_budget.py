@@ -6,6 +6,7 @@ import copy
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -794,15 +795,21 @@ def test_reservation_or_card_verification_failure_never_dispatches():
         "count": 2,
     }
     exhausted_body = rc._replace_state_block(body, exhausted_state)
+    exhausted_card = dict(copy.deepcopy(current), body=exhausted_body)
     reserve_calls = []
+    exhausted_edits = []
+    # The verified card read precedes the exhaustion gate because a policy
+    # backfill recovery may still be admitted for that exact snapshot; an
+    # exhausted revision must still never reserve budget or queue triage.
     with (
         patched(
             rc,
             {
-                "get_card": lambda number: (_ for _ in ()).throw(
-                    AssertionError("exhausted attempts must not read the card")
-                ),
+                "get_card": lambda number: copy.deepcopy(exhausted_card),
                 "reserve_triage_budget": lambda *args: reserve_calls.append(args),
+                "_edit_issue_body": lambda *args, **kwargs: exhausted_edits.append(
+                    args
+                ),
             },
         ),
         patched(core, {"load_config": lambda: config}),
@@ -810,6 +817,10 @@ def test_reservation_or_card_verification_failure_never_dispatches():
     ):
         assert rc.mark_triage_queued(42, candidate, exhausted_body) is None
     assert reserve_calls == []
+    assert all(
+        core.parse_state_block(edit[1]).get("triage_status") != "queued"
+        for edit in exhausted_edits
+    )
 
     reads = 0
     written_body = body
@@ -964,6 +975,27 @@ def test_budget_denial_publishes_held_cards_without_spend_cache_and_later_retrie
             assert retry_state[rc.TRIAGE_ATTEMPTS_FIELD]["count"] == 1
 
 
+def step_guard_requires(steps, step_id, condition):
+    """Whether `step_id` can only run when `condition` held.
+
+    Follows the step's `if:` through each `steps.<id>.outputs.<name> == 'true'`
+    reference: a step that did not run has empty outputs, so that comparison
+    is true only when the referenced step itself ran under its own guard.
+    """
+    by_id = {step["id"]: step for step in steps if step.get("id")}
+    pending, seen = [step_id], set()
+    while pending:
+        current = pending.pop()
+        if current in seen or current not in by_id:
+            continue
+        seen.add(current)
+        guard = str(by_id[current].get("if") or "")
+        if condition in guard:
+            return True
+        pending.extend(re.findall(r"steps\.([\w-]+)\.outputs\.[\w-]+ == 'true'", guard))
+    return False
+
+
 def test_dispatch_capability_and_workflow_admission_make_bypass_impossible():
     gh_calls = []
     with patched(rc, {"_gh": lambda args, check=True: gh_calls.append(args)}):
@@ -989,7 +1021,10 @@ def test_dispatch_capability_and_workflow_admission_make_bypass_impossible():
     task = workflow.index("id: claude-task")
     model = workflow.index("uses: ./.github/actions/claude-model-call")
     assert admission < claim < task < model
-    assert "steps.resolve.outputs.skip != 'true'" in workflow[claim - 200 : claim + 200]
+    steps = yaml.safe_load(workflow)["jobs"]["triage"]["steps"]
+    assert step_guard_requires(
+        steps, "event-claim", "steps.resolve.outputs.skip != 'true'"
+    ), "a resolve-skipped event must never reach the claim"
     assert "steps.event-claim.outputs.admitted == 'true'" in workflow
 
 
