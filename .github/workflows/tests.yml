@@ -31,9 +31,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # The fresh-interpreter handoff gates need python3.12 and python3.13 on
+      # PATH; the last listed version is the default `python`.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: |
+            3.12
+            3.13
+            3.x
 
       - name: Install validation dependencies
         run: python -m pip install --quiet -r requirements-dev.txt ruff==0.16.10
@@ -62,6 +67,14 @@ jobs:
       - name: Run every test suite
         run: |
           set -u
+          # The suites are offline and run exactly as local validation does:
+          # drop the ambient Actions context so no suite reads this run's
+          # owner, repository, or run id (which would select live gh paths).
+          for name in $(compgen -e); do
+            case "${name}" in
+              GITHUB_*|RUNNER_*) unset "${name}" ;;
+            esac
+          done
           failed=()
           for suite in tests/test_*.py; do
             echo "::group::${suite}"
