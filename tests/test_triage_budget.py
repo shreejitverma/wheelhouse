@@ -990,6 +990,8 @@ def step_guard_requires(steps, step_id, condition):
             continue
         seen.add(current)
         guard = str(by_id[current].get("if") or "")
+        if "||" in guard or re.search(r"\b(always|failure|cancelled)\(\)", guard):
+            continue
         if condition in guard:
             return True
         pending.extend(re.findall(r"steps\.([\w-]+)\.outputs\.[\w-]+ == 'true'", guard))
@@ -1025,6 +1027,14 @@ def test_dispatch_capability_and_workflow_admission_make_bypass_impossible():
     assert step_guard_requires(
         steps, "event-claim", "steps.resolve.outputs.skip != 'true'"
     ), "a resolve-skipped event must never reach the claim"
+    assert not step_guard_requires(
+        [
+            {"id": "x", "if": "steps.resolve.outputs.skip != 'true'"},
+            {"id": "claim", "if": "steps.x.outputs.ok == 'true' || always()"},
+        ],
+        "claim",
+        "steps.resolve.outputs.skip != 'true'",
+    ), "a disjunctive or status-function guard must not count as requiring"
     assert "steps.event-claim.outputs.admitted == 'true'" in workflow
 
 
