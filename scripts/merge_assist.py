@@ -180,6 +180,16 @@ _GIT_SAFE_FLAGS = (
 )
 
 
+# Identity for the mechanical `git merge --no-commit` probe in `prepare`.
+# It never authors a commit; it only satisfies git's identity requirement.
+MERGE_PROBE_IDENTITY_ENV = {
+    "GIT_AUTHOR_NAME": "wheelhouse-assisted-merge",
+    "GIT_AUTHOR_EMAIL": "wheelhouse-assisted-merge@users.noreply.github.com",
+    "GIT_COMMITTER_NAME": "wheelhouse-assisted-merge",
+    "GIT_COMMITTER_EMAIL": "wheelhouse-assisted-merge@users.noreply.github.com",
+}
+
+
 def _git_env(extra=None):
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -918,6 +928,12 @@ def prepare(binding, repo_dir):
     if reason:
         raise AssistError(reason)
 
+    # `git merge --no-commit` still requires a committer identity. The
+    # sanitized git environment disables global config, so without an explicit
+    # identity git guesses one from the hostname: that works on hosted runners
+    # (fully qualified hostnames) but fails on hosts without a domain, such as
+    # self-hosted runners, containers, and laptops. No commit is created here;
+    # the resolution commit later uses the identity passed to `apply`.
     merge = git(
         repo_dir,
         "merge",
@@ -925,6 +941,7 @@ def prepare(binding, repo_dir):
         "--no-commit",
         "--no-verify",
         base_sha,
+        env_extra=MERGE_PROBE_IDENTITY_ENV,
         check=False,
     )
     entries = enumerate_conflicts(repo_dir)

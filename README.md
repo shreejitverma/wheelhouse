@@ -644,6 +644,7 @@ wheelhouse.config.yml          the one file you edit
   deep-review.yml              always-on, code-grounded: Investigate box / label / manual issue run -> read-only target review -> workflow labels and posts Claude's verdict
   merge-assist.yml             captain-initiated conflict resolution -> bounded read-only model turn -> one plain non-force push to the existing PR branch
   no-mistakes-required.yml     PR-to-main gate requiring the no-mistakes signature
+  tests.yml                    every pull request and push to main -> the CONTRIBUTING.md local validation plus every tests/test_*.py suite
 scripts/
   wheelhouse_core.py           resilient GraphQL scan/classify and exact-target adapters, source pushability policy, scan-health ledger, author filtering, dedup/overlap, request-changes cleanup, CI safety, auto-approval, read-only CI security summaries, ref qualification, and scan logs
   maintainer_edits_policy.py   ordered policy notice / exact re-read / close transaction for non-modifiable fork sources

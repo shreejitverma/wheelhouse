@@ -706,14 +706,27 @@ def test_context_queue_reserves_one_unit_and_returns_a_sealed_permit():
         assert verified["base_sha"] == B2
         assert verified["vision_sha"] == V1
 
-    for live_base, live_vision in ((B3, V1), (B2, V2)):
+    def live_target_reader(state, head, base, vision):
+        def read(endpoint):
+            if "/pulls/" in endpoint:
+                pr = {"state": state, "head": {"sha": head}, "base": {"sha": base}}
+                return (0, pr, "")
+            return (0, {"type": "file", "sha": vision}, "")
+
+        return read
+
+    moved_head = "f" * 40
+    for live_state, live_head, live_base, live_vision in (
+        ("open", HEAD, B3, V1),
+        ("open", HEAD, B2, V2),
+        ("open", moved_head, B2, V1),
+        ("closed", HEAD, B2, V1),
+    ):
         with patched(
             triage_admission,
             {
-                "_fleet_json": lambda endpoint, base=live_base, vision=live_vision: (
-                    (0, {"state": "open", "head": {"sha": HEAD}, "base": {"sha": base}}, "")
-                    if "/pulls/" in endpoint
-                    else (0, {"type": "file", "sha": vision}, "")
+                "_fleet_json": live_target_reader(
+                    live_state, live_head, live_base, live_vision
                 )
             },
         ):
@@ -724,7 +737,9 @@ def test_context_queue_reserves_one_unit_and_returns_a_sealed_permit():
             except ValueError:
                 pass
             else:
-                raise AssertionError("moved base/VISION context was accepted")
+                raise AssertionError(
+                    "moved head/base/VISION or closed target was accepted"
+                )
 
     # Dispatch accepts only the sealed permit for this exact card/item.
     calls = []

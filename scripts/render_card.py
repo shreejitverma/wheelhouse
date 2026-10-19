@@ -9220,6 +9220,15 @@ def _automerge_projection_item(owner, state):
     else:
         if complete:
             item["same_closing_issue_overlap"] = overlap
+    # A card carries no scan-time label observation, so the escape hatch's
+    # bulk input is the live read of the one label it consumes. A failed read
+    # leaves it absent, and the evaluator then holds as unavailable.
+    awaiting = core.target_label_state(
+        owner, item["repo"], item["number"], core.AWAITING_CAPTAIN_CONFIRM_LABEL
+    )
+    if awaiting is not None:
+        item["labels"] = [core.AWAITING_CAPTAIN_CONFIRM_LABEL] if awaiting else []
+        item["labels_truncated"] = False
     return item
 
 

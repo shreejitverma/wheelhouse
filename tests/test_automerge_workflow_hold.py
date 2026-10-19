@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
+from urllib.parse import unquote
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts")
@@ -38,6 +39,8 @@ HEAD_THREE = "e" * 40
 BASE_SHA = "b" * 40
 VISION_SHA = "c" * 40
 HISTORY_COMMIT = "f" * 40
+# REST `head.repo` for a same-repository PR (no source-fork policy applies).
+SAME_REPO_SOURCE = {"full_name": "owner/fmt"}
 
 
 def eligible_verdict():
@@ -161,6 +164,8 @@ def item_for(head, kind="pr-review"):
         "recommendation": "Merge - compliance and tests are green.",
         "url": "https://github.com/owner/fmt/pull/5",
         "same_closing_issue_overlap": "",
+        "labels": [],
+        "labels_truncated": False,
         "target_observation": observation,
         "decision_context": context,
     }
@@ -252,7 +257,7 @@ class LifecycleWorld:
             "title": "card",
         }
         self.pr = {
-            "head": {"sha": head},
+            "head": {"sha": head, "repo": SAME_REPO_SOURCE},
             "base": {"sha": BASE_SHA},
             "mergeable": True,
             "mergeable_state": "clean",
@@ -457,6 +462,11 @@ class LifecycleWorld:
                 else [{"filename": "src/app.py"}]
             )
             return [{"files": paths}]
+        if path.startswith("/repos/owner/fmt/issues/5/labels/"):
+            label = unquote(path.rsplit("/", 1)[1])
+            if label in {value["name"] for value in self.pr["labels"]}:
+                return {"name": label}
+            raise RuntimeError("gh: Not Found (HTTP 404)")
         if path == "/repos/owner/fmt/pulls/5/merge":
             self.metrics["merge_calls"] += 1
             self.merge_tokens.append(os.environ.get("GH_TOKEN"))
@@ -556,7 +566,13 @@ class LifecycleWorld:
 
     def set_head(self, head):
         self.head = head
-        self.pr.update({"head": {"sha": head}, "merged": False, "state": "open"})
+        self.pr.update(
+            {
+                "head": {"sha": head, "repo": SAME_REPO_SOURCE},
+                "merged": False,
+                "state": "open",
+            }
+        )
 
     def set_fresh_verdict(self, head):
         self.card["body"] = state_with_fresh_verdict(self.card["body"], head)

@@ -104,6 +104,10 @@ python tests/test_scan_reliability.py
 python tests/test_config_schema.py
 python tests/test_agos_state.py
 python tests/test_agos_project_bridge.py
+python tests/test_advisory_telemetry_consistency.py
+python tests/test_denied_tool_visibility.py
+python tests/test_size_budget.py
+python tests/test_triage_context_allowance.py
 python - <<'PY'
 from pathlib import Path
 import yaml
@@ -115,11 +119,21 @@ for pattern in (".github/workflows/*.yml", ".github/ISSUE_TEMPLATE/*.yml", "whee
 PY
 ```
 
+To run every suite at once, including any added after this list:
+
+```
+for suite in tests/test_*.py; do python "$suite" || echo "FAILED: $suite"; done
+```
+
+The `Tests` workflow (`.github/workflows/tests.yml`) runs all of these checks, and every `tests/test_*.py` file, on each pull request and push to `main`.
+
 If `actionlint` is available, also run:
 
 ```
 actionlint .github/workflows/*.yml
 ```
+
+actionlint 1.7.12 does not yet recognize the `queue` key under `concurrency`, which the queue-serialized workflows use on purpose; those four findings are expected.
 
 ## Setting up the repository itself
 

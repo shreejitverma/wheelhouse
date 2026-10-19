@@ -26,6 +26,7 @@ Run: python tests/test_triage_schema_repair.py
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -977,6 +978,72 @@ def test_cli_triage_apply_repair_end_to_end():
 # --------------------------------------------------------------------------- #
 # 9. triage.yml static wiring + token/posture isolation (clause 7)
 # --------------------------------------------------------------------------- #
+FRESHNESS_EXPECTED_REVISION = "a" * 40
+
+
+def run_post_model_freshness(step, admission_exit):
+    """Execute a post-model-freshness `run:` for a PR card against stubs.
+
+    `gh` returns a card, `scripts/triage_admission.py` exits `admission_exit`,
+    and `scripts/agent_runtime.py` only records its arguments.
+    """
+    script = re.sub(r"\$\{\{[^}]*\}\}", "expr", str(step.get("run", "")))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        (tmp / "scripts").mkdir()
+        recorder = (
+            "import json, os, sys\n"
+            "with open(os.environ['STUB_LOG'], 'a') as log:\n"
+            "    log.write(json.dumps([os.path.basename(sys.argv[0])]"
+            " + sys.argv[1:]) + '\\n')\n"
+        )
+        (tmp / "scripts" / "triage_admission.py").write_text(
+            recorder + "sys.exit(int(os.environ['STUB_ADMISSION_EXIT']))\n"
+        )
+        (tmp / "scripts" / "agent_runtime.py").write_text(recorder)
+        shims = {
+            "gh": "echo '{\"body\": \"\", \"state\": \"OPEN\", \"labels\": []}'",
+            "python": 'exec "%s" "$@"' % sys.executable,
+        }
+        for name, body in shims.items():
+            shim = bindir / name
+            shim.write_text("#!/bin/sh\n%s\n" % body)
+            shim.chmod(0o755)
+        output = tmp / "github_output"
+        output.write_text("")
+        log = tmp / "calls.jsonl"
+        env = {
+            "PATH": "%s:%s" % (bindir, os.environ.get("PATH", "")),
+            "GITHUB_OUTPUT": str(output),
+            "STUB_LOG": str(log),
+            "STUB_ADMISSION_EXIT": str(admission_exit),
+            "KIND": "pr-review",
+            "CARD_TOKEN": "card-token",
+            "CARD_REPO": "owner/cards",
+            "CARD_ISSUE": "7",
+            "OWNER": "owner",
+            "SLUG": "owner/target",
+            "NUMBER": "3",
+            "EXPECTED_REVISION": FRESHNESS_EXPECTED_REVISION,
+            "REVIEW_CONTEXT": "review-context",
+            "RECOVERY_CONTEXT": "",
+        }
+        proc = subprocess.run(
+            ["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True
+        )
+        outputs = dict(
+            line.split("=", 1) for line in output.read_text().splitlines() if "=" in line
+        )
+        calls = (
+            [json.loads(line) for line in log.read_text().splitlines()]
+            if log.exists()
+            else []
+        )
+        return {"returncode": proc.returncode, "outputs": outputs, "calls": calls}
+
+
 def test_triage_yml_repair_wiring():
     triage_source = read(".github", "workflows", "triage.yml")
     doc = yaml.safe_load(triage_source)
@@ -1267,8 +1334,38 @@ def test_triage_yml_repair_wiring():
         fresh.get("env", {}).get("EXPECTED_REVISION")
         == "${{ needs.triage.outputs.revision }}"
         and "issues/$NUMBER" in str(fresh.get("run", ""))
-        and "pulls/$NUMBER" in str(fresh.get("run", ""))
         and "target.stale" in str(fresh.get("run", "")),
+    )
+    rejected = run_post_model_freshness(fresh, admission_exit=1)
+    admitted = run_post_model_freshness(fresh, admission_exit=0)
+    check(
+        "yaml: PR post-model freshness fails closed on an admission rejection",
+        rejected["returncode"] == 0
+        and rejected["outputs"].get("fresh") == "false"
+        and any(
+            call[0] == "agent_runtime.py"
+            and call[call.index("--code") + 1] == "target.stale"
+            for call in rejected["calls"]
+            if "--code" in call
+        ),
+    )
+    check(
+        "yaml: PR post-model freshness admits only an accepted bound context",
+        admitted["returncode"] == 0
+        and admitted["outputs"].get("fresh") == "true"
+        and not any(call[0] == "agent_runtime.py" for call in admitted["calls"]),
+    )
+    check(
+        "yaml: PR post-model freshness binds admission to the expected revision",
+        all(
+            [
+                call[call.index("--revision") + 1]
+                for call in run["calls"]
+                if call[0] == "triage_admission.py" and "--revision" in call
+            ]
+            == [FRESHNESS_EXPECTED_REVISION]
+            for run in (rejected, admitted)
+        ),
     )
     check(
         "yaml: card projection rejects post-model freshness loss",

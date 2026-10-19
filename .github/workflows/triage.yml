@@ -850,7 +850,7 @@ jobs:
               echo '  "recommendation_basis": {"kind":"other","observation_id":"exact trusted-review-facts observation_id","context_id":"exact trusted-review-facts context_id"},'
               if [ "$AUTOMERGE_VERDICT_AVAILABLE" = "true" ]; then
                 echo '  "source_provenance": {"url":"exact public_clone URL","requested_ref":"exact requested ref","resolved_commit":"returned commit","inspected_files":[{"path":"exact file read","sha256":"matching trusted observation digest"}]},'
-                echo '  "vision_evidence": {"target_owner":"'${SLUG%%/*}'","target_repo":"'${SLUG#*/}'","target_number":'$NUMBER',"target_facts_sha256":"'$TARGET_FACTS_SHA256'","vision_sha":"'$VISION_SHA'","vision_content_sha256":"'$VISION_CONTENT_SHA256'","base_sha":"'$BASE_SHA'","target_head_sha":"'$HEAD_SHA'","applicable_criteria":[{"id":"matching declared criterion id","quote":"exact uniquely occurring VISION criterion","external_source_required":true or false}]},'
+                echo '  "vision_evidence": {"target_owner":"'"${SLUG%%/*}"'","target_repo":"'"${SLUG#*/}"'","target_number":'"$NUMBER"',"target_facts_sha256":"'"$TARGET_FACTS_SHA256"'","vision_sha":"'"$VISION_SHA"'","vision_content_sha256":"'"$VISION_CONTENT_SHA256"'","base_sha":"'"$BASE_SHA"'","target_head_sha":"'"$HEAD_SHA"'","applicable_criteria":[{"id":"matching declared criterion id","quote":"exact uniquely occurring VISION criterion","external_source_required":true or false}]},'
               fi
               echo '  "automerge": {'
               echo '    "behavior_class": "A | B | C | ineligible",'

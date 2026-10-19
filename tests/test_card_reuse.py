@@ -76,6 +76,7 @@ def item(head="a" * 40, kind="pr-review", **overrides):
         "priority": "high" if kind == "ci-approval" else "med",
         "auto_triage": True,
         "base_sha": "b" * 40,
+        "triage_vision_status": "present",
         "automerge_vision_sha": "c" * 40,
     }
     base.update(overrides)
@@ -1878,17 +1879,19 @@ def test_full_lifecycle_wait_then_new_head():
         "full lifecycle: scan starts merge-ready",
         old["bucket"] == "merge-ready",
     )
+    # Conflicts are captain-owned and keep a PR merge-ready, so the waiting
+    # phase that takes the PR off the maintainer worklist is a draft.
     waiting_bucket = core.classify(
-        False,
+        True,
         "pass",
         "green",
         True,
         cross_repo=False,
-        mergeable="CONFLICTING",
+        mergeable="MERGEABLE",
     )
     check(
-        "full lifecycle: conflict enters waiting phase",
-        waiting_bucket == "needs-rebase",
+        "full lifecycle: draft enters waiting phase",
+        waiting_bucket == "draft" and waiting_bucket not in core.NEEDS_MAINTAINER,
     )
     github.soft_close()
     github.run_reconcile(scan_payload([]))
